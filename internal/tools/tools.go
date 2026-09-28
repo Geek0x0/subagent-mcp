@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -51,7 +53,7 @@ func (b *limitedBuffer) String() string {
 }
 
 func RunShell(ctx context.Context, cwd, command string, timeout time.Duration) (out string, exitCode int, err error) {
-	return runCommand(ctx, cwd, []string{"bash", "-lc", command}, timeout)
+	return runCommand(ctx, cwd, shellArgv(command), timeout)
 }
 
 // RunShellSandboxed runs command through the Landlock helper so that only
@@ -66,7 +68,52 @@ func RunShellSandboxed(
 	if err != nil {
 		return "", -1, fmt.Errorf("locate sandbox helper: %w", err)
 	}
-	return runCommand(ctx, cwd, sandbox.Command(self, writableRoots, "bash", "-lc", command), timeout)
+	return runCommand(ctx, cwd, sandbox.Command(self, writableRoots, shellArgv(command)...), timeout)
+}
+
+// shellScript removes variables after bash has loaded the user's login profile,
+// then evaluates the caller's command with the profile's other environment
+// changes intact. The names and prefixes are positional arguments, not shell
+// source, so a configured name can never inject code into this wrapper.
+const shellScript = `exact_count=$1
+prefix_count=$2
+shift 2
+while ((exact_count > 0)); do
+    builtin unset -- "$1"
+    shift
+    exact_count=$((exact_count - 1))
+done
+while ((prefix_count > 0)); do
+    prefix=$1
+    shift
+    while IFS= read -r name; do
+        if [[ $name == "$prefix"* ]]; then
+            builtin unset -- "$name"
+        fi
+    done < <(builtin compgen -A variable)
+    prefix_count=$((prefix_count - 1))
+done
+__subagent_mcp_command=$1
+set --
+builtin eval "$__subagent_mcp_command"`
+
+func shellArgv(command string) []string {
+	scrubMu.RLock()
+	names := make([]string, 0, len(scrubNames))
+	for name := range scrubNames {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	prefixes := append([]string(nil), scrubPrefixes...)
+	scrubMu.RUnlock()
+
+	argv := []string{
+		"bash", "-lc", shellScript, "bash",
+		strconv.Itoa(len(names)), strconv.Itoa(len(prefixes)),
+	}
+	argv = append(argv, names...)
+	argv = append(argv, prefixes...)
+	return append(argv, command)
 }
 
 func runCommand(ctx context.Context, cwd string, argv []string, timeout time.Duration) (out string, exitCode int, err error) {

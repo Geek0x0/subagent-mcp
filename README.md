@@ -102,7 +102,7 @@ Accepted caller values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, 
 
 ### API keys
 
-Keys are never stored in the config file. For the three model API families, when a session is created, the server reads the selected provider's `env_key` variable from its own environment; every provider's `env_key` variable is also removed from shell commands run by the agent (see [Environment](#environment)). Keep the variable in the environment that launches the MCP server, for example in an MCP client's `env` block or your shell profile. Codex uses its own login instead.
+Keys are never stored in the config file. For the three model API families, when a session is created, the server reads the selected provider's `env_key` variable from its own environment; every provider's `env_key` variable is also removed from shell commands run by the agent (see [Environment](#environment)). Keep the variable in the environment that launches the MCP server, for example in an MCP client's `env` block. Do not rely on a shell profile to provide the key to the agent: login profiles are loaded for shell commands, but configured keys are removed again before the command runs. Codex uses its own login instead.
 
 ### Selecting a provider
 
@@ -173,7 +173,7 @@ The `auth` line replaces `key`: the server starts Codex app-server and calls `ac
 | `SUBAGENT_MCP_TOOL_NAME` | Base name for the two MCP tools; defaults to `subagent`, exposing `subagent` and `subagent-reply`. `codex` registers `codex` and `codex-reply`. The value must match `^[A-Za-z0-9_-]{1,64}$` and must not end with `-reply`; an invalid value fails startup naming `SUBAGENT_MCP_TOOL_NAME`. |
 | `SUBAGENT_MCP_ROLLOUT` | Set to `off` to disable rollout files. |
 
-Before starting any shell command, the server removes from the child environment every variable named by any provider's `env_key` and every variable whose name starts with `SUBAGENT_MCP_`, so agent commands cannot read the keys or the server settings. `read_file` additionally refuses to read the loaded config file, resolved through symlinks, to keep provider topology out of model context. Reads are otherwise unrestricted: a command can still read a key stored in another file, so prefer passing keys through the MCP server environment rather than keeping them on disk.
+Before running any shell command, the server removes from the command environment every variable named by any provider's `env_key` and every variable whose name starts with `SUBAGENT_MCP_`, including values a login profile tries to re-export. The command still runs through `bash -lc`, so profile-provided settings such as `PATH` work; cleanup happens after the profile is loaded. On Linux, the server also starts non-dumpable, preventing a same-user shell child from reading the server's environment through `/proc`. `read_file` additionally refuses to read the loaded config file, resolved through symlinks, to keep provider topology out of model context. Reads are otherwise unrestricted: a command can still read a key stored in another file, so prefer passing keys through the MCP server environment rather than keeping them on disk.
 
 ## Tools
 
@@ -280,7 +280,7 @@ The shell allowlist covers `ls`, `cat`, `head`, `tail`, `rg`, `grep`, `find`, `p
 
 ### Kernel sandbox for shell calls
 
-Shell calls that the policy auto-allows run under a Landlock ruleset: the server re-executes its own binary as `subagent-mcp __sandbox-exec --rw <path>... -- bash -lc <command>`, which restricts itself to read and execute everywhere plus write access only beneath the listed roots, and then `exec`s the command. The restriction is inherited by every descendant process, so writes are blocked by the kernel rather than by command-string inspection.
+Shell calls that the policy auto-allows run under a Landlock ruleset: the server re-executes its own binary as `subagent-mcp __sandbox-exec --rw <path>... -- bash -lc <command>`, which restricts itself to read and execute everywhere plus write access only beneath the listed roots, and then `exec`s the command. The login profile is loaded before the command environment cleanup described above, so profile-provided `PATH` entries remain usable without re-exported secrets reaching the command. The restriction is inherited by every descendant process, so writes are blocked by the kernel rather than by command-string inspection.
 
 | Sandbox | Writable roots for auto-allowed shell calls |
 |---|---|

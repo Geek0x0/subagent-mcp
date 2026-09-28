@@ -10,6 +10,7 @@ require (
 	github.com/openai/openai-go/v3 v3.66.0
 	github.com/pelletier/go-toml/v2 v2.4.3
 	github.com/sashabaranov/go-openai v1.42.0
+	golang.org/x/sys v0.47.0
 )
 
 require (
@@ -27,6 +28,5 @@ require (
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
 	go.yaml.in/yaml/v4 v4.0.0-rc.2 // indirect
 	golang.org/x/sync v0.22.0 // indirect
-	golang.org/x/sys v0.47.0 // indirect
 	kernel.org/pub/linux/libs/security/libcap/psx v1.2.77 // indirect
 )

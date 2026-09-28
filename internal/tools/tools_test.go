@@ -218,6 +218,100 @@ func TestScrubbedEnvSandboxed(t *testing.T) {
 	}
 }
 
+func TestRunShellScrubsLoginProfileProviderKeyAndKeepsPATH(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		sandbox bool
+	}{
+		{name: "native"},
+		{name: "sandboxed", sandbox: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.sandbox {
+				if err := sandbox.Available(); err != nil {
+					t.Skipf("landlock unavailable: %v", err)
+				}
+			}
+
+			const keyName = "PROFILE_PROVIDER_KEY"
+			const keyValue = "profile-provider-secret"
+			home := t.TempDir()
+			bin := t.TempDir()
+			toolPath := filepath.Join(bin, "profile-tool")
+			if err := os.WriteFile(toolPath, []byte("#!/bin/sh\nprintf 'profile-tool-found\\n'\n"), 0o755); err != nil {
+				t.Fatalf("write profile tool: %v", err)
+			}
+			profile := fmt.Sprintf("export %s=%s\nexport PATH='%s':$PATH\n", keyName, keyValue, strings.ReplaceAll(bin, "'", "'\\''"))
+			if err := os.WriteFile(filepath.Join(home, ".bash_profile"), []byte(profile), 0o600); err != nil {
+				t.Fatalf("write bash profile: %v", err)
+			}
+
+			t.Setenv("HOME", home)
+			SetScrubbedEnv([]string{keyName}, []string{"SUBAGENT_MCP_"})
+			t.Cleanup(func() { SetScrubbedEnv(nil, []string{"SUBAGENT_MCP_"}) })
+
+			command := `printf 'key=%s\n' "${PROFILE_PROVIDER_KEY-unset}"; profile-tool`
+			var out string
+			var err error
+			if tc.sandbox {
+				out, _, err = RunShellSandboxed(context.Background(), t.TempDir(), command, 5*time.Second, []string{t.TempDir()})
+			} else {
+				out, _, err = RunShell(context.Background(), t.TempDir(), command, 5*time.Second)
+			}
+			if err != nil {
+				t.Fatalf("shell error = %v; output = %q", err, out)
+			}
+			if strings.Contains(out, keyValue) || !strings.Contains(out, "key=unset\n") {
+				t.Fatalf("shell saw profile key: %q", out)
+			}
+			if !strings.Contains(out, "profile-tool-found") {
+				t.Fatalf("shell did not find profile-provided PATH executable: %q", out)
+			}
+		})
+	}
+}
+
+func TestRunShellScrubsLoginProfileSubagentEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		sandbox bool
+	}{
+		{name: "native"},
+		{name: "sandboxed", sandbox: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.sandbox {
+				if err := sandbox.Available(); err != nil {
+					t.Skipf("landlock unavailable: %v", err)
+				}
+			}
+
+			home := t.TempDir()
+			if err := os.WriteFile(filepath.Join(home, ".bash_profile"), []byte("export SUBAGENT_MCP_PROFILE_SECRET=profile-subagent-secret\n"), 0o600); err != nil {
+				t.Fatalf("write bash profile: %v", err)
+			}
+			t.Setenv("HOME", home)
+			SetScrubbedEnv(nil, []string{"SUBAGENT_MCP_"})
+			t.Cleanup(func() { SetScrubbedEnv(nil, []string{"SUBAGENT_MCP_"}) })
+
+			command := `printf 'subagent=%s\n' "${SUBAGENT_MCP_PROFILE_SECRET-unset}"`
+			var out string
+			var err error
+			if tc.sandbox {
+				out, _, err = RunShellSandboxed(context.Background(), t.TempDir(), command, 5*time.Second, []string{t.TempDir()})
+			} else {
+				out, _, err = RunShell(context.Background(), t.TempDir(), command, 5*time.Second)
+			}
+			if err != nil {
+				t.Fatalf("shell error = %v; output = %q", err, out)
+			}
+			if out != "subagent=unset\n" {
+				t.Fatalf("shell saw profile SUBAGENT_MCP_ variable: %q", out)
+			}
+		})
+	}
+}
+
 func waitForProcessExit(pid int, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for {

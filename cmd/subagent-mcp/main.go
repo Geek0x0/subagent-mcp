@@ -18,6 +18,8 @@ import (
 
 const version = "0.9.0"
 
+var disableProcessDumpingFn = disableProcessDumping
+
 func main() {
 	sandbox.MaybeRunHelper()
 	showVersion := flag.Bool("version", false, "print version and exit")
@@ -72,6 +74,9 @@ func main() {
 }
 
 func configureRuntime(cfg *config.Config) {
+	if err := disableProcessDumpingFn(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: /proc environment protection could not be enabled: %v; continuing\n", err)
+	}
 	tools.SetScrubbedEnv(cfg.EnvKeys(), []string{"SUBAGENT_MCP_"})
 	tools.SetProtectedFiles([]string{cfg.Path})
 }
