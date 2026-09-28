@@ -24,6 +24,7 @@ type thread struct {
 	conn      *conn
 	completed bool
 	closed    bool
+	closedCh  chan struct{} // Closed once, by the first Close.
 	active    *threadTurn
 }
 
@@ -49,7 +50,7 @@ func startThread(ctx context.Context, p *pool, opts provider.ThreadOptions) (*th
 		return nil, c.failure(err)
 	}
 	opts.WritableRoots = append([]string(nil), opts.WritableRoots...)
-	t := &thread{pool: p, opts: opts, id: result.Thread.ID, conn: c}
+	t := &thread{pool: p, opts: opts, id: result.Thread.ID, conn: c, closedCh: make(chan struct{})}
 	go t.route(c, c.client.Subscribe(t.id))
 	return t, nil
 }
@@ -273,10 +274,28 @@ func (t *thread) approve(ctx context.Context, c *conn, turnID string, msg Messag
 		req.Tool, req.Command, req.Path = "apply_patch", "", paths[p.ItemID]
 	}
 	decision := "decline"
-	// Approve is bound to Run's ctx by the caller, including its existing
-	// elicitation timeout. Do not spawn an uninterruptible callback goroutine.
-	if ctx.Err() == nil && cb.Approve != nil && cb.Approve(req) && ctx.Err() == nil {
-		decision = "accept"
+	// Approve gets a ctx derived from Run's ctx, so the caller's cancellation
+	// and elicitation timeout still apply, extended to end when the child
+	// dies or this thread closes: a pending approval must not outlive either.
+	// Do not spawn an uninterruptible callback goroutine.
+	if cb.Approve != nil && ctx.Err() == nil {
+		approveCtx, cancel := context.WithCancel(ctx)
+		gone := make(chan struct{})
+		go func() {
+			defer close(gone)
+			select {
+			case <-c.client.Done():
+			case <-t.closedCh:
+			case <-approveCtx.Done():
+			}
+			cancel()
+		}()
+		approved := cb.Approve(approveCtx, req)
+		if approved && approveCtx.Err() == nil {
+			decision = "accept"
+		}
+		cancel()
+		<-gone
 	}
 	return c.client.Respond(msg.ID, map[string]string{"decision": decision})
 }
@@ -338,6 +357,7 @@ func (t *thread) Close() {
 		return
 	}
 	t.closed = true
+	close(t.closedCh)
 	c := t.conn
 	var turnID string
 	if t.active != nil {

@@ -116,8 +116,8 @@ func (r *Runner) Run(ctx context.Context, s *Session, prompt string) (string, er
 			Emit: func(event map[string]any) {
 				r.Emitter.Emit(ctx, s.ID, event)
 			},
-			Approve: func(req provider.ApprovalRequest) bool {
-				return r.Approver.Approve(ctx, s.ID, ApprovalRequest{
+			Approve: func(approveCtx context.Context, req provider.ApprovalRequest) bool {
+				return r.Approver.Approve(approveCtx, s.ID, ApprovalRequest{
 					Tool: req.Tool, Command: req.Command, Path: req.Path, Reason: req.Reason,
 				})
 			},

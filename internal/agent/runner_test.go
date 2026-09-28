@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 	"unicode/utf8"
@@ -175,13 +176,19 @@ func TestRunnerDelegatesToThread(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var gotPrompt, gotEffort string
+	var threadApproveCtx context.Context
 	thread := &stubThread{run: func(gotCtx context.Context, prompt, effort string, cb provider.ThreadCallbacks) (string, error) {
 		if gotCtx != ctx {
 			t.Error("Thread.Run() received a different context")
 		}
 		gotPrompt, gotEffort = prompt, effort
 		cb.Emit(map[string]any{"type": "agent_message", "message": "hi"})
-		if !cb.Approve(provider.ApprovalRequest{Tool: "shell", Command: "ls"}) {
+		// The thread derives its own approval context; the Runner must pass
+		// it through instead of substituting Run's context.
+		approveCtx, cancelApprove := context.WithCancel(gotCtx)
+		defer cancelApprove()
+		threadApproveCtx = approveCtx
+		if !cb.Approve(approveCtx, provider.ApprovalRequest{Tool: "shell", Command: "ls"}) {
 			t.Error("approval result = false, want true")
 		}
 		return "done", nil
@@ -197,8 +204,8 @@ func TestRunnerDelegatesToThread(t *testing.T) {
 			emitter.Emit(gotCtx, threadID, event)
 		}),
 		Approver: approverFunc(func(gotCtx context.Context, threadID string, req ApprovalRequest) bool {
-			if gotCtx != ctx || threadID != session.ID {
-				t.Errorf("Approve() context/thread = (%v, %q), want (%v, %q)", gotCtx, threadID, ctx, session.ID)
+			if gotCtx != threadApproveCtx || threadID != session.ID {
+				t.Errorf("Approve() context/thread = (%v, %q), want (%v, %q)", gotCtx, threadID, threadApproveCtx, session.ID)
 			}
 			approvals = append(approvals, req)
 			return true
@@ -219,6 +226,9 @@ func TestRunnerDelegatesToThread(t *testing.T) {
 	}
 	if want := []ApprovalRequest{{Tool: "shell", Command: "ls"}}; !reflect.DeepEqual(approvals, want) {
 		t.Fatalf("approvals = %#v, want %#v", approvals, want)
+	}
+	if threadApproveCtx == nil {
+		t.Fatal("thread never called Approve")
 	}
 	if !session.lastUsed.After(before) {
 		t.Fatalf("session.lastUsed = %v, want after %v", session.lastUsed, before)
@@ -314,14 +324,19 @@ func TestManagerEvictionClosesThread(t *testing.T) {
 			manager := NewManager()
 			current := time.Now()
 			manager.now = func() time.Time { return current }
-			closed := 0
+			var closed atomic.Int32
+			closedCh := make(chan struct{}, 1)
 			thread := &stubThread{close: func() {
-				closed++
+				closed.Add(1)
 				if !manager.mu.TryLock() {
 					t.Error("Thread.Close() called with manager lock held")
-					return
+				} else {
+					manager.mu.Unlock()
 				}
-				manager.mu.Unlock()
+				select {
+				case closedCh <- struct{}{}:
+				default:
+				}
 			}}
 			oldest := manager.Create(Options{Thread: thread})
 			if eviction == "idle TTL" {
@@ -339,14 +354,66 @@ func TestManagerEvictionClosesThread(t *testing.T) {
 			if got, ok := manager.Get(fresh.ID); !ok || got != fresh {
 				t.Fatalf("Get(fresh.ID) = (%#v, %v), want fresh session", got, ok)
 			}
-			if closed != 1 {
-				t.Fatalf("Close() calls = %d, want 1", closed)
+			awaitClosed(t, closedCh)
+			if got := closed.Load(); got != 1 {
+				t.Fatalf("Close() calls = %d, want 1", got)
 			}
 			manager.Create(Options{})
-			if closed != 1 {
-				t.Fatalf("Close() calls after another Create() = %d, want 1", closed)
+			if got := closed.Load(); got != 1 {
+				t.Fatalf("Close() calls after another Create() = %d, want 1", got)
 			}
 		})
+	}
+}
+
+// awaitClosed waits for one completed eviction close.
+func awaitClosed(t *testing.T, closedCh <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-closedCh:
+	case <-time.After(2 * time.Second):
+		t.Fatal("evicted thread was not closed")
+	}
+}
+
+// TestManagerEvictionCloseDoesNotBlockCreate pins that Create never waits for
+// an evicted thread's Close, which can take seconds on a backend RPC.
+func TestManagerEvictionCloseDoesNotBlockCreate(t *testing.T) {
+	manager := NewManager()
+	current := time.Now()
+	manager.now = func() time.Time { return current }
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseClose := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseClose()
+	closeStarted := make(chan struct{}, 1)
+	closeDone := make(chan struct{})
+	var closeCalls atomic.Int32
+	thread := &stubThread{close: func() {
+		defer close(closeDone)
+		closeCalls.Add(1)
+		closeStarted <- struct{}{}
+		<-release
+	}}
+	manager.Create(Options{Thread: thread})
+	current = current.Add(sessionIdleTTL + time.Second)
+
+	created := make(chan *Session, 1)
+	go func() { created <- manager.Create(Options{}) }()
+	select {
+	case <-created:
+	case <-time.After(time.Second):
+		t.Fatal("Create() blocked behind the evicted thread's Close()")
+	}
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("evicted thread was never closed")
+	}
+	releaseClose()
+	awaitClosed(t, closeDone)
+	if got := closeCalls.Load(); got != 1 {
+		t.Fatalf("Close() calls = %d, want 1", got)
 	}
 }
 

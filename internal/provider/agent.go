@@ -26,8 +26,11 @@ type ThreadOptions struct {
 
 // ThreadCallbacks connects backend events and approvals to the session caller.
 type ThreadCallbacks struct {
-	Emit    func(event map[string]any)
-	Approve func(req ApprovalRequest) bool
+	Emit func(event map[string]any)
+	// Approve receives a context that is cancelled when the turn can no
+	// longer wait for a decision: the caller's context, a crashed child, or a
+	// closed thread. Implementations must stop waiting when it ends.
+	Approve func(ctx context.Context, req ApprovalRequest) bool
 }
 
 // ApprovalRequest describes an operation that needs the caller's approval.

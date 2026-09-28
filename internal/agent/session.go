@@ -113,7 +113,9 @@ func (m *Manager) Create(o Options) *Session {
 	m.sessions[session.ID] = session
 	m.mu.Unlock()
 	for _, thread := range evicted {
-		thread.Close()
+		// A close can block for seconds on a backend RPC; never stall the
+		// caller of Create behind an eviction sweep.
+		go thread.Close()
 	}
 
 	return session

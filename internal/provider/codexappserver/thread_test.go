@@ -107,7 +107,7 @@ func TestRunCommandApproval(t *testing.T) {
 			})
 			th := mustStartThread(t, fakePool(t, f), provider.ThreadOptions{})
 			var got provider.ApprovalRequest
-			_, err := th.Run(threadContext(t), "hi", "", provider.ThreadCallbacks{Approve: func(req provider.ApprovalRequest) bool { got = req; return accept }})
+			_, err := th.Run(threadContext(t), "hi", "", provider.ThreadCallbacks{Approve: func(_ context.Context, req provider.ApprovalRequest) bool { got = req; return accept }})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -135,7 +135,7 @@ func TestRunNetworkCommandApproval(t *testing.T) {
 	})
 	th := mustStartThread(t, fakePool(t, f), provider.ThreadOptions{})
 	var got provider.ApprovalRequest
-	if _, err := th.Run(threadContext(t), "hi", "", provider.ThreadCallbacks{Approve: func(req provider.ApprovalRequest) bool {
+	if _, err := th.Run(threadContext(t), "hi", "", provider.ThreadCallbacks{Approve: func(_ context.Context, req provider.ApprovalRequest) bool {
 		got = req
 		return true
 	}}); err != nil {
@@ -157,7 +157,7 @@ func TestRunFileChangeApprovalPaths(t *testing.T) {
 	})
 	th := mustStartThread(t, fakePool(t, f), provider.ThreadOptions{})
 	var got provider.ApprovalRequest
-	_, err := th.Run(threadContext(t), "hi", "", provider.ThreadCallbacks{Approve: func(req provider.ApprovalRequest) bool { got = req; return true }})
+	_, err := th.Run(threadContext(t), "hi", "", provider.ThreadCallbacks{Approve: func(_ context.Context, req provider.ApprovalRequest) bool { got = req; return true }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -184,7 +184,7 @@ func TestRunUnsupportedAndStaleRequests(t *testing.T) {
 		completeTurn(f, "thr-1", "turn-1", "completed")
 	})
 	th := mustStartThread(t, fakePool(t, f), provider.ThreadOptions{})
-	text, err := th.Run(threadContext(t), "hi", "", provider.ThreadCallbacks{Approve: func(provider.ApprovalRequest) bool { t.Error("unexpected approval"); return true }})
+	text, err := th.Run(threadContext(t), "hi", "", provider.ThreadCallbacks{Approve: func(context.Context, provider.ApprovalRequest) bool { t.Error("unexpected approval"); return true }})
 	if err != nil || text != "ok" {
 		t.Fatalf("Run = %q, %v", text, err)
 	}
@@ -303,7 +303,11 @@ func TestRunCancelDuringApproval(t *testing.T) {
 	approving := make(chan struct{})
 	result := make(chan error, 1)
 	go func() {
-		_, err := th.Run(ctx, "hi", "", provider.ThreadCallbacks{Approve: func(provider.ApprovalRequest) bool { close(approving); <-ctx.Done(); return false }})
+		_, err := th.Run(ctx, "hi", "", provider.ThreadCallbacks{Approve: func(approveCtx context.Context, _ provider.ApprovalRequest) bool {
+			close(approving)
+			<-approveCtx.Done()
+			return false
+		}})
 		result <- err
 	}()
 	await(t, approving)
@@ -324,6 +328,108 @@ func TestRunCancelDuringApproval(t *testing.T) {
 	assertDecision(t, await(t, reply), "decline")
 	assertParams(t, f, "turn/interrupt", map[string]any{"threadId": "thr-1", "turnId": "turn-1"})
 	assertSecondRun(t, th, f)
+}
+
+// pendingApproval holds callbacks whose Approve blocks until its context ends,
+// reporting that cancellation instead of a decision.
+type pendingApproval struct {
+	cb        provider.ThreadCallbacks
+	started   chan struct{}
+	cancelled chan error
+}
+
+func newPendingApproval() *pendingApproval {
+	a := &pendingApproval{started: make(chan struct{}), cancelled: make(chan error, 1)}
+	a.cb = provider.ThreadCallbacks{Approve: func(ctx context.Context, _ provider.ApprovalRequest) bool {
+		close(a.started)
+		select {
+		case <-ctx.Done():
+			a.cancelled <- ctx.Err()
+		case <-time.After(5 * time.Second):
+			a.cancelled <- errors.New("approval context outlived the wait")
+		}
+		return false
+	}}
+	return a
+}
+
+func TestRunApprovalCancelledByCrash(t *testing.T) {
+	f := threadFake(t)
+	scriptTurn(f, "thr-1", "turn-1", func() {
+		f.Request("item/commandExecution/requestApproval", map[string]string{"threadId": "thr-1", "turnId": "turn-1", "command": "rm x"})
+	})
+	th := mustStartThread(t, fakePool(t, f), provider.ThreadOptions{})
+	approval := newPendingApproval()
+	result := make(chan error, 1)
+	go func() {
+		_, err := th.Run(threadContext(t), "hi", "", approval.cb)
+		result <- err
+	}()
+	await(t, approval.started)
+
+	f.Crash()
+	begin := time.Now()
+	var err error
+	select {
+	case err = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("Run stayed blocked longer than 1s after the child crashed")
+	}
+	if elapsed := time.Since(begin); elapsed >= time.Second {
+		t.Fatalf("Run after crash took %s", elapsed)
+	}
+	if err == nil || !strings.HasPrefix(err.Error(), "codex app-server exited:") {
+		t.Fatalf("Run error = %v, want codex app-server exited: ...", err)
+	}
+	select {
+	case err := <-approval.cancelled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("approve context = %v, want context.Canceled", err)
+		}
+	default:
+		t.Fatal("approve context was not cancelled by the crash")
+	}
+}
+
+func TestRunApprovalCancelledByClose(t *testing.T) {
+	f := threadFake(t)
+	reply := make(chan json.RawMessage, 1)
+	scriptTurn(f, "thr-1", "turn-1", func() {
+		reply <- f.Request("item/commandExecution/requestApproval", map[string]string{"threadId": "thr-1", "turnId": "turn-1", "command": "rm x"})
+	})
+	th := mustStartThread(t, fakePool(t, f), provider.ThreadOptions{})
+	approval := newPendingApproval()
+	result := make(chan error, 1)
+	go func() {
+		_, err := th.Run(threadContext(t), "hi", "", approval.cb)
+		result <- err
+	}()
+	await(t, approval.started)
+
+	th.Close()
+	begin := time.Now()
+	var err error
+	select {
+	case err = <-result:
+	case <-time.After(time.Second):
+		t.Fatal("Run stayed blocked longer than 1s after Close")
+	}
+	if elapsed := time.Since(begin); elapsed >= time.Second {
+		t.Fatalf("Run after Close took %s", elapsed)
+	}
+	if !errors.Is(err, errThreadClosed) {
+		t.Fatalf("Run error = %v, want %v", err, errThreadClosed)
+	}
+	select {
+	case err := <-approval.cancelled:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("approve context = %v, want context.Canceled", err)
+		}
+	default:
+		t.Fatal("approve context was not cancelled by Close")
+	}
+	// The connection is still alive, so the pending request is declined.
+	assertDecision(t, await(t, reply), "decline")
 }
 
 func TestRunCancelInterruptTimeout(t *testing.T) {
@@ -436,7 +542,10 @@ func TestRunTwoThreadsInterleaved(t *testing.T) {
 	for i, th := range threads {
 		go func() {
 			var r result
-			r.text, r.err = th.Run(ctx, "hi", "", provider.ThreadCallbacks{Emit: func(e map[string]any) { r.events = append(r.events, e) }, Approve: func(a provider.ApprovalRequest) bool { r.approvals = append(r.approvals, a); return true }})
+			r.text, r.err = th.Run(ctx, "hi", "", provider.ThreadCallbacks{Emit: func(e map[string]any) { r.events = append(r.events, e) }, Approve: func(_ context.Context, a provider.ApprovalRequest) bool {
+				r.approvals = append(r.approvals, a)
+				return true
+			}})
 			results[i] <- r
 		}()
 	}
@@ -601,7 +710,7 @@ func TestCloseActiveTurnRejectsQueuedApprovalAndInterrupts(t *testing.T) {
 		runDone := make(chan error, 1)
 		ctx := threadContext(t)
 		go func() {
-			_, err := th.Run(ctx, "hi", "", provider.ThreadCallbacks{Approve: func(req provider.ApprovalRequest) bool {
+			_, err := th.Run(ctx, "hi", "", provider.ThreadCallbacks{Approve: func(_ context.Context, req provider.ApprovalRequest) bool {
 				if req.Command != "one" {
 					t.Errorf("unexpected approval: %+v", req)
 					return false
@@ -798,7 +907,7 @@ func TestThreadGoroutines(t *testing.T) {
 			defer closeApprove()
 			closeRunDone := make(chan error, 1)
 			go func() {
-				_, err := th.Run(threadContext(t), "close", "", provider.ThreadCallbacks{Approve: func(provider.ApprovalRequest) bool {
+				_, err := th.Run(threadContext(t), "close", "", provider.ThreadCallbacks{Approve: func(context.Context, provider.ApprovalRequest) bool {
 					close(approving)
 					<-releaseApprove
 					return false
