@@ -28,6 +28,13 @@ default_model = "claude-sonnet-5"
 models = [{ id = "claude-sonnet-5" }]
 `
 
+const codexTOML = `
+[providers.codex]
+api = "codex-app-server"
+default_model = "gpt-6-astra"
+models = [{ id = "gpt-6-astra" }]
+`
+
 func writeConfig(t *testing.T, content string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "config.toml")
@@ -67,6 +74,45 @@ func TestLoadValid(t *testing.T) {
 	}
 	if cfg.Path == "" {
 		t.Fatalf("Path not recorded")
+	}
+}
+
+func TestLoadCodexAppServerProvider(t *testing.T) {
+	cfg, err := Load(writeConfig(t, codexTOML))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	p := cfg.Providers["codex"]
+	if p.API != APICodexAppServer || p.BaseURL != "" || p.Command != "" {
+		t.Fatalf("Provider(codex) = %#v", p)
+	}
+	if key, err := cfg.APIKeyFor("codex"); err != nil || key != "" {
+		t.Fatalf("APIKeyFor(codex) = %q, %v, want empty key and nil error", key, err)
+	}
+	if keys := cfg.EnvKeys(); len(keys) != 0 {
+		t.Fatalf("EnvKeys() = %q, want no keys", keys)
+	}
+}
+
+func TestLoadCodexAppServerCommand(t *testing.T) {
+	cfg, err := Load(writeConfig(t, codexTOML+`command = "/opt/codex/bin/codex"`))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.Providers["codex"].Command; got != "/opt/codex/bin/codex" {
+		t.Fatalf("Command = %q, want /opt/codex/bin/codex", got)
+	}
+}
+
+func TestEnvKeys(t *testing.T) {
+	content := validTOML + codexTOML + strings.Replace(codexTOML, "providers.codex", "providers.codex2", 1)
+	content += strings.ReplaceAll(validTOML, "providers.", "providers.other-")
+	cfg, err := Load(writeConfig(t, content))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if keys := cfg.EnvKeys(); !reflect.DeepEqual(keys, []string{"ANT_TEST_KEY", "DS_TEST_KEY"}) {
+		t.Fatalf("EnvKeys() = %q, want sorted, deduplicated, non-empty keys", keys)
 	}
 }
 
@@ -157,6 +203,12 @@ func TestLoadErrors(t *testing.T) {
 		{"unknown provider key", strings.Replace(validTOML, `env_key = "ANT_TEST_KEY"`, "env_key = \"ANT_TEST_KEY\"\nmodel = \"x\"", 1), "model"},
 		{"bad api", strings.Replace(validTOML, `api = "messages"`, `api = "grpc"`, 1), "providers.anthropic.api"},
 		{"missing env_key", strings.Replace(validTOML, `env_key = "ANT_TEST_KEY"`, "", 1), "providers.anthropic.env_key"},
+		{"codex env_key", codexTOML + `env_key = "X"`, "providers.codex.env_key is not used by codex-app-server: authentication goes through codex login"},
+		{"codex base_url", codexTOML + `base_url = "https://x"`, "providers.codex.base_url is not used by codex-app-server"},
+		{"native command", validTOML + `command = "codex"`, "providers.anthropic.command is only valid for codex-app-server"},
+		{"chat-completions command", strings.Replace(validTOML, `api = "chat-completions"`, "api = \"chat-completions\"\ncommand = \"codex\"", 1), "providers.deepseek.command is only valid for codex-app-server"},
+		{"responses command", strings.Replace(validTOML, `api = "chat-completions"`, "api = \"responses\"\ncommand = \"codex\"", 1), "providers.deepseek.command is only valid for codex-app-server"},
+		{"codex missing default_model", strings.Replace(codexTOML, `default_model = "gpt-6-astra"`, "", 1), "providers.codex.default_model"},
 		{"default not in models", strings.Replace(validTOML, `default_model = "claude-sonnet-5"`, `default_model = "claude-opus-5"`, 1), "providers.anthropic.default_model"},
 		{"empty models", strings.Replace(validTOML, `models = [{ id = "claude-sonnet-5" }]`, "models = []", 1), "providers.anthropic.models"},
 		{"duplicate model", strings.Replace(validTOML, `{ id = "deepseek-v4-pro" }`, `{ id = "deepseek-flash" }`, 1), "providers.deepseek.models"},

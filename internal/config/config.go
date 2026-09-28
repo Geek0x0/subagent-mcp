@@ -20,6 +20,7 @@ const (
 	APIChatCompletions = "chat-completions"
 	APIResponses       = "responses"
 	APIMessages        = "messages"
+	APICodexAppServer  = "codex-app-server"
 )
 
 // EffortValues lists the reasoning effort values accepted from callers.
@@ -38,6 +39,7 @@ type Provider struct {
 	API             string            `toml:"api"`
 	BaseURL         string            `toml:"base_url"`
 	EnvKey          string            `toml:"env_key"`
+	Command         string            `toml:"command"`
 	DefaultModel    string            `toml:"default_model"`
 	Models          []Model           `toml:"models"`
 	EffortMap       map[string]string `toml:"effort_map"`
@@ -135,12 +137,24 @@ func (c *Config) Validate() error {
 
 func (p Provider) validate(prefix string) error {
 	switch p.API {
-	case APIChatCompletions, APIResponses, APIMessages:
+	case APIChatCompletions, APIResponses, APIMessages, APICodexAppServer:
 	default:
-		return fmt.Errorf("%s.api must be one of %s, %s, %s; got %q", prefix, APIChatCompletions, APIResponses, APIMessages, p.API)
+		return fmt.Errorf("%s.api must be one of %s, %s, %s, %s; got %q", prefix, APIChatCompletions, APIResponses, APIMessages, APICodexAppServer, p.API)
 	}
-	if p.EnvKey == "" {
-		return fmt.Errorf("%s.env_key is required", prefix)
+	if p.API == APICodexAppServer {
+		if p.EnvKey != "" {
+			return fmt.Errorf("%s.env_key is not used by codex-app-server: authentication goes through codex login", prefix)
+		}
+		if p.BaseURL != "" {
+			return fmt.Errorf("%s.base_url is not used by codex-app-server", prefix)
+		}
+	} else {
+		if p.Command != "" {
+			return fmt.Errorf("%s.command is only valid for codex-app-server", prefix)
+		}
+		if p.EnvKey == "" {
+			return fmt.Errorf("%s.env_key is required", prefix)
+		}
 	}
 	if len(p.Models) == 0 {
 		return fmt.Errorf("%s.models must list at least one model", prefix)
@@ -180,10 +194,14 @@ func (c *Config) Provider(name string) (Provider, error) {
 }
 
 // APIKeyFor returns the named provider's API key from its env_key variable.
+// Codex app-server providers use codex login and return an empty key.
 func (c *Config) APIKeyFor(name string) (string, error) {
 	p, err := c.Provider(name)
 	if err != nil {
 		return "", err
+	}
+	if p.API == APICodexAppServer {
+		return "", nil
 	}
 	key := os.Getenv(p.EnvKey)
 	if key == "" {
@@ -202,11 +220,13 @@ func (c *Config) ProviderNames() []string {
 	return names
 }
 
-// EnvKeys returns every provider's env_key, sorted and deduplicated.
+// EnvKeys returns every non-empty provider env_key, sorted and deduplicated.
 func (c *Config) EnvKeys() []string {
 	set := map[string]bool{}
 	for _, p := range c.Providers {
-		set[p.EnvKey] = true
+		if p.EnvKey != "" {
+			set[p.EnvKey] = true
+		}
 	}
 	keys := make([]string, 0, len(set))
 	for key := range set {
