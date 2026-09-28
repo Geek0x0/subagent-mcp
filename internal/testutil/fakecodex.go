@@ -222,6 +222,18 @@ func MaybeRunFakeCodexAppServer() {
 	if os.Getenv("SUBAGENT_FAKE_CODEX") != "1" || len(os.Args) < 2 || os.Args[1] != "app-server" {
 		return
 	}
+	if path := os.Getenv("SUBAGENT_FAKE_CODEX_ENV_FILE"); path != "" {
+		var names []string
+		for _, entry := range os.Environ() {
+			name, _, _ := strings.Cut(entry, "=")
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		if err := os.WriteFile(path, []byte(strings.Join(names, "\n")+"\n"), 0o600); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
 	if err := serveFakeCodexAppServer(os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

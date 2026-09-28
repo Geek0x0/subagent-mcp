@@ -21,6 +21,8 @@ const (
 	checkMainEnvKey   = "SUBAGENT_CHECK_TEST_API_KEY"
 	checkMainPathEnv  = "SUBAGENT_CHECK_TEST_PATH"
 	checkMainValueKey = "sk-check-child-secret"
+	checkCodexEnvKey  = "SUBAGENT_CHECK_CODEX_NATIVE_KEY"
+	checkCodexEnvFile = "SUBAGENT_FAKE_CODEX_ENV_FILE"
 
 	validTestConfig = `
 [providers.test]
@@ -155,6 +157,61 @@ func TestMainCheckConfigMissingPath(t *testing.T) {
 		if !strings.Contains(string(output), want) {
 			t.Fatalf("main() --check-config missing path output = %q, want it to contain %q", output, want)
 		}
+	}
+}
+
+func TestMainCheckConfigScrubsNativeProviderKeyFromCodex(t *testing.T) {
+	if os.Getenv(mainChild) == t.Name() {
+		os.Args = []string{os.Args[0], "--check-config"}
+		main()
+		os.Exit(0)
+	}
+
+	fake := testutil.NewFakeChat(t, nil)
+	fake.SetModels([]string{"test-model"})
+	envFile := filepath.Join(t.TempDir(), "codex-env")
+	contents := fmt.Sprintf(`
+[providers.codex]
+api = "codex-app-server"
+command = %q
+default_model = "gpt-6-astra"
+models = [{ id = "gpt-6-astra" }]
+
+[providers.native]
+api = "chat-completions"
+base_url = %q
+env_key = %q
+default_model = "test-model"
+models = [{ id = "test-model" }]
+`, os.Args[0], fake.URL, checkCodexEnvKey)
+	path := writeConfigFile(t, contents)
+
+	cmd := newMainChildCommand(t)
+	cmd.Env = append(cmd.Env,
+		"SUBAGENT_MCP_CONFIG="+path,
+		checkCodexEnvKey+"=sk-codex-native-secret",
+		"SUBAGENT_FAKE_CODEX=1",
+		checkCodexEnvFile+"="+envFile,
+	)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("main() --check-config error = %v; output:\n%s", err, output)
+	}
+
+	data, err := os.ReadFile(envFile)
+	if err != nil {
+		t.Fatalf("os.ReadFile(%q) error = %v; check-config output:\n%s", envFile, err, output)
+	}
+	names := strings.Split(string(data), "\n")
+	present := make(map[string]bool, len(names))
+	for _, name := range names {
+		present[name] = true
+	}
+	if present[checkCodexEnvKey] {
+		t.Fatalf("codex app-server inherited native provider key %q; environment names:\n%s", checkCodexEnvKey, data)
+	}
+	if !present["SUBAGENT_FAKE_CODEX"] {
+		t.Fatalf("codex app-server environment is missing positive-control marker; environment names:\n%s", data)
 	}
 }
 

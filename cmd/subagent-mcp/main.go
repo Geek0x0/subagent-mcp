@@ -43,6 +43,7 @@ func main() {
 			fmt.Printf("config   %s   FAIL: %v\n", path, err)
 			os.Exit(1)
 		}
+		configureRuntime(cfg)
 		fmt.Printf("config   %s   OK\n", path)
 		os.Exit(runCheck(os.Stdout, cfg, *liveFlag))
 	}
@@ -55,8 +56,7 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	tools.SetScrubbedEnv(cfg.EnvKeys(), []string{"SUBAGENT_MCP_"})
-	tools.SetProtectedFiles([]string{cfg.Path})
+	configureRuntime(cfg)
 
 	var options []dsserver.Option
 	if toolName := os.Getenv("SUBAGENT_MCP_TOOL_NAME"); toolName != "" {
@@ -69,4 +69,9 @@ func main() {
 	if err := dsserver.New(cfg, version, options...).ServeStdio(); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func configureRuntime(cfg *config.Config) {
+	tools.SetScrubbedEnv(cfg.EnvKeys(), []string{"SUBAGENT_MCP_"})
+	tools.SetProtectedFiles([]string{cfg.Path})
 }
