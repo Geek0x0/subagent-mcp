@@ -30,3 +30,12 @@ env_key = "ANTHROPIC_API_KEY"
 default_model = "claude-sonnet-5"
 max_output_tokens = 64000
 models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
+
+# codex-app-server: experimental; uses Codex's own tools, sandbox, and login.
+# Run `codex login` first. Do not set env_key or base_url for this api.
+# [providers.codex]
+# api = "codex-app-server"
+# command = "codex"   # optional; default "codex" on PATH
+# default_model = "gpt-6-astra"
+# models = [{ id = "gpt-6-astra" }, { id = "gpt-6-sol" }, { id = "gpt-5.5" }]
+# effort_map = { none = "low", minimal = "low" }

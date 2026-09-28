@@ -1,12 +1,13 @@
 # subagent-mcp
 
-subagent-mcp is one MCP server binary that exposes a coding agent — real shell and file-tool execution, a Landlock write sandbox, approvals, rollout files, cancellation, and progress notifications — driven by any of three model API families. The MCP caller selects which configured provider a session uses via the `provider` argument.
+subagent-mcp is one MCP server binary that exposes a coding agent — real shell and file-tool execution, a Landlock write sandbox, approvals, rollout files, cancellation, and progress notifications — driven by any of three model API families, or delegates whole sessions to Codex through its app-server. The MCP caller selects which configured provider a session uses via the `provider` argument.
 
 | `api` value | Wire protocol | Example providers |
 |---|---|---|
 | `chat-completions` | OpenAI Chat Completions, streaming SSE | DeepSeek, any OpenAI-compatible endpoint |
 | `responses` | OpenAI Responses API, streaming SSE | OpenAI |
 | `messages` | Anthropic Messages API, streaming SSE | Anthropic |
+| `codex-app-server` | Codex app-server, JSON-RPC over stdio | Local Codex CLI (experimental) |
 
 ## Install
 
@@ -42,7 +43,7 @@ subagent-mcp is one MCP server binary that exposes a coding agent — real shell
    claude plugin install subagent@subagent-mcp
    ```
 
-4. Create the config file and provide each provider's key you plan to use in the environment that launches the MCP server:
+4. Create the config file and provide each provider's key you plan to use in the environment that launches the MCP server (for Codex, use `codex login` instead):
 
    ```bash
    mkdir -p ~/.config/subagent-mcp
@@ -86,9 +87,10 @@ models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
 
 | Field | Level | Required | Rules |
 |---|---|---|---|
-| `api` | provider | yes | One of `chat-completions`, `responses`, `messages`. |
-| `base_url` | provider | no | Defaults per api: `https://api.openai.com/v1` for `chat-completions` and `responses`, `https://api.anthropic.com` for `messages`. |
-| `env_key` | provider | yes | Name of the environment variable holding the key. Its value is read when a session is created for that provider (via the `provider` argument, or the sole configured provider); a missing value fails that call naming the variable and `providers.<name>.env_key`. |
+| `api` | provider | yes | One of `chat-completions`, `responses`, `messages`, `codex-app-server`. |
+| `base_url` | provider | no | Defaults per api: `https://api.openai.com/v1` for `chat-completions` and `responses`, `https://api.anthropic.com` for `messages`. Rejected when non-empty for `codex-app-server`, which has no URL default. |
+| `env_key` | provider | except Codex | Name of the environment variable holding the key. Its value is read when a session is created for that provider (via the `provider` argument, or the sole configured provider); a missing value fails that call naming the variable and `providers.<name>.env_key`. Rejected when non-empty for `codex-app-server`: authentication goes through `codex login`. |
+| `command` | provider | no | Executable name or path for `codex-app-server`; defaults to `codex` on `PATH`. The server adds the `app-server` argument; this is not a shell command or argument list. Rejected when non-empty for every other api. |
 | `default_model` | provider | yes | Must be one of `models[].id`. Used when a caller omits `model`. |
 | `models` | provider | yes | Non-empty list of `{ id, description? }` tables; ids must be unique and are advertised in config order. |
 | `effort_map` | provider | no | Maps a caller effort value to the value sent to the API: `effort_map[value]` if present, else the caller's value. Keys and values must be in the effort set below. |
@@ -100,22 +102,34 @@ Accepted caller values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, 
 
 ### API keys
 
-Keys are never stored in the config file. When a session is created, the server reads the selected provider's `env_key` variable from its own environment; every provider's `env_key` variable is also removed from shell commands run by the agent (see [Environment](#environment)). Keep the variable in the environment that launches the MCP server, for example in an MCP client's `env` block or your shell profile.
+Keys are never stored in the config file. For the three model API families, when a session is created, the server reads the selected provider's `env_key` variable from its own environment; every provider's `env_key` variable is also removed from shell commands run by the agent (see [Environment](#environment)). Keep the variable in the environment that launches the MCP server, for example in an MCP client's `env` block or your shell profile. Codex uses its own login instead.
 
 ### Selecting a provider
 
 Pass `provider` when starting a session to choose which configured provider it uses; the tool schema's `enum` lists every name defined under `[providers]`. Omitting `provider` works only when the config defines exactly one provider — with two or more, omitting it is a tool error listing the available names. The chosen provider is fixed for the session's lifetime: `subagent-reply` always continues with the same one, and each call's `model` must come from that provider's list.
 
+### Codex app-server provider
+
+`codex-app-server` is **experimental**, tested with **codex-cli 0.156.1**. Install Codex, run `codex login` as the user launching the MCP server, and enable the commented `[providers.codex]` block in `config.example.toml`. Set `command` only if the executable is not `codex` on `PATH`; omit `env_key` and `base_url`.
+
+The session inherits the user's whole Codex environment — auth, config, plugins, hooks, skills, MCP servers, and AGENTS.md — and uses **Codex's own tools and sandbox**, not subagent-mcp's native four-tool runner or Landlock policy. The app-server child still receives an environment scrubbed of configured `env_key` variables and `SUBAGENT_MCP_*` variables. The native tool, prompt-loading, sandbox, and rollout details elsewhere in this README apply to the three model API families; Codex differs as follows:
+
+- `config.max_turns` is ignored; Codex manages the agent loop.
+- AGENTS.md is loaded by Codex, not assembled into the prompt by subagent-mcp.
+- `base-instructions` replaces Codex's base prompt only when given a non-empty value; omitting it leaves Codex's own base prompt intact. `developer-instructions` is forwarded separately.
+- Codex owns the non-ephemeral thread and its rollout under `~/.codex/sessions` (or the user's configured Codex home). It appears in Codex history; subagent-mcp does not write a second rollout, and `SUBAGENT_MCP_ROLLOUT=off` does not disable Codex's rollout.
+- `sandbox` is forwarded to Codex; `approval-policy` is forwarded with `on-failure` mapped to `on-request`. Command and file-change approvals are relayed to the MCP client. `config.writable_roots` is forwarded only for `workspace-write`.
+
 ## Validating the config
 
-`--check-config` loads and validates the config file, reports every provider's `env_key` name and whether it is set, and asks each reachable provider's API for its model list so a wrong key, base URL, or model id fails loudly:
+`--check-config` loads and validates the config file, reports each model API provider's `env_key` name and whether it is set (or Codex's `auth` status), and asks each reachable provider for its model list so authentication and reachability errors fail loudly and unlisted model ids are warned about:
 
 ```bash
 subagent-mcp --check-config [path]
 subagent-mcp --check-config --live [path]
 ```
 
-The optional `path` defaults to `$SUBAGENT_MCP_CONFIG` or `~/.config/subagent-mcp/config.toml`. Flags must come before the path. The process exits 0 unless a provider check actually failed or no configured provider has a key set; a missing config, unknown TOML key, or invalid field is reported naming the path or field, and a missing key is always skipped — the overall result fails only when no configured provider has a key set, or a reachability/model check actually failed. Output looks like:
+The optional `path` defaults to `$SUBAGENT_MCP_CONFIG` or `~/.config/subagent-mcp/config.toml`. Flags must come before the path. The process exits 0 unless a provider check actually failed or no provider has a key set or passes Codex auth. A missing config, unknown TOML key, or invalid field is reported naming the path or field. A missing API key is skipped, but a Codex auth failure counts as failed. Output looks like:
 
 ```
 config   /home/you/.config/subagent-mcp/config.toml   OK
@@ -129,9 +143,24 @@ provider deepseek (chat-completions)
 result   PASS (1 checked, 1 skipped, 0 failed)
 ```
 
-If no configured provider has a key set, the result line instead reads `result   FAIL (0 checked, N skipped, 0 failed) — no configured provider has its key set`.
+If no configured provider has a key set or passes Codex auth, and none failed, the result line instead reads `result   FAIL (0 checked, N skipped, 0 failed) — no configured provider has its key set`.
 
-`model ... WARN` means a configured model id is not in the provider's current list; it does not affect the exit code. `--live` is opt-in and makes one real, billed tool-call round trip per reachable provider using `default_model` and effort `low`, printing a warning first; use it deliberately, not in CI. Neither mode ever prints a key value, only the variable names.
+For a Codex-only config, an illustrative `--check-config` result is:
+
+```text
+config   /home/you/.config/subagent-mcp/config.toml   OK
+provider codex (codex-app-server)
+  auth   chatgpt (plus)   OK
+  api    codex-cli 0.156.1   OK (7 models listed)
+  model  gpt-6-astra     OK
+  model  gpt-6-sol     OK
+  model  gpt-5.5     OK
+result   PASS (1 checked, 0 skipped, 0 failed)
+```
+
+The `auth` line replaces `key`: the server starts Codex app-server and calls `account/read`, then `model/list` for the `api` and `model` lines. Account type, plan, version, and model count depend on the installation. A missing login prints `  auth   FAIL: not logged in; run codex login`; a process-start error also prints `  auth   FAIL: <error>`. A model-list failure prints `  api    FAIL: <error>`. Passing auth counts as checked; an auth or API failure counts as failed.
+
+`model ... WARN` means a configured model id is not in the provider's current list; it does not affect the exit code. `--live` is opt-in and makes one real, billed tool-call round trip per reachable model API provider using `default_model` and effort `low`. For Codex it instead runs one ephemeral, read-only thread with approval policy `never`, asking for a fixed number and checking the final answer contains it. Its line is `  live   <default_model>   OK (turn succeeded, <duration>)` or `  live   <default_model>   FAIL: <error>`. Both paths print the billed-call warning first; use `--live` deliberately, not in CI. Neither mode ever prints a key value.
 
 ## Environment
 

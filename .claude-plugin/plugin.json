@@ -1,6 +1,6 @@
 {
   "name": "subagent",
-  "version": "0.8.0",
+  "version": "0.9.0",
   "description": "subagent-mcp coding agent exposed as MCP tools (subagent / subagent-reply)",
   "author": {
     "name": "Kaidi Shi"

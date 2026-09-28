@@ -7,6 +7,8 @@ description: Dispatch coding work units to the subagent MCP tools (subagent / su
 
 The MCP tool names follow the server's `SUBAGENT_MCP_TOOL_NAME` environment variable, which defaults to `subagent`. The server's config file can define more than one model provider (DeepSeek over Chat Completions, OpenAI over Responses, Anthropic over Messages, or others); the caller selects which one a session uses via the `provider` argument on the start tool.
 
+With an experimental `codex-app-server` provider, the session inherits the user's Codex environment and uses Codex's own tools and sandbox, not the native tool and Landlock rules below. `config.max_turns` has no effect; Codex loads AGENTS.md, and a non-empty `base-instructions` replaces Codex's base prompt only when supplied. Codex owns the rollout under `~/.codex/sessions` (or the configured Codex home); `SUBAGENT_MCP_ROLLOUT=off` does not disable it. Authentication uses `codex login`, not `env_key`.
+
 ## New session vs reply
 
 Call `subagent` for a new, independent work unit. Start a new session whenever the task needs a different working directory, model, sandbox, approval policy, instruction set, or turn limit. These settings are fixed when the session is created.
