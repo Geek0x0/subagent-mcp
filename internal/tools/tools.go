@@ -82,7 +82,7 @@ func runCommand(ctx context.Context, cwd string, argv []string, timeout time.Dur
 	var buf limitedBuffer
 	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
 	cmd.Dir = cwd
-	cmd.Env = scrubbedEnv()
+	cmd.Env = ScrubbedEnv()
 	// ponytail: Linux process-group signaling kills ordinary descendants, and WaitDelay bounds
 	// inherited-pipe waits. A descendant that escapes the group can survive without being reported.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -148,10 +148,10 @@ func SetProtectedFiles(paths []string) {
 	}
 }
 
-// scrubbedEnv returns the current environment without the configured secret
+// ScrubbedEnv returns the current environment without the configured secret
 // names and prefixes so that commands run by the agent cannot read provider
 // API keys from the server's environment.
-func scrubbedEnv() []string {
+func ScrubbedEnv() []string {
 	scrubMu.RLock()
 	defer scrubMu.RUnlock()
 	env := os.Environ()

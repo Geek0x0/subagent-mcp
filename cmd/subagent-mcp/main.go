@@ -8,6 +8,7 @@ import (
 
 	"github.com/Geek0x0/subagent-mcp/internal/config"
 	_ "github.com/Geek0x0/subagent-mcp/internal/provider/chatcompletions"
+	_ "github.com/Geek0x0/subagent-mcp/internal/provider/codexappserver"
 	_ "github.com/Geek0x0/subagent-mcp/internal/provider/messages"
 	_ "github.com/Geek0x0/subagent-mcp/internal/provider/responses"
 	"github.com/Geek0x0/subagent-mcp/internal/sandbox"

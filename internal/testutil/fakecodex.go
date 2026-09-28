@@ -4,6 +4,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -209,4 +213,159 @@ func (f *FakeCodex) handle(msg codexMessage, handler func(json.RawMessage) (any,
 		return
 	}
 	f.send(codexMessage{ID: msg.ID, Result: raw})
+}
+
+// MaybeRunFakeCodexAppServer lets a test binary serve as <command> app-server.
+// Call it first in TestMain. It returns unless explicitly enabled in a child;
+// the stdio server exits successfully on stdin EOF and never runs the tests.
+func MaybeRunFakeCodexAppServer() {
+	if os.Getenv("SUBAGENT_FAKE_CODEX") != "1" || len(os.Args) < 2 || os.Args[1] != "app-server" {
+		return
+	}
+	if err := serveFakeCodexAppServer(os.Stdin, os.Stdout); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Exit(0)
+}
+
+func serveFakeCodexAppServer(r io.Reader, w io.Writer) error {
+	decoder, encoder := json.NewDecoder(r), json.NewEncoder(w)
+	threads := make(map[string]bool)
+	var nextThread, nextTurn int
+	for {
+		var msg codexMessage
+		if err := decoder.Decode(&msg); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+		if len(msg.ID) == 0 { // initialized and other client notifications.
+			continue
+		}
+		var params struct {
+			ThreadID string                        `json:"threadId"`
+			TurnID   string                        `json:"turnId"`
+			Cursor   string                        `json:"cursor"`
+			Input    []struct{ Type, Text string } `json:"input"`
+		}
+		if len(msg.Params) != 0 {
+			if err := json.Unmarshal(msg.Params, &params); err != nil {
+				return err
+			}
+		}
+		var result any
+		var rpcErr *codexError
+		type notification struct {
+			method string
+			params any
+		}
+		var notifications []notification
+		switch msg.Method {
+		case "initialize":
+			result = map[string]string{"userAgent": "subagent-mcp/0.156.1 (fake)"}
+		case "account/read":
+			var account any = map[string]string{"type": "chatgpt", "planType": "plus"}
+			if os.Getenv("SUBAGENT_FAKE_CODEX_LOGGED_OUT") == "1" {
+				account = nil
+			}
+			result = map[string]any{"account": account, "requiresOpenaiAuth": true}
+		case "model/list":
+			var models []string
+			if value := os.Getenv("SUBAGENT_FAKE_CODEX_MODELS"); value != "" {
+				models = strings.Split(value, ",")
+			}
+			start := 0
+			if params.Cursor != "" {
+				var err error
+				start, err = strconv.Atoi(params.Cursor)
+				if err != nil || start < 0 || start > len(models) {
+					rpcErr = &codexError{Code: -32602, Message: "invalid cursor"}
+					break
+				}
+			}
+			// One model per page exercises the adapter's nextCursor handling.
+			data := []map[string]string{}
+			var nextCursor any
+			if start < len(models) {
+				data = append(data, map[string]string{"id": models[start]})
+				if start+1 < len(models) {
+					nextCursor = strconv.Itoa(start + 1)
+				}
+			}
+			result = map[string]any{"data": data, "nextCursor": nextCursor}
+		case "thread/start":
+			nextThread++
+			id := fmt.Sprintf("thr-%d", nextThread)
+			threads[id] = true
+			result = map[string]any{"thread": map[string]string{"id": id}}
+		case "thread/resume":
+			threads[params.ThreadID] = true
+			result = map[string]any{"thread": map[string]string{"id": params.ThreadID}}
+		case "thread/unsubscribe":
+			result = struct{}{}
+		case "turn/start":
+			if !threads[params.ThreadID] {
+				rpcErr = &codexError{Code: -32602, Message: "thread must be started or resumed"}
+				break
+			}
+			if os.Getenv("SUBAGENT_FAKE_CODEX_CRASH") == "1" {
+				return fmt.Errorf("fatal: boom")
+			}
+			nextTurn++
+			id := fmt.Sprintf("turn-%d", nextTurn)
+			var prompt strings.Builder
+			for _, input := range params.Input {
+				if input.Type == "text" {
+					prompt.WriteString(input.Text)
+				}
+			}
+			text := "echo: " + prompt.String()
+			if prompt.String() == "__env__" {
+				var names []string
+				for _, entry := range os.Environ() {
+					name, _, _ := strings.Cut(entry, "=")
+					names = append(names, name)
+				}
+				sort.Strings(names)
+				text = strings.Join(names, "\n")
+			}
+			result = map[string]any{"turn": map[string]string{"id": id}}
+			notifications = []notification{
+				{"turn/started", map[string]any{"threadId": params.ThreadID, "turn": map[string]string{"id": id}}},
+				{"item/completed", map[string]any{"threadId": params.ThreadID, "turnId": id, "item": map[string]string{
+					"id": "item-" + id, "type": "agentMessage", "phase": "final_answer", "text": text,
+				}}},
+				{"turn/completed", map[string]any{"threadId": params.ThreadID, "turn": map[string]string{"id": id, "status": "completed"}}},
+			}
+		case "turn/interrupt":
+			result = struct{}{}
+			notifications = []notification{{"turn/completed", map[string]any{
+				"threadId": params.ThreadID, "turn": map[string]string{"id": params.TurnID, "status": "interrupted"},
+			}}}
+		default:
+			rpcErr = &codexError{Code: -32601, Message: "method not found"}
+		}
+		reply := codexMessage{ID: msg.ID, Error: rpcErr}
+		if rpcErr == nil {
+			var err error
+			reply.Result, err = json.Marshal(result)
+			if err != nil {
+				return err
+			}
+		}
+		if err := encoder.Encode(reply); err != nil {
+			return err
+		}
+		for _, n := range notifications {
+			raw, err := json.Marshal(n.params)
+			if err != nil {
+				return err
+			}
+			if err := encoder.Encode(codexMessage{Method: n.method, Params: raw}); err != nil {
+				return err
+			}
+		}
+	}
 }
