@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -122,6 +123,30 @@ func TestRunCommandApproval(t *testing.T) {
 	}
 }
 
+func TestRunNetworkCommandApproval(t *testing.T) {
+	f := threadFake(t)
+	reply := make(chan json.RawMessage, 1)
+	scriptTurn(f, "thr-1", "turn-1", func() {
+		reply <- f.Request("item/commandExecution/requestApproval", map[string]any{
+			"threadId": "thr-1", "turnId": "turn-1", "command": nil,
+			"networkApprovalContext": map[string]string{"host": "example.com", "protocol": "https"},
+		})
+		completeTurn(f, "thr-1", "turn-1", "completed")
+	})
+	th := mustStartThread(t, fakePool(t, f), provider.ThreadOptions{})
+	var got provider.ApprovalRequest
+	if _, err := th.Run(threadContext(t), "hi", "", provider.ThreadCallbacks{Approve: func(req provider.ApprovalRequest) bool {
+		got = req
+		return true
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	if got.Command != "example.com" {
+		t.Fatalf("approval command = %q, want network host", got.Command)
+	}
+	assertDecision(t, await(t, reply), "accept")
+}
+
 func TestRunFileChangeApprovalPaths(t *testing.T) {
 	f := threadFake(t)
 	reply := make(chan json.RawMessage, 1)
@@ -192,9 +217,15 @@ func TestRunFailedTurn(t *testing.T) {
 		f.Notify("turn/completed", map[string]any{"threadId": "thr-1", "turn": map[string]any{"id": "turn-1", "status": "failed", "error": map[string]string{"message": "quota"}}})
 	})
 	th := mustStartThread(t, fakePool(t, f), provider.ThreadOptions{})
-	_, err := th.Run(threadContext(t), "hi", "", provider.ThreadCallbacks{})
+	var events []string
+	_, err := th.Run(threadContext(t), "hi", "", provider.ThreadCallbacks{Emit: func(event map[string]any) {
+		events = append(events, event["type"].(string))
+	}})
 	if err == nil || !strings.Contains(err.Error(), "quota") {
 		t.Fatalf("Run error = %v", err)
+	}
+	if want := []string{"task_started"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
 	}
 }
 
@@ -229,9 +260,11 @@ func TestRunCancelInterrupts(t *testing.T) {
 	ctx, cancel := context.WithCancel(threadContext(t))
 	defer cancel()
 	started := make(chan struct{})
+	var events []string
 	result := make(chan error, 1)
 	go func() {
 		_, err := th.Run(ctx, "hi", "", provider.ThreadCallbacks{Emit: func(e map[string]any) {
+			events = append(events, e["type"].(string))
 			if e["type"] == "task_started" {
 				close(started)
 			}
@@ -246,6 +279,9 @@ func TestRunCancelInterrupts(t *testing.T) {
 	}
 	if elapsed := time.Since(begin); elapsed >= time.Second {
 		t.Fatalf("cancel took %s", elapsed)
+	}
+	if want := []string{"task_started"}; !reflect.DeepEqual(events, want) {
+		t.Fatalf("events = %v, want %v", events, want)
 	}
 	assertParams(t, f, "turn/interrupt", map[string]any{"threadId": "thr-1", "turnId": "turn-1"})
 	assertSecondRun(t, th, f)
@@ -440,46 +476,58 @@ func TestRunTwoThreadsInterleaved(t *testing.T) {
 func TestRunCrashThenResume(t *testing.T) {
 	for _, duringStart := range []bool{false, true} {
 		t.Run(fmt.Sprint(duringStart), func(t *testing.T) {
-			f1, f2 := threadFake(t), threadFake(t)
-			p := fakePool(t, f1, f2)
-			scriptTurn(f1, "thr-1", "turn-1", func() { completeTurn(f1, "thr-1", "turn-1", "completed") })
-			th := mustStartThread(t, p, provider.ThreadOptions{})
-			if _, err := th.Run(threadContext(t), "first", "", provider.ThreadCallbacks{}); err != nil {
-				t.Fatal(err)
-			}
-			if duringStart {
-				f1.Handle("turn/start", func(json.RawMessage) (any, error) { f1.Crash(); return nil, nil })
-			} else {
-				scriptTurn(f1, "thr-1", "turn-2", func() {})
-			}
-			_, err := th.Run(threadContext(t), "crash", "", provider.ThreadCallbacks{Emit: func(e map[string]any) {
-				if e["type"] == "task_started" {
-					f1.Crash()
-				}
-			}})
-			if err == nil || !strings.HasPrefix(err.Error(), "codex app-server exited:") || !strings.Contains(err.Error(), "boom") {
-				t.Fatalf("crash error = %v", err)
-			}
-			var resumed atomic.Bool
-			f2.Handle("thread/resume", func(json.RawMessage) (any, error) {
-				resumed.Store(true)
-				return map[string]any{"thread": map[string]string{"id": "thr-1"}}, nil
-			})
-			f2.Handle("turn/start", func(json.RawMessage) (any, error) {
-				if !resumed.Load() {
-					return nil, errors.New("turn/start before thread/resume")
-				}
-				agentMessage(f2, "thr-1", "turn-3", "final_answer", "resumed")
-				completeTurn(f2, "thr-1", "turn-3", "completed")
-				return map[string]any{"turn": map[string]string{"id": "turn-3"}}, nil
-			})
-			text, err := th.Run(threadContext(t), "again", "", provider.ThreadCallbacks{})
-			if err != nil || text != "resumed" {
-				t.Fatalf("resumed Run = %q, %v", text, err)
-			}
-			assertParams(t, f2, "thread/resume", map[string]any{"threadId": "thr-1"})
-			if got := f2.Received("thread/start"); len(got) != 0 {
-				t.Fatalf("resume sent thread/start: %s", got)
+			for _, instructions := range []bool{false, true} {
+				t.Run(fmt.Sprint(instructions), func(t *testing.T) {
+					f1, f2 := threadFake(t), threadFake(t)
+					p := fakePool(t, f1, f2)
+					scriptTurn(f1, "thr-1", "turn-1", func() { completeTurn(f1, "thr-1", "turn-1", "completed") })
+					opts := provider.ThreadOptions{Cwd: "/work", Model: "model", Sandbox: "read-only", ApprovalPolicy: "never"}
+					want := map[string]any{"threadId": "thr-1", "cwd": "/work", "model": "model", "sandbox": "read-only", "approvalPolicy": "never"}
+					if instructions {
+						opts.ApprovalPolicy = "on-failure"
+						opts.BaseInstructions, opts.DeveloperInstructions = "base", "developer"
+						want["approvalPolicy"] = "on-request"
+						want["baseInstructions"], want["developerInstructions"] = "base", "developer"
+					}
+					th := mustStartThread(t, p, opts)
+					if _, err := th.Run(threadContext(t), "first", "", provider.ThreadCallbacks{}); err != nil {
+						t.Fatal(err)
+					}
+					if duringStart {
+						f1.Handle("turn/start", func(json.RawMessage) (any, error) { f1.Crash(); return nil, nil })
+					} else {
+						scriptTurn(f1, "thr-1", "turn-2", func() {})
+					}
+					_, err := th.Run(threadContext(t), "crash", "", provider.ThreadCallbacks{Emit: func(e map[string]any) {
+						if e["type"] == "task_started" {
+							f1.Crash()
+						}
+					}})
+					if err == nil || !strings.HasPrefix(err.Error(), "codex app-server exited:") || !strings.Contains(err.Error(), "boom") {
+						t.Fatalf("crash error = %v", err)
+					}
+					var resumed atomic.Bool
+					f2.Handle("thread/resume", func(json.RawMessage) (any, error) {
+						resumed.Store(true)
+						return map[string]any{"thread": map[string]string{"id": "thr-1"}}, nil
+					})
+					f2.Handle("turn/start", func(json.RawMessage) (any, error) {
+						if !resumed.Load() {
+							return nil, errors.New("turn/start before thread/resume")
+						}
+						agentMessage(f2, "thr-1", "turn-3", "final_answer", "resumed")
+						completeTurn(f2, "thr-1", "turn-3", "completed")
+						return map[string]any{"turn": map[string]string{"id": "turn-3"}}, nil
+					})
+					text, err := th.Run(threadContext(t), "again", "", provider.ThreadCallbacks{})
+					if err != nil || text != "resumed" {
+						t.Fatalf("resumed Run = %q, %v", text, err)
+					}
+					assertParams(t, f2, "thread/resume", want)
+					if got := f2.Received("thread/start"); len(got) != 0 {
+						t.Fatalf("resume sent thread/start: %s", got)
+					}
+				})
 			}
 		})
 	}
@@ -525,10 +573,310 @@ func TestCloseUnsubscribes(t *testing.T) {
 			if !dead {
 				assertParams(t, f, "thread/unsubscribe", map[string]any{"threadId": "thr-1"})
 			}
+			if got := f.Received("turn/interrupt"); len(got) != 0 {
+				t.Fatalf("idle Close sent turn/interrupt: %s", got)
+			}
 			if _, err := sub.Next(threadContext(t)); err == nil {
 				t.Fatal("subscription still open")
 			}
 		})
+	}
+}
+
+func TestCloseActiveTurnRejectsQueuedApprovalAndInterrupts(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		f := threadFake(t)
+		firstReply, secondReply := make(chan json.RawMessage, 1), make(chan json.RawMessage, 1)
+		scriptTurn(f, "thr-1", "turn-1", func() {
+			firstReply <- f.Request("item/commandExecution/requestApproval", map[string]string{
+				"threadId": "thr-1", "turnId": "turn-1", "command": "one",
+			})
+		})
+		f.Handle("turn/interrupt", func(json.RawMessage) (any, error) { return map[string]any{}, nil })
+		th := mustStartThread(t, fakePool(t, f), provider.ThreadOptions{})
+		approving, releaseApproval := make(chan struct{}), make(chan struct{})
+		var releaseOnce sync.Once
+		release := func() { releaseOnce.Do(func() { close(releaseApproval) }) }
+		defer release()
+		runDone := make(chan error, 1)
+		ctx := threadContext(t)
+		go func() {
+			_, err := th.Run(ctx, "hi", "", provider.ThreadCallbacks{Approve: func(req provider.ApprovalRequest) bool {
+				if req.Command != "one" {
+					t.Errorf("unexpected approval: %+v", req)
+					return false
+				}
+				close(approving)
+				<-releaseApproval
+				return false
+			}})
+			runDone <- err
+		}()
+		await(t, approving)
+		go func() {
+			secondReply <- f.Request("item/commandExecution/requestApproval", map[string]string{
+				"threadId": "thr-1", "turnId": "turn-1", "command": "two",
+			})
+		}()
+		// Ensure approval #2 reached the turn queue, not just the client's
+		// subscription, before closing while approval #1 still blocks Run.
+		synctest.Wait()
+		th.mu.Lock()
+		active := th.active
+		th.mu.Unlock()
+		active.queue.mu.Lock()
+		queued := len(active.queue.queue)
+		active.queue.mu.Unlock()
+		if queued != 1 {
+			t.Fatalf("queued approvals = %d, want 1", queued)
+		}
+
+		th.Close()
+		assertRejected(t, await(t, secondReply))
+		assertParams(t, f, "turn/interrupt", map[string]any{"threadId": "thr-1", "turnId": "turn-1"})
+		assertParams(t, f, "thread/unsubscribe", map[string]any{"threadId": "thr-1"})
+		release()
+		if err := await(t, runDone); !errors.Is(err, errThreadClosed) {
+			t.Fatalf("Run after Close = %v, want closed error", err)
+		}
+		assertDecision(t, await(t, firstReply), "decline")
+	})
+}
+
+func TestCloseInterruptsWithinSharedBudget(t *testing.T) {
+	for _, interruptDelay := range []time.Duration{0, 3 * time.Second, 10 * time.Second} {
+		t.Run(interruptDelay.String(), func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				f := threadFake(t)
+				scriptTurn(f, "thr-1", "turn-1", func() {})
+				interruptDone, unsubscribeDone := make(chan struct{}), make(chan struct{})
+				f.Handle("turn/interrupt", func(json.RawMessage) (any, error) {
+					defer close(interruptDone)
+					time.Sleep(interruptDelay)
+					return map[string]any{}, nil
+				})
+				f.Handle("thread/unsubscribe", func(json.RawMessage) (any, error) {
+					defer close(unsubscribeDone)
+					if interruptDelay != 0 {
+						time.Sleep(10 * time.Second)
+					}
+					return map[string]any{}, nil
+				})
+				// Virtual time stops once this goroutine returns, so reap
+				// every handler goroutine the fake started even when an
+				// assertion fails first.
+				defer func() {
+					synctest.Wait()
+					if len(f.Received("turn/interrupt")) > 0 {
+						<-interruptDone
+					}
+					if len(f.Received("thread/unsubscribe")) > 0 {
+						<-unsubscribeDone
+					}
+				}()
+				th := mustStartThread(t, fakePool(t, f), provider.ThreadOptions{})
+				started, runDone := make(chan struct{}), make(chan error, 1)
+				go func() {
+					_, err := th.Run(t.Context(), "hi", "", provider.ThreadCallbacks{Emit: func(e map[string]any) {
+						if e["type"] == "task_started" {
+							close(started)
+						}
+					}})
+					runDone <- err
+				}()
+				await(t, started)
+				begin := time.Now()
+				th.Close()
+				want := time.Duration(0)
+				if interruptDelay != 0 {
+					want = 5 * time.Second
+				}
+				if elapsed := time.Since(begin); elapsed != want {
+					t.Fatalf("Close took %s, want %s", elapsed, want)
+				}
+				assertParams(t, f, "turn/interrupt", map[string]any{"threadId": "thr-1", "turnId": "turn-1"})
+				if interruptDelay < 5*time.Second {
+					assertParams(t, f, "thread/unsubscribe", map[string]any{"threadId": "thr-1"})
+				}
+				if err := await(t, runDone); !errors.Is(err, errThreadClosed) {
+					t.Fatalf("Run after Close = %v, want closed error", err)
+				}
+			})
+		})
+	}
+}
+
+func TestThreadGoroutines(t *testing.T) {
+	for _, crash := range []bool{false, true} {
+		t.Run(fmt.Sprintf("crash=%t", crash), func(t *testing.T) {
+			baseline := settleGoroutines()
+			// Start the replacement fake only after checking the crashed
+			// generation, so its reader cannot mask a leaked goroutine.
+			fakes := []*testutil.FakeCodex{threadFake(t), nil}
+			f := fakes[0]
+			p := fakePool(t, fakes...)
+			c, err := p.acquire(threadContext(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			liveBaseline := settleGoroutines()
+			th := mustStartThread(t, p, provider.ThreadOptions{})
+			scriptTurn(f, "thr-1", "turn-1", func() { completeTurn(f, "thr-1", "turn-1", "completed") })
+			if _, err := th.Run(threadContext(t), "first", "", provider.ThreadCallbacks{}); err != nil {
+				t.Fatal(err)
+			}
+
+			// Keep cancellation's interrupt RPC in flight so both its goroutine
+			// and the context.AfterFunc helper must exit on crash or completion.
+			scriptTurn(f, "thr-1", "turn-2", func() {})
+			interrupting, release := make(chan struct{}), make(chan struct{})
+			var releaseOnce sync.Once
+			releaseInterrupt := func() { releaseOnce.Do(func() { close(release) }) }
+			defer releaseInterrupt()
+			f.Handle("turn/interrupt", func(json.RawMessage) (any, error) {
+				close(interrupting)
+				<-release
+				if !crash {
+					completeTurn(f, "thr-1", "turn-2", "interrupted")
+				}
+				return map[string]any{}, nil
+			})
+			ctx, cancel := context.WithCancel(threadContext(t))
+			defer cancel()
+			started, runDone := make(chan struct{}), make(chan error, 1)
+			go func() {
+				_, err := th.Run(ctx, "cancel", "", provider.ThreadCallbacks{Emit: func(e map[string]any) {
+					if e["type"] == "task_started" {
+						close(started)
+					}
+				}})
+				runDone <- err
+			}()
+			await(t, started)
+			cancel()
+			await(t, interrupting)
+			if crash {
+				f.Crash()
+			}
+			releaseInterrupt()
+			if err := await(t, runDone); !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled Run = %v", err)
+			}
+
+			if crash {
+				await(t, c.client.Done())
+				assertThreadGoroutines(t, baseline, "crash")
+				f = threadFake(t)
+				fakes[1] = f
+				c, err = p.acquire(threadContext(t))
+				if err != nil {
+					t.Fatal(err)
+				}
+				liveBaseline = settleGoroutines()
+				f.Handle("thread/resume", func(json.RawMessage) (any, error) { return map[string]any{}, nil })
+				scriptTurn(f, "thr-1", "turn-3", func() { completeTurn(f, "thr-1", "turn-3", "completed") })
+				if _, err := th.Run(threadContext(t), "resume", "", provider.ThreadCallbacks{}); err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			// Close during an active turn: Run is blocked answering approval
+			// #1 while approval #2 is still queued. The queued request must be
+			// answered when Close closes the turn queue, otherwise its sender
+			// goroutine outlives Close with the connection still alive.
+			closeTurn := "turn-close"
+			firstReply := make(chan json.RawMessage, 1)
+			scriptTurn(f, "thr-1", closeTurn, func() {
+				firstReply <- f.Request("item/commandExecution/requestApproval", map[string]string{
+					"threadId": "thr-1", "turnId": closeTurn, "command": "one",
+				})
+			})
+			f.Handle("turn/interrupt", func(json.RawMessage) (any, error) { return map[string]any{}, nil })
+			approving, releaseApprove := make(chan struct{}), make(chan struct{})
+			var approveOnce sync.Once
+			closeApprove := func() { approveOnce.Do(func() { close(releaseApprove) }) }
+			defer closeApprove()
+			closeRunDone := make(chan error, 1)
+			go func() {
+				_, err := th.Run(threadContext(t), "close", "", provider.ThreadCallbacks{Approve: func(provider.ApprovalRequest) bool {
+					close(approving)
+					<-releaseApprove
+					return false
+				}})
+				closeRunDone <- err
+			}()
+			await(t, approving)
+			secondReply := make(chan json.RawMessage, 1)
+			go func() {
+				secondReply <- f.Request("item/commandExecution/requestApproval", map[string]string{
+					"threadId": "thr-1", "turnId": closeTurn, "command": "two",
+				})
+			}()
+			awaitQueued(t, th, 1)
+			th.Close()
+			closeApprove()
+			if err := await(t, closeRunDone); !errors.Is(err, errThreadClosed) {
+				t.Fatalf("Run after Close = %v, want closed error", err)
+			}
+			// Leave the shared connection alive: crashing it here would hide
+			// a router which only exits on EOF rather than local unsubscribe.
+			assertThreadGoroutines(t, liveBaseline, "Close with live connection")
+			f.Crash()
+			await(t, c.client.Done())
+			assertThreadGoroutines(t, baseline, "transport shutdown")
+		})
+	}
+}
+
+// settleGoroutines samples the count until it stops changing, so a baseline is
+// not inflated by a transient which exits mid-test and hides a leak.
+func settleGoroutines() int {
+	prev := runtime.NumGoroutine()
+	stable := 0
+	for stable < 5 {
+		time.Sleep(20 * time.Millisecond)
+		got := runtime.NumGoroutine()
+		if got == prev {
+			stable++
+		} else {
+			stable = 0
+		}
+		prev = got
+	}
+	return prev
+}
+
+func awaitQueued(t *testing.T, th *thread, want int) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		th.mu.Lock()
+		active := th.active
+		th.mu.Unlock()
+		queued := -1
+		if active != nil {
+			active.queue.mu.Lock()
+			queued = len(active.queue.queue)
+			active.queue.mu.Unlock()
+		}
+		if queued == want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("queued server requests = %d, want %d", queued, want)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func assertThreadGoroutines(t *testing.T, baseline int, phase string) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for runtime.NumGoroutine() > baseline && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := runtime.NumGoroutine(); got > baseline {
+		t.Fatalf("goroutines after %s = %d, baseline = %d", phase, got, baseline)
 	}
 }
 

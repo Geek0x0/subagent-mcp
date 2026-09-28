@@ -22,6 +22,8 @@ func TestMapNotification(t *testing.T) {
 		{"usage from last", "thread/tokenUsage/updated", `{"tokenUsage":{"last":{"inputTokens":10,"outputTokens":3,"totalTokens":13},"total":{"inputTokens":100,"outputTokens":30,"totalTokens":130}}}`, map[string]any{"type": "token_count", "prompt_tokens": 10, "completion_tokens": 3, "total_tokens": 13}},
 		{"error", "error", `{"error":{"message":"quota"},"willRetry":false}`, map[string]any{"type": "error", "message": "quota"}},
 		{"completed", "turn/completed", `{"turn":{"status":"completed"}}`, map[string]any{"type": "task_complete"}},
+		{"failed", "turn/completed", `{"turn":{"status":"failed"}}`, nil},
+		{"interrupted", "turn/completed", `{"turn":{"status":"interrupted"}}`, nil},
 		{"agent begin", "item/started", `{"item":{"type":"agentMessage"}}`, nil},
 		{"reasoning begin", "item/started", `{"item":{"type":"reasoning"}}`, nil},
 		{"reasoning end", "item/completed", `{"item":{"type":"reasoning"}}`, nil},

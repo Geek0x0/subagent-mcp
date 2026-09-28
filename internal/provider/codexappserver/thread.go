@@ -40,20 +40,8 @@ func startThread(ctx context.Context, p *pool, opts provider.ThreadOptions) (*th
 	if err != nil {
 		return nil, err
 	}
-	policy := opts.ApprovalPolicy
-	if policy == "on-failure" {
-		policy = "on-request"
-	}
-	params := map[string]any{
-		"cwd": opts.Cwd, "model": opts.Model, "sandbox": opts.Sandbox,
-		"approvalPolicy": policy, "ephemeral": opts.Ephemeral,
-	}
-	if opts.BaseInstructions != "" {
-		params["baseInstructions"] = opts.BaseInstructions
-	}
-	if opts.DeveloperInstructions != "" {
-		params["developerInstructions"] = opts.DeveloperInstructions
-	}
+	params := threadSettings(opts)
+	params["ephemeral"] = opts.Ephemeral
 	var result struct {
 		Thread struct{ ID string } `json:"thread"`
 	}
@@ -75,10 +63,12 @@ func (t *thread) route(c *conn, sub *Subscription) {
 		t.mu.Lock()
 		active := t.active
 		if err != nil {
+			var queued []Message
 			if t.conn == c && active != nil {
-				active.queue.close(err)
+				queued = active.queue.close(err)
 			}
 			t.mu.Unlock()
+			rejectQueued(c, queued)
 			return
 		}
 		reject := t.closed || t.conn != c || active == nil
@@ -118,7 +108,9 @@ func (t *thread) Run(ctx context.Context, prompt, effort string, cb provider.Thr
 		if !completed {
 			return "", errors.New("codex session lost; start a new session")
 		}
-		if err := c.client.Call(ctx, "thread/resume", map[string]string{"threadId": t.id}, nil); err != nil {
+		params := threadSettings(t.opts)
+		params["threadId"] = t.id
+		if err := c.client.Call(ctx, "thread/resume", params, nil); err != nil {
 			return "", c.failure(err)
 		}
 	}
@@ -250,10 +242,14 @@ func (t *thread) markCompleted() {
 }
 
 type approvalParams struct {
-	TurnID  string `json:"turnId"`
-	ItemID  string `json:"itemId"`
-	Command string `json:"command"`
-	Reason  string `json:"reason"`
+	TurnID                 string `json:"turnId"`
+	ItemID                 string `json:"itemId"`
+	Command                string `json:"command"`
+	Reason                 string `json:"reason"`
+	NetworkApprovalContext struct {
+		Host     string `json:"host"`
+		Protocol string `json:"protocol"`
+	} `json:"networkApprovalContext"`
 }
 
 func approvalMethod(method string) bool {
@@ -268,6 +264,9 @@ func (t *thread) approve(ctx context.Context, c *conn, turnID string, msg Messag
 	var p approvalParams
 	if json.Unmarshal(msg.Params, &p) != nil || p.TurnID != turnID || !approvalMethod(msg.Method) {
 		return rejectRequest(c, msg)
+	}
+	if p.Command == "" {
+		p.Command = p.NetworkApprovalContext.Host
 	}
 	req := provider.ApprovalRequest{Tool: "shell", Command: p.Command, Reason: p.Reason}
 	if msg.Method == "item/fileChange/requestApproval" {
@@ -329,11 +328,7 @@ func (t *thread) finish(c *conn, active *threadTurn) {
 	t.active = nil
 	queued := active.queue.close(errors.New("turn finished"))
 	t.mu.Unlock()
-	for _, msg := range queued {
-		if len(msg.ID) != 0 {
-			_ = rejectRequest(c, msg)
-		}
-	}
+	rejectQueued(c, queued)
 }
 
 func (t *thread) Close() {
@@ -344,12 +339,43 @@ func (t *thread) Close() {
 	}
 	t.closed = true
 	c := t.conn
+	var turnID string
 	if t.active != nil {
 		t.active.cancel()
+		turnID = t.active.id
 	}
 	t.mu.Unlock()
 	c.client.Unsubscribe(t.id)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if turnID != "" && c.client.Err() == nil {
+		_ = c.client.Call(ctx, "turn/interrupt", map[string]string{"threadId": t.id, "turnId": turnID}, nil)
+	}
 	_ = c.client.Call(ctx, "thread/unsubscribe", map[string]string{"threadId": t.id}, nil)
+}
+
+func threadSettings(opts provider.ThreadOptions) map[string]any {
+	policy := opts.ApprovalPolicy
+	if policy == "on-failure" {
+		policy = "on-request"
+	}
+	params := map[string]any{
+		"cwd": opts.Cwd, "model": opts.Model, "sandbox": opts.Sandbox,
+		"approvalPolicy": policy,
+	}
+	if opts.BaseInstructions != "" {
+		params["baseInstructions"] = opts.BaseInstructions
+	}
+	if opts.DeveloperInstructions != "" {
+		params["developerInstructions"] = opts.DeveloperInstructions
+	}
+	return params
+}
+
+func rejectQueued(c *conn, queued []Message) {
+	for _, msg := range queued {
+		if len(msg.ID) != 0 {
+			_ = rejectRequest(c, msg)
+		}
+	}
 }

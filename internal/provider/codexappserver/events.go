@@ -56,7 +56,10 @@ func mapNotification(method string, params json.RawMessage) (event map[string]an
 	case "turn/started":
 		return map[string]any{"type": "task_started"}, true
 	case "turn/completed":
-		return map[string]any{"type": "task_complete"}, true
+		if p.Turn.Status == "completed" {
+			return map[string]any{"type": "task_complete"}, true
+		}
+		return nil, false
 	case "item/agentMessage/delta":
 		return map[string]any{"type": "agent_message_delta", "delta": p.Delta}, true
 	case "item/started", "item/completed":
