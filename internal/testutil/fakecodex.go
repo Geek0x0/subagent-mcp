@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -342,6 +343,10 @@ func serveFakeCodexAppServer(r io.Reader, w io.Writer) error {
 				}
 				sort.Strings(names)
 				text = strings.Join(names, "\n")
+			} else if sum, ok := answerSumPrompt(prompt.String()); ok {
+				// The --live checks ask for a value that never appears in the
+				// prompt, so echoing the prompt back would fail their check.
+				text = sum
 			}
 			result = map[string]any{"turn": map[string]string{"id": id}}
 			notifications = []notification{
@@ -380,4 +385,21 @@ func serveFakeCodexAppServer(r io.Reader, w io.Writer) error {
 			}
 		}
 	}
+}
+
+var sumPromptPattern = regexp.MustCompile(`(?i)(\d+)\s*(?:plus|\+)\s*(\d+)`)
+
+// answerSumPrompt returns the sum for a prompt asking what two integers add up
+// to, computing it from the numbers in the prompt rather than any fixed value.
+func answerSumPrompt(prompt string) (string, bool) {
+	match := sumPromptPattern.FindStringSubmatch(prompt)
+	if match == nil {
+		return "", false
+	}
+	a, errA := strconv.Atoi(match[1])
+	b, errB := strconv.Atoi(match[2])
+	if errA != nil || errB != nil {
+		return "", false
+	}
+	return strconv.Itoa(a + b), true
 }

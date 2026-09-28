@@ -22,6 +22,10 @@ const (
 	// internal/provider/live_test.go; the fake values never leave this process.
 	checkToolName     = "get_secret_number"
 	checkSecretNumber = "4217"
+
+	// checkLivePrompt is the Codex --live prompt. Its answer (4217) never
+	// appears in it, so a reply that merely quotes the prompt fails the check.
+	checkLivePrompt = "What is 2713 plus 1504? Reply with just the number."
 )
 
 // checkTool is the only tool offered during a --live check.
@@ -198,7 +202,7 @@ func checkLiveThread(agent provider.Agent, model string) error {
 		return err
 	}
 	defer thread.Close()
-	text, err := thread.Run(ctx, "Reply with just the number "+checkSecretNumber+".", "low", provider.ThreadCallbacks{})
+	text, err := thread.Run(ctx, checkLivePrompt, "low", provider.ThreadCallbacks{})
 	if err != nil {
 		return err
 	}

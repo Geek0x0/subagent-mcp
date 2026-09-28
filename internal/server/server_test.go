@@ -637,7 +637,9 @@ func TestHandleStartValidation(t *testing.T) {
 
 func TestHandleStartDelegatesToAgentProvider(t *testing.T) {
 	cwd := t.TempDir()
-	if err := os.WriteFile(filepath.Join(cwd, "AGENTS.md"), []byte("must not be loaded"), 0); err != nil {
+	// A directory fails AGENTS.md loading even when tests run as root, so this
+	// proves the delegated provider never loads it (a mode-0 file would not).
+	if err := os.Mkdir(filepath.Join(cwd, "AGENTS.md"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	home := t.TempDir()

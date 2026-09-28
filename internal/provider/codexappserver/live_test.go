@@ -37,7 +37,9 @@ func TestLiveCodexAppServer(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(th.Close)
-	text, err := th.Run(ctx, "Reply with only the single number 4217.", "low", provider.ThreadCallbacks{})
+	// The answer must not appear in the prompt, so a reply that merely quotes
+	// the prompt cannot pass.
+	text, err := th.Run(ctx, "What is 2713 plus 1504? Reply with only the sum.", "low", provider.ThreadCallbacks{})
 	if err != nil || !strings.Contains(text, "4217") {
 		t.Fatalf("Run = %q, %v", text, err)
 	}

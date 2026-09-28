@@ -119,6 +119,9 @@ The session inherits the user's whole Codex environment — auth, config, plugin
 - `base-instructions` replaces Codex's base prompt only when given a non-empty value; omitting it leaves Codex's own base prompt intact. `developer-instructions` is forwarded separately.
 - Codex owns the non-ephemeral thread and its rollout under `~/.codex/sessions` (or the user's configured Codex home). It appears in Codex history; subagent-mcp does not write a second rollout, and `SUBAGENT_MCP_ROLLOUT=off` does not disable Codex's rollout.
 - `sandbox` is forwarded to Codex; `approval-policy` is forwarded with `on-failure` mapped to `on-request`. Command and file-change approvals are relayed to the MCP client. `config.writable_roots` is forwarded only for `workspace-write`.
+- The relayed approval's target is the shell command, the touched paths for a file change, or — for a network approval — the requested host. Every other request Codex sends to the server (an MCP server's elicitation, a tool user-input request, a permission request, a dynamic tool call, or anything else) is answered automatically with the error `-32601 not supported by subagent-mcp`, so Codex's MCP servers and tools cannot prompt through subagent-mcp; those requests fail inside Codex instead of reaching your MCP client.
+- A pending approval wait ends when the call is cancelled or the five-minute approval timeout expires (denial), and also when the Codex child process dies or the thread closes, so a pending approval never outlives either.
+- Codex sends `item/started` before it asks for approval, so a declined file change still emits `exec_command_begin` and `exec_command_end`; see [Events](#events).
 
 ## Validating the config
 
@@ -160,7 +163,7 @@ result   PASS (1 checked, 0 skipped, 0 failed)
 
 The `auth` line replaces `key`: the server starts Codex app-server and calls `account/read`, then `model/list` for the `api` and `model` lines. Account type, plan, version, and model count depend on the installation. A missing login prints `  auth   FAIL: not logged in; run codex login`; a process-start error also prints `  auth   FAIL: <error>`. A model-list failure prints `  api    FAIL: <error>`. Passing auth counts as checked; an auth or API failure counts as failed.
 
-`model ... WARN` means a configured model id is not in the provider's current list; it does not affect the exit code. `--live` is opt-in and makes one real, billed tool-call round trip per reachable model API provider using `default_model` and effort `low`. For Codex it instead runs one ephemeral, read-only thread with approval policy `never`, asking for a fixed number and checking the final answer contains it. Its line is `  live   <default_model>   OK (turn succeeded, <duration>)` or `  live   <default_model>   FAIL: <error>`. Both paths print the billed-call warning first; use `--live` deliberately, not in CI. Neither mode ever prints a key value.
+`model ... WARN` means a configured model id is not in the provider's current list; it does not affect the exit code. `--live` is opt-in and makes one real, billed tool-call round trip per reachable model API provider using `default_model` and effort `low`. For Codex it instead runs one ephemeral, read-only thread with approval policy `never`, asking for the sum of two numbers — the total never appears in the prompt — and checking that the final answer contains that total, so a reply that merely quotes the prompt fails. Its line is `  live   <default_model>   OK (turn succeeded, <duration>)` or `  live   <default_model>   FAIL: <error>`. Both paths print the billed-call warning first; use `--live` deliberately, not in CI. Neither mode ever prints a key value.
 
 ## Environment
 
@@ -257,7 +260,7 @@ Streams `POST /v1/messages` with adaptive summarized thinking, `output_config.ef
 
 ## Cancellation and concurrency
 
-The server honors the standard MCP `notifications/cancelled` message for in-flight `subagent` and `subagent-reply` calls. Cancelling a call stops the model request, kills any running shell command, and releases the thread lock; the call returns an error containing `context canceled`, and the thread stays resumable with `subagent-reply`. A cancellation that arrives before a queued call starts is ignored.
+The server honors the standard MCP `notifications/cancelled` message for in-flight `subagent` and `subagent-reply` calls. Cancelling a call stops the model request, kills any running shell command, and releases the thread lock; the call returns an error containing `context canceled`, and the thread stays resumable with `subagent-reply`. For `codex-app-server` sessions the lock is released only once the pending turn interrupt finishes, which can take up to 30 seconds after the cancellation, so a `subagent-reply` sent in that window gets a `busy` error instead of continuing the thread. A cancellation that arrives before a queued call starts is ignored.
 
 The stdio server processes up to 32 tool calls concurrently (mcp-go's default is 5).
 
@@ -306,7 +309,7 @@ During a running call, the server emits `subagent/event` notifications with `thr
 | `task_complete` | The call completed successfully. |
 | `error` | The call failed; `message` contains the error. |
 
-Operations stopped by policy or denied approval do not begin execution and therefore do not emit `exec_command_begin` or `exec_command_end`.
+Operations stopped by policy or denied approval do not begin execution and therefore do not emit `exec_command_begin` or `exec_command_end`. For `codex-app-server` sessions Codex reports `item/started` before it requests approval, so a file change that is then declined has already emitted `exec_command_begin` and still emits `exec_command_end`; those events show what Codex reported, not whether the approval was granted.
 
 When a `tools/call` carries `_meta.progressToken`, the server additionally sends standard `notifications/progress` notifications for that call alongside the unchanged `subagent/event` notifications. The `progress` value increases from 1, and `message` carries a short summary: `started`, `shell: <cmd>`, `apply_patch: <paths>`, `<tool>: <path>`, `agent: <first line>`, `completed`, or `error: <msg>`, each at most 200 characters.
 

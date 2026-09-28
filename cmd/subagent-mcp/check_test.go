@@ -628,8 +628,11 @@ func TestCheckLiveThread(t *testing.T) {
 				if _, ok := ctx.Deadline(); !ok {
 					t.Error("live turn has no deadline")
 				}
-				if !strings.Contains(prompt, "4217") || effort != "low" {
+				if prompt != checkLivePrompt || effort != "low" {
 					t.Errorf("Run prompt = %q, effort = %q", prompt, effort)
+				}
+				if strings.Contains(prompt, checkSecretNumber) {
+					t.Errorf("Run prompt %q contains the expected answer %s", prompt, checkSecretNumber)
 				}
 				if cb.Emit != nil || cb.Approve != nil {
 					t.Error("live check should not emit events or approve operations")
@@ -665,5 +668,23 @@ func TestCheckLiveThread(t *testing.T) {
 				t.Errorf("thread ran = %v, closed = %v; want both %v", runCalled, thread.closed, wantRun)
 			}
 		})
+	}
+}
+
+// A model that just quotes the prompt must not pass the live check: the answer
+// the prompt asks for never appears in the prompt itself.
+func TestCheckLiveThreadFailsWhenReplyEchoesPrompt(t *testing.T) {
+	thread := &checkThreadStub{run: func(_ context.Context, prompt, _ string, _ provider.ThreadCallbacks) (string, error) {
+		return "echo: " + prompt, nil
+	}}
+	agent := checkAgentFunc(func(context.Context, provider.ThreadOptions) (provider.Thread, error) {
+		return thread, nil
+	})
+	err := checkLiveThread(agent, "gpt-6-astra")
+	if err == nil {
+		t.Fatal("checkLiveThread() = nil, want failure when the reply echoes the prompt")
+	}
+	if !strings.Contains(err.Error(), "does not contain "+checkSecretNumber) {
+		t.Errorf("checkLiveThread() = %v, want answer-does-not-contain-%s error", err, checkSecretNumber)
 	}
 }
