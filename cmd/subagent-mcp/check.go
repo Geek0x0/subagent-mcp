@@ -31,11 +31,11 @@ var checkTool = provider.ToolSpec{
 	Parameters:  json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
 }
 
-// runCheck validates every configured provider's key, endpoint and models,
-// optionally performing one real minimal tool-call round trip per reachable
-// provider when live is true. It writes human-readable lines to w, never any
-// key value, and returns the process exit code: 1 when any provider failed.
-// It also fails when no configured provider has a key set.
+// runCheck validates every configured provider's auth, endpoint and models,
+// optionally performing a minimal tool-call round trip or agent turn per
+// reachable provider when live is true. It writes human-readable lines to w,
+// never any key value, and returns the process exit code: 1 when any provider
+// failed. It also fails when no provider has a key set or passes an auth check.
 func runCheck(w io.Writer, cfg *config.Config, live bool) int {
 	if live {
 		fmt.Fprintln(w, "--live will make real, billed API calls to each configured provider.")
@@ -51,6 +51,17 @@ func runCheck(w io.Writer, cfg *config.Config, live bool) int {
 	for _, name := range names {
 		p := cfg.Providers[name]
 		fmt.Fprintf(w, "provider %s (%s)\n", name, p.API)
+
+		if p.API == config.APICodexAppServer {
+			authOK, checkFailed := checkCodexProvider(w, name, p, live)
+			if authOK {
+				checked++
+			}
+			if checkFailed {
+				failed++
+			}
+			continue
+		}
 
 		key := os.Getenv(p.EnvKey)
 		if key == "" {
@@ -112,17 +123,89 @@ func runCheck(w io.Writer, cfg *config.Config, live bool) int {
 	status := "PASS"
 	reason := ""
 	switch {
+	case failed > 0:
+		status = "FAIL"
 	case checked == 0:
 		status = "FAIL"
 		reason = " — no configured provider has its key set"
-	case failed > 0:
-		status = "FAIL"
 	}
 	fmt.Fprintf(w, "result   %s (%d checked, %d skipped, %d failed)%s\n", status, checked, skipped, failed, reason)
 	if status == "FAIL" {
 		return 1
 	}
 	return 0
+}
+
+// checkCodexProvider returns whether auth passed and whether any check failed.
+// The registered Codex adapter implements AuthChecker, ModelLister and Agent.
+func checkCodexProvider(w io.Writer, name string, p config.Provider, live bool) (bool, bool) {
+	adapter, err := provider.New(name, p, "")
+	if err != nil {
+		fmt.Fprintf(w, "  auth   FAIL: %v\n", err)
+		return false, true
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), checkListTimeout)
+	status, err := adapter.(provider.AuthChecker).CheckAuth(ctx)
+	cancel()
+	if err != nil {
+		fmt.Fprintf(w, "  auth   FAIL: %v\n", err)
+		return false, true
+	}
+	fmt.Fprintf(w, "  auth   %s   OK\n", status.Summary)
+
+	ctx, cancel = context.WithTimeout(context.Background(), checkListTimeout)
+	ids, err := adapter.(provider.ModelLister).ListModels(ctx)
+	cancel()
+	if err != nil {
+		fmt.Fprintf(w, "  api    FAIL: %v\n", err)
+		return true, true
+	}
+	fmt.Fprintf(w, "  api    %s   OK (%d models listed)\n", status.Version, len(ids))
+	listed := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		listed[id] = true
+	}
+	for _, id := range p.ModelIDs() {
+		if listed[id] {
+			fmt.Fprintf(w, "  model  %s     OK\n", id)
+		} else {
+			fmt.Fprintf(w, "  model  %s     WARN: not in the provider's current model list\n", id)
+		}
+	}
+
+	if live {
+		start := time.Now()
+		if err := checkLiveThread(adapter.(provider.Agent), p.DefaultModel); err != nil {
+			fmt.Fprintf(w, "  live   %s   FAIL: %v\n", p.DefaultModel, err)
+			return true, true
+		}
+		fmt.Fprintf(w, "  live   %s   OK (turn succeeded, %s)\n",
+			p.DefaultModel, time.Since(start).Round(time.Millisecond))
+	}
+	return true, false
+}
+
+func checkLiveThread(agent provider.Agent, model string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), checkLiveTimeout)
+	defer cancel()
+
+	thread, err := agent.StartThread(ctx, provider.ThreadOptions{
+		Model: model, Cwd: os.TempDir(), Sandbox: "read-only", ApprovalPolicy: "never",
+		Ephemeral: true,
+	})
+	if err != nil {
+		return err
+	}
+	defer thread.Close()
+	text, err := thread.Run(ctx, "Reply with just the number "+checkSecretNumber+".", "low", provider.ThreadCallbacks{})
+	if err != nil {
+		return err
+	}
+	if !strings.Contains(text, checkSecretNumber) {
+		return fmt.Errorf("answer %q does not contain %s", text, checkSecretNumber)
+	}
+	return nil
 }
 
 // checkLiveRoundTrip performs the same minimal tool-call round trip as
