@@ -96,6 +96,44 @@ func (p *stubProvider) recordedRequests() []provider.TurnRequest {
 	return append([]provider.TurnRequest(nil), p.requests...)
 }
 
+type agentStub struct {
+	t      *testing.T
+	opts   []provider.ThreadOptions
+	err    error
+	thread *agentThreadStub
+}
+
+func (p *agentStub) Name() string { return "agent-stub" }
+
+func (p *agentStub) Turn(context.Context, provider.TurnRequest, func(string)) (*provider.TurnResult, error) {
+	p.t.Error("Agent provider's Turn() must not be called")
+	return nil, errors.New("unexpected Turn call")
+}
+
+func (p *agentStub) StartThread(_ context.Context, opts provider.ThreadOptions) (provider.Thread, error) {
+	p.opts = append(p.opts, opts)
+	if p.err != nil {
+		return nil, p.err
+	}
+	p.thread = &agentThreadStub{}
+	return p.thread, nil
+}
+
+type agentThreadRun struct {
+	prompt, effort string
+}
+
+type agentThreadStub struct {
+	runs []agentThreadRun
+}
+
+func (s *agentThreadStub) Run(_ context.Context, prompt, effort string, _ provider.ThreadCallbacks) (string, error) {
+	s.runs = append(s.runs, agentThreadRun{prompt: prompt, effort: effort})
+	return "from codex", nil
+}
+
+func (s *agentThreadStub) Close() {}
+
 type emitterFunc func(context.Context, string, map[string]any)
 
 func (f emitterFunc) Emit(ctx context.Context, threadID string, msg map[string]any) {
@@ -594,6 +632,116 @@ func TestHandleStartValidation(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestHandleStartDelegatesToAgentProvider(t *testing.T) {
+	cwd := t.TempDir()
+	if err := os.WriteFile(filepath.Join(cwd, "AGENTS.md"), []byte("must not be loaded"), 0); err != nil {
+		t.Fatal(err)
+	}
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	t.Setenv("SUBAGENT_MCP_ROLLOUT", "")
+	root := t.TempDir()
+	stub := &agentStub{t: t}
+	s := New(testConfig(t, stub), "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt":                 "hello",
+		"cwd":                    cwd,
+		"base-instructions":      "B",
+		"developer-instructions": "D",
+		"sandbox":                "workspace-write",
+		"approval-policy":        "on-failure",
+		"reasoning-effort":       "xhigh",
+		"config":                 map[string]any{"writable_roots": []any{root}, "max_turns": float64(1)},
+	}))
+	if err != nil || result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want success", result, err)
+	}
+	if got := toolResultText(t, result); got != "from codex" {
+		t.Fatalf("handleStart() text = %q, want from codex", got)
+	}
+	wantOptions := []provider.ThreadOptions{{
+		BaseInstructions:      "B",
+		DeveloperInstructions: "D",
+		Sandbox:               "workspace-write",
+		ApprovalPolicy:        "on-failure",
+		WritableRoots:         []string{root},
+		Cwd:                   cwd,
+		Model:                 "m-fast",
+	}}
+	if !reflect.DeepEqual(stub.opts, wantOptions) {
+		t.Fatalf("StartThread() options = %#v, want %#v", stub.opts, wantOptions)
+	}
+	threadID := toolResultThreadID(t, result)
+	reply, err := s.handleReply(context.Background(), callToolRequest("subagent-reply", map[string]any{
+		"threadId": threadID,
+		"prompt":   "keep going",
+	}))
+	if err != nil || reply.IsError || toolResultText(t, reply) != "from codex" {
+		t.Fatalf("handleReply() = (%#v, %v), want from codex", reply, err)
+	}
+	if got := toolResultThreadID(t, reply); got != threadID {
+		t.Fatalf("handleReply() threadId = %q, want %q", got, threadID)
+	}
+	wantRuns := []agentThreadRun{{prompt: "hello", effort: "max"}, {prompt: "keep going", effort: "max"}}
+	if !reflect.DeepEqual(stub.thread.runs, wantRuns) || len(stub.opts) != 1 {
+		t.Fatalf("thread runs = %#v, want %#v on one thread", stub.thread.runs, wantRuns)
+	}
+	entries, err := os.ReadDir(home)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("CODEX_HOME entries = %v, error = %v, want no rollout", entries, err)
+	}
+}
+
+func TestHandleStartAgentOmittedBaseInstructions(t *testing.T) {
+	cwd := t.TempDir()
+	// A directory fails AGENTS.md loading even when tests run as root.
+	if err := os.Mkdir(filepath.Join(cwd, "AGENTS.md"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	stub := &agentStub{t: t}
+	s := New(testConfig(t, stub), "test")
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "hello",
+		"cwd":    cwd,
+	}))
+	if err != nil || result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want success", result, err)
+	}
+	wantOptions := []provider.ThreadOptions{{Model: "m-fast", Cwd: cwd, Sandbox: "read-only", ApprovalPolicy: "on-request"}}
+	if !reflect.DeepEqual(stub.opts, wantOptions) {
+		t.Fatalf("StartThread() options = %#v, want %#v with empty instructions", stub.opts, wantOptions)
+	}
+	if want := []agentThreadRun{{prompt: "hello", effort: "high"}}; !reflect.DeepEqual(stub.thread.runs, want) {
+		t.Fatalf("thread runs = %#v, want %#v", stub.thread.runs, want)
+	}
+}
+
+func TestHandleStartAgentStartThreadError(t *testing.T) {
+	stub := &agentStub{t: t, err: errors.New("no codex")}
+	s := New(testConfig(t, stub), "test")
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "hello",
+		"cwd":    t.TempDir(),
+	}))
+	if err != nil || !result.IsError || !strings.Contains(toolResultText(t, result), "no codex") {
+		t.Fatalf("handleStart() = (%#v, %v), want no codex tool error", result, err)
+	}
+	if len(stub.opts) != 1 || stub.thread != nil {
+		t.Fatalf("StartThread() calls = %d, thread = %#v, want one failed start", len(stub.opts), stub.thread)
+	}
+	if result.StructuredContent != nil {
+		t.Fatalf("failed start returned session content: %#v", result.StructuredContent)
+	}
+	reply, err := s.handleReply(context.Background(), callToolRequest("subagent-reply", map[string]any{
+		"threadId": "any-thread",
+		"prompt":   "retry",
+	}))
+	if err != nil || !reply.IsError || !strings.Contains(toolResultText(t, reply), "unknown threadId") {
+		t.Fatalf("handleReply() = (%#v, %v), want unknown threadId tool error", reply, err)
 	}
 }
 

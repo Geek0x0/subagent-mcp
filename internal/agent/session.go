@@ -31,6 +31,7 @@ Work autonomously on the task you are given: inspect what you need, make the sma
 
 type Options struct {
 	Provider        provider.Provider
+	Thread          provider.Thread
 	Model           string
 	ReasoningEffort string
 	EffortSent      string
@@ -46,6 +47,7 @@ type Session struct {
 	ID string
 
 	provider        provider.Provider
+	thread          provider.Thread
 	model           string
 	reasoningEffort string
 	effortSent      string
@@ -83,7 +85,7 @@ func (m *Manager) Create(o Options) *Session {
 	if o.MaxTurns <= 0 {
 		o.MaxTurns = DefaultMaxTurns
 	}
-	if o.SystemPrompt == "" {
+	if o.SystemPrompt == "" && o.Thread == nil {
 		o.SystemPrompt = DefaultSystemPrompt
 	}
 	if o.EffortSent == "" {
@@ -93,6 +95,7 @@ func (m *Manager) Create(o Options) *Session {
 	session := &Session{
 		ID:              uuid.NewString(),
 		provider:        o.Provider,
+		thread:          o.Thread,
 		model:           o.Model,
 		reasoningEffort: o.ReasoningEffort,
 		effortSent:      o.EffortSent,
@@ -106,9 +109,12 @@ func (m *Manager) Create(o Options) *Session {
 	}
 
 	m.mu.Lock()
-	m.evictLocked()
+	evicted := m.evictLocked()
 	m.sessions[session.ID] = session
 	m.mu.Unlock()
+	for _, thread := range evicted {
+		thread.Close()
+	}
 
 	return session
 }
@@ -116,7 +122,9 @@ func (m *Manager) Create(o Options) *Session {
 // evictLocked drops idle sessions that have been unused for longer than
 // sessionIdleTTL, then trims the map to leave room for one new session.
 // m.mu must be held. Sessions whose mu is held are busy and never evicted.
-func (m *Manager) evictLocked() {
+// Returned threads must be closed after releasing m.mu.
+func (m *Manager) evictLocked() []provider.Thread {
+	var evicted []provider.Thread
 	now := m.now()
 	for id, existing := range m.sessions {
 		if !existing.mu.TryLock() {
@@ -126,11 +134,14 @@ func (m *Manager) evictLocked() {
 		existing.mu.Unlock()
 		if now.Sub(lastUsed) > sessionIdleTTL {
 			delete(m.sessions, id)
+			if existing.thread != nil {
+				evicted = append(evicted, existing.thread)
+			}
 		}
 	}
 
 	if len(m.sessions) < maxSessions {
-		return
+		return evicted
 	}
 
 	type idleSession struct {
@@ -157,8 +168,12 @@ func (m *Manager) evictLocked() {
 			continue
 		}
 		delete(m.sessions, candidate.id)
+		if existing.thread != nil {
+			evicted = append(evicted, existing.thread)
+		}
 		existing.mu.Unlock()
 	}
+	return evicted
 }
 
 func (m *Manager) Get(id string) (*Session, bool) {

@@ -111,6 +111,24 @@ func (r *Runner) Run(ctx context.Context, s *Session, prompt string) (string, er
 	defer s.mu.Unlock()
 	defer func() { s.lastUsed = time.Now() }()
 
+	if s.thread != nil {
+		text, err := s.thread.Run(ctx, prompt, s.effortSent, provider.ThreadCallbacks{
+			Emit: func(event map[string]any) {
+				r.Emitter.Emit(ctx, s.ID, event)
+			},
+			Approve: func(req provider.ApprovalRequest) bool {
+				return r.Approver.Approve(ctx, s.ID, ApprovalRequest{
+					Tool: req.Tool, Command: req.Command, Path: req.Path, Reason: req.Reason,
+				})
+			},
+		})
+		if err != nil {
+			r.Emitter.Emit(ctx, s.ID, map[string]any{"type": "error", "message": err.Error()})
+			return "", err
+		}
+		return text, nil
+	}
+
 	r.Emitter.Emit(ctx, s.ID, map[string]any{"type": "task_started"})
 	started := time.Now()
 	s.turnID = uuid.NewString()

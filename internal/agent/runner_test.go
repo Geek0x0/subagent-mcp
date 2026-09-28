@@ -144,6 +144,212 @@ func (a *stubApprover) recordedRequests() []ApprovalRequest {
 	return append([]ApprovalRequest(nil), a.requests...)
 }
 
+type stubThread struct {
+	run   func(context.Context, string, string, provider.ThreadCallbacks) (string, error)
+	close func()
+}
+
+func (s *stubThread) Run(ctx context.Context, prompt, effort string, cb provider.ThreadCallbacks) (string, error) {
+	return s.run(ctx, prompt, effort, cb)
+}
+
+func (s *stubThread) Close() {
+	if s.close != nil {
+		s.close()
+	}
+}
+
+type emitterFunc func(context.Context, string, map[string]any)
+
+func (f emitterFunc) Emit(ctx context.Context, threadID string, event map[string]any) {
+	f(ctx, threadID, event)
+}
+
+type approverFunc func(context.Context, string, ApprovalRequest) bool
+
+func (f approverFunc) Approve(ctx context.Context, threadID string, req ApprovalRequest) bool {
+	return f(ctx, threadID, req)
+}
+
+func TestRunnerDelegatesToThread(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var gotPrompt, gotEffort string
+	thread := &stubThread{run: func(gotCtx context.Context, prompt, effort string, cb provider.ThreadCallbacks) (string, error) {
+		if gotCtx != ctx {
+			t.Error("Thread.Run() received a different context")
+		}
+		gotPrompt, gotEffort = prompt, effort
+		cb.Emit(map[string]any{"type": "agent_message", "message": "hi"})
+		if !cb.Approve(provider.ApprovalRequest{Tool: "shell", Command: "ls"}) {
+			t.Error("approval result = false, want true")
+		}
+		return "done", nil
+	}}
+	session := newTestSession(t, Options{Thread: thread, ReasoningEffort: "xhigh", EffortSent: "max"})
+	emitter := &recEmitter{}
+	var approvals []ApprovalRequest
+	runner := &Runner{
+		Emitter: emitterFunc(func(gotCtx context.Context, threadID string, event map[string]any) {
+			if gotCtx != ctx || threadID != session.ID {
+				t.Errorf("Emit() context/thread = (%v, %q), want (%v, %q)", gotCtx, threadID, ctx, session.ID)
+			}
+			emitter.Emit(gotCtx, threadID, event)
+		}),
+		Approver: approverFunc(func(gotCtx context.Context, threadID string, req ApprovalRequest) bool {
+			if gotCtx != ctx || threadID != session.ID {
+				t.Errorf("Approve() context/thread = (%v, %q), want (%v, %q)", gotCtx, threadID, ctx, session.ID)
+			}
+			approvals = append(approvals, req)
+			return true
+		}),
+	}
+
+	before := time.Now()
+	got, err := runner.Run(ctx, session, "finish the task")
+	if err != nil || got != "done" {
+		t.Fatalf("Run() = (%q, %v), want (done, nil)", got, err)
+	}
+	if gotPrompt != "finish the task" || gotEffort != "max" {
+		t.Fatalf("Thread.Run() prompt/effort = (%q, %q)", gotPrompt, gotEffort)
+	}
+	wantEvents := []map[string]any{{"type": "agent_message", "message": "hi"}}
+	if got := emitter.recordedEvents(); !reflect.DeepEqual(got, wantEvents) {
+		t.Fatalf("events = %#v, want %#v", got, wantEvents)
+	}
+	if want := []ApprovalRequest{{Tool: "shell", Command: "ls"}}; !reflect.DeepEqual(approvals, want) {
+		t.Fatalf("approvals = %#v, want %#v", approvals, want)
+	}
+	if !session.lastUsed.After(before) {
+		t.Fatalf("session.lastUsed = %v, want after %v", session.lastUsed, before)
+	}
+	if len(session.messages) != 0 || session.turnID != "" || session.system != "" {
+		t.Fatalf("thread session initialized native state: messages=%#v, turnID=%q, system=%q", session.messages, session.turnID, session.system)
+	}
+}
+
+func TestRunnerThreadErrorEmitsError(t *testing.T) {
+	boom := errors.New("boom")
+	thread := &stubThread{run: func(context.Context, string, string, provider.ThreadCallbacks) (string, error) {
+		return "", boom
+	}}
+	session := newTestSession(t, Options{Thread: thread})
+	emitter := &recEmitter{}
+	runner := &Runner{Emitter: emitter, Approver: &stubApprover{}}
+
+	before := time.Now()
+	if got, err := runner.Run(context.Background(), session, "hello"); got != "" || !errors.Is(err, boom) {
+		t.Fatalf("Run() = (%q, %v), want (empty, boom)", got, err)
+	}
+	wantEvents := []map[string]any{{"type": "error", "message": "boom"}}
+	if got := emitter.recordedEvents(); !reflect.DeepEqual(got, wantEvents) {
+		t.Fatalf("events = %#v, want %#v", got, wantEvents)
+	}
+	if !session.lastUsed.After(before) {
+		t.Fatalf("session.lastUsed = %v, want after %v", session.lastUsed, before)
+	}
+	thread.run = func(context.Context, string, string, provider.ThreadCallbacks) (string, error) {
+		return "recovered", nil
+	}
+	if got, err := runner.Run(context.Background(), session, "retry"); got != "recovered" || err != nil {
+		t.Fatalf("Run() after error = (%q, %v), want (recovered, nil)", got, err)
+	}
+}
+
+func TestRunnerThreadBusy(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	unblock := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	thread := &stubThread{run: func(ctx context.Context, _, _ string, _ provider.ThreadCallbacks) (string, error) {
+		entered <- struct{}{}
+		select {
+		case <-unblock:
+			return "done", nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}}
+	session := newTestSession(t, Options{Thread: thread})
+	runner := &Runner{Emitter: &recEmitter{}, Approver: &stubApprover{}}
+	firstResult := make(chan error, 1)
+	go func() {
+		_, err := runner.Run(ctx, session, "first")
+		firstResult <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Run() did not reach the blocked thread")
+	}
+
+	secondResult := make(chan error, 1)
+	go func() {
+		_, err := runner.Run(ctx, session, "second")
+		secondResult <- err
+	}()
+	select {
+	case err := <-secondResult:
+		if !errors.Is(err, ErrBusy) {
+			t.Fatalf("concurrent Run() error = %v, want ErrBusy", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("concurrent Run() blocked instead of returning ErrBusy")
+	}
+
+	close(unblock)
+	select {
+	case err := <-firstResult:
+		if err != nil {
+			t.Fatalf("first Run() error = %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("first Run() did not finish after unblocking the thread")
+	}
+}
+
+func TestManagerEvictionClosesThread(t *testing.T) {
+	for _, eviction := range []string{"idle TTL", "capacity"} {
+		t.Run(eviction, func(t *testing.T) {
+			manager := NewManager()
+			current := time.Now()
+			manager.now = func() time.Time { return current }
+			closed := 0
+			thread := &stubThread{close: func() {
+				closed++
+				if !manager.mu.TryLock() {
+					t.Error("Thread.Close() called with manager lock held")
+					return
+				}
+				manager.mu.Unlock()
+			}}
+			oldest := manager.Create(Options{Thread: thread})
+			if eviction == "idle TTL" {
+				current = current.Add(sessionIdleTTL + time.Second)
+			} else {
+				for i := 1; i < maxSessions; i++ {
+					current = current.Add(time.Minute)
+					manager.Create(Options{})
+				}
+			}
+			fresh := manager.Create(Options{})
+			if got, ok := manager.Get(oldest.ID); ok || got != nil {
+				t.Fatalf("Get(oldest.ID) = (%#v, %v), want (nil, false)", got, ok)
+			}
+			if got, ok := manager.Get(fresh.ID); !ok || got != fresh {
+				t.Fatalf("Get(fresh.ID) = (%#v, %v), want fresh session", got, ok)
+			}
+			if closed != 1 {
+				t.Fatalf("Close() calls = %d, want 1", closed)
+			}
+			manager.Create(Options{})
+			if closed != 1 {
+				t.Fatalf("Close() calls after another Create() = %d, want 1", closed)
+			}
+		})
+	}
+}
+
 func TestRunnerPureTextOneTurn(t *testing.T) {
 	client := &stubProvider{turns: []stubTurn{{result: &provider.TurnResult{Text: "done"}}}}
 	emitter := &recEmitter{}

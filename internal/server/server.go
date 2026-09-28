@@ -540,19 +540,23 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		return mcp.NewToolResultError(fmt.Sprintf("cwd is not a directory: %q", cwd)), nil
 	}
 
-	systemPrompt := agent.DefaultSystemPrompt
-	if baseInstructions := req.GetString("base-instructions", ""); baseInstructions != "" {
-		systemPrompt = baseInstructions
-	}
-	agentsMD, err := agent.LoadAgentsMD(cwd)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
-	if agentsMD != "" {
-		systemPrompt += "\n\n" + agentsMD
-	}
-	if developerInstructions := req.GetString("developer-instructions", ""); developerInstructions != "" {
-		systemPrompt += "\n\n" + developerInstructions
+	agentProvider, isAgent := selectedProvider.(provider.Agent)
+	var systemPrompt string
+	if !isAgent {
+		systemPrompt = agent.DefaultSystemPrompt
+		if baseInstructions := req.GetString("base-instructions", ""); baseInstructions != "" {
+			systemPrompt = baseInstructions
+		}
+		agentsMD, err := agent.LoadAgentsMD(cwd)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		if agentsMD != "" {
+			systemPrompt += "\n\n" + agentsMD
+		}
+		if developerInstructions := req.GetString("developer-instructions", ""); developerInstructions != "" {
+			systemPrompt += "\n\n" + developerInstructions
+		}
 	}
 
 	maxTurns := 0
@@ -565,7 +569,7 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
-	sess := s.mgr.Create(agent.Options{
+	options := agent.Options{
 		Provider:        selectedProvider,
 		Model:           model,
 		Cwd:             cwd,
@@ -576,28 +580,46 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		SystemPrompt:    systemPrompt,
 		MaxTurns:        maxTurns,
 		WritableRoots:   writableRoots,
-	})
-	created := time.Now()
-	recorder := rollout.Open(sess.ID, created)
-	sess.AttachRollout(recorder)
-	meta := map[string]any{
-		"session_id":        sess.ID,
-		"id":                sess.ID,
-		"timestamp":         created.UTC().Format(time.RFC3339Nano),
-		"cwd":               cwd,
-		"originator":        "subagent-mcp",
-		"cli_version":       s.version,
-		"source":            "mcp",
-		"model_provider":    sess.Provider().Name(),
-		"base_instructions": map[string]any{"text": systemPrompt},
 	}
-	if resolvedCwd, err := filepath.EvalSymlinks(cwd); err == nil {
-		if root, ok := repo.Root(resolvedCwd); ok {
-			branch, commit := repo.Head(root)
-			meta["git"] = map[string]any{"branch": branch, "commit_hash": commit}
+	if isAgent {
+		options.Thread, err = agentProvider.StartThread(ctx, provider.ThreadOptions{
+			Model:                 model,
+			Cwd:                   cwd,
+			Sandbox:               string(sandbox),
+			ApprovalPolicy:        string(approval),
+			BaseInstructions:      req.GetString("base-instructions", ""),
+			DeveloperInstructions: req.GetString("developer-instructions", ""),
+			WritableRoots:         writableRoots,
+		})
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
 		}
 	}
-	recorder.Write("session_meta", meta)
+
+	sess := s.mgr.Create(options)
+	if !isAgent {
+		created := time.Now()
+		recorder := rollout.Open(sess.ID, created)
+		sess.AttachRollout(recorder)
+		meta := map[string]any{
+			"session_id":        sess.ID,
+			"id":                sess.ID,
+			"timestamp":         created.UTC().Format(time.RFC3339Nano),
+			"cwd":               cwd,
+			"originator":        "subagent-mcp",
+			"cli_version":       s.version,
+			"source":            "mcp",
+			"model_provider":    sess.Provider().Name(),
+			"base_instructions": map[string]any{"text": systemPrompt},
+		}
+		if resolvedCwd, err := filepath.EvalSymlinks(cwd); err == nil {
+			if root, ok := repo.Root(resolvedCwd); ok {
+				branch, commit := repo.Head(root)
+				meta["git"] = map[string]any{"branch": branch, "commit_hash": commit}
+			}
+		}
+		recorder.Write("session_meta", meta)
+	}
 
 	text, err := s.runner.Run(ctx, sess, prompt)
 	return resultWithThreadID(sess.ID, text, err), nil
