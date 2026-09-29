@@ -64,6 +64,105 @@ func TestIsWhitelistedShell(t *testing.T) {
 	}
 }
 
+func TestIsWhitelistedShellLegitimateCommands(t *testing.T) {
+	t.Parallel()
+
+	commands := []string{
+		"ls -la",
+		"ls internal/",
+		`rg "pattern" internal/`,
+		`rg -n 'func Test' --glob '*.go'`,
+		`grep -rn "foo bar" .`,
+		`cat 'file with space.txt'`,
+		"head -n 20 a.go",
+		`find . -name '*.go'`,
+		`find . -type f -name "*_test.go"`,
+		"wc -l a b",
+		"git status",
+		"git log --oneline -5",
+		"git diff --stat",
+		"git rev-parse HEAD",
+		"git branch -a",
+		"rg foo | head",
+		`rg "a;b" .`,
+		`echo 'a;b'; pwd`,
+	}
+
+	for _, command := range commands {
+		command := command
+		t.Run(command, func(t *testing.T) {
+			t.Parallel()
+			if !isWhitelistedShell(command) {
+				t.Fatalf("isWhitelistedShell(%q) = false, want true", command)
+			}
+		})
+	}
+}
+
+func TestIsWhitelistedShellAdversarialCommands(t *testing.T) {
+	t.Parallel()
+
+	commands := []string{
+		"find . '-delete'",
+		`find . "-delete"`,
+		"find . -de''lete",
+		`rg '--pre=sh' x .`,
+		`grep '--pre=sh' x .`,
+		`echo ${x:=$'\x24(touch pwned)'}; echo ${x@P}`,
+		"cat /proc/$PPID/environ",
+		"echo $HOME",
+		"ls $(pwd)",
+		"ls `pwd`",
+		"cat <(ls)",
+		"cat >(ls)",
+		"ls > out",
+		"ls < in",
+		"cd internal",
+		"ls *",
+		"git diff --stat *",
+		"ls ~",
+		"ls {--output=x}",
+		"ls && rm x",
+		"ls\nrm -rf x",
+		"git -c core.pager=x log",
+		"git --exec-path",
+		"env FOO=1 ls",
+		"rg --pre=sh x",
+		"rg --pre x",
+		"rg --pre-glob x",
+		"rg --hostname-bin x",
+		"grep --pre=sh x",
+		"grep --pre x",
+		"grep --pre-glob x",
+		"grep --hostname-bin x",
+		"git diff --output=x",
+		"git diff --output x",
+		"git diff -o x",
+		"git show --output=x",
+		"git show --output x",
+		"git log --output=x",
+		"git log --output x",
+		"git log --show-signature",
+		"git diff --ext-diff",
+		"git show --textconv",
+		"find . -fprint0 output",
+		"find . -okdir echo file \\;",
+		"find . -ok echo file \\;",
+		"find . -fls output",
+		"find . -fprintf output %p",
+	}
+
+	for _, command := range commands {
+		command := command
+		t.Run(command, func(t *testing.T) {
+			t.Parallel()
+			if isWhitelistedShell(command) {
+				t.Fatalf("isWhitelistedShell(%q) = true, want false", command)
+			}
+		})
+	}
+}
+
 func TestPathInside(t *testing.T) {
 	t.Parallel()
 

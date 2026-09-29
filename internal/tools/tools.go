@@ -73,7 +73,9 @@ func RunShellSandboxed(
 
 // shellScript removes variables after bash has loaded the user's login profile,
 // then evaluates the caller's command with the profile's other environment
-// changes intact. The names and prefixes are positional arguments, not shell
+// changes intact. It also removes profile aliases/functions that could replace
+// an allowlisted executable and wraps allowlisted Git reads with safe config
+// overrides. The names and prefixes are positional arguments, not shell
 // source, so a configured name can never inject code into this wrapper.
 const shellScript = `exact_count=$1
 prefix_count=$2
@@ -93,6 +95,66 @@ while ((prefix_count > 0)); do
     done < <(builtin compgen -A variable)
     prefix_count=$((prefix_count - 1))
 done
+builtin shopt -u expand_aliases
+builtin unalias -a 2>/dev/null
+for __subagent_mcp_name in ls cat head tail rg grep find pwd wc stat which echo git; do
+    builtin unset -f "$__subagent_mcp_name" 2>/dev/null
+done
+builtin unset -- __subagent_mcp_name
+__subagent_mcp_safe_git() {
+    local subcommand=${1-}
+    case "$subcommand" in
+    status|branch|rev-parse|ls-files|diff|show|log|blame) ;;
+    *) command git "$@"; return ;;
+    esac
+    local filter_keys filter_status
+    local filter_key
+    local -a filter_overrides=()
+    filter_keys=$(
+        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS= \
+        command git --no-pager -c alias.config= config --name-only --get-regexp \
+            '^filter\..*\.(clean|process|smudge|required)$'
+    )
+    filter_status=$?
+    if ((filter_status > 1)); then
+        return "$filter_status"
+    fi
+    if ((filter_status == 0)); then
+        while IFS= read -r filter_key; do
+            if [[ -n $filter_key ]]; then
+                case "$filter_key" in
+                *.required) filter_overrides+=(-c "$filter_key=false") ;;
+                *) filter_overrides+=(-c "$filter_key=") ;;
+                esac
+            fi
+        done <<< "$filter_keys"
+    fi
+    case "$subcommand" in
+    status|branch|rev-parse|ls-files)
+        shift
+        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS= \
+        GIT_EXTERNAL_DIFF= GIT_PAGER=cat PAGER=cat GIT_SSH= GIT_SSH_COMMAND= GIT_ASKPASS= \
+            command git --no-pager -c "alias.$subcommand=" -c core.fsmonitor=false -c core.fsmonitorHookPath= -c diff.external= -c core.pager=cat \
+            -c core.sshCommand= -c credential.helper= \
+            -c log.showSignature=false -c status.submoduleSummary=false -c submodule.recurse=false \
+            "${filter_overrides[@]}" \
+            "$subcommand" "$@"
+        ;;
+    diff|show|log|blame)
+        shift
+        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS= \
+        GIT_EXTERNAL_DIFF= GIT_PAGER=cat PAGER=cat GIT_SSH= GIT_SSH_COMMAND= GIT_ASKPASS= \
+            command git --no-pager -c "alias.$subcommand=" -c core.fsmonitor=false -c core.fsmonitorHookPath= -c diff.external= -c core.pager=cat \
+            -c core.sshCommand= -c credential.helper= \
+            -c log.showSignature=false -c diff.submodule=short -c interactive.diffFilter= \
+            -c submodule.recurse=false "${filter_overrides[@]}" \
+            "$subcommand" --no-ext-diff --no-textconv "$@"
+        ;;
+    esac
+}
+git() {
+    __subagent_mcp_safe_git "$@"
+}
 __subagent_mcp_command=$1
 set --
 builtin eval "$__subagent_mcp_command"`

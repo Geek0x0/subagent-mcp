@@ -121,26 +121,12 @@ func Evaluate(sb Sandbox, ap ApprovalPolicy, req Request) (Decision, string) {
 }
 
 func isWhitelistedShell(command string) bool {
-	if strings.TrimSpace(command) == "" {
+	segments, ok := lexShell(command)
+	if !ok {
 		return false
 	}
-	for _, metacharacter := range []string{">", "`", "$(", "<("} {
-		if strings.Contains(command, metacharacter) {
-			return false
-		}
-	}
-
-	// ponytail: Quoted metacharacters such as find -name "a;b" are known false negatives that fall through to approval.
-	segments := strings.FieldsFunc(command, func(r rune) bool {
-		return r == ';' || r == '&' || r == '|' || r == '\n'
-	})
-	matchedSegment := false
 	for _, segment := range segments {
-		fields := strings.Fields(segment)
-		if len(fields) == 0 {
-			continue
-		}
-		matchedSegment = true
+		fields := segment.words
 		if simpleAllowed[fields[0]] {
 			if hasDangerousShellFlag(fields) {
 				return false
@@ -156,7 +142,7 @@ func isWhitelistedShell(command string) bool {
 		return false
 	}
 
-	return matchedSegment
+	return true
 }
 
 func hasDangerousShellFlag(fields []string) bool {
@@ -191,6 +177,12 @@ func hasDangerousShellFlag(fields []string) bool {
 		if len(fields) < 2 {
 			return false
 		}
+		for _, argument := range fields[2:] {
+			if argument == "--recurse-submodules" || argument == "--show-signature" || argument == "--verify-signatures" ||
+				argument == "--submodule" || strings.HasPrefix(argument, "--submodule=") {
+				return true
+			}
+		}
 		if fields[1] == "branch" {
 			allowed := map[string]bool{
 				"-a":             true,
@@ -221,7 +213,9 @@ func hasDangerousShellFlag(fields []string) bool {
 		}
 		if fields[1] == "diff" || fields[1] == "log" || fields[1] == "show" {
 			for _, argument := range fields[2:] {
-				if argument == "--output" || strings.HasPrefix(argument, "--output=") {
+				if argument == "--output" || strings.HasPrefix(argument, "--output=") ||
+					argument == "-o" || strings.HasPrefix(argument, "-o") ||
+					strings.HasPrefix(argument, "--ext-diff") || strings.HasPrefix(argument, "--textconv") {
 					return true
 				}
 			}

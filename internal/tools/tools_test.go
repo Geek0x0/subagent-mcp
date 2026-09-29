@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -12,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Geek0x0/subagent-mcp/internal/policy"
 	"github.com/Geek0x0/subagent-mcp/internal/sandbox"
 )
 
@@ -218,6 +220,206 @@ func TestScrubbedEnvSandboxed(t *testing.T) {
 	}
 }
 
+func TestAutoAllowedGitCommandsDoNotRunRepositoryPrograms(t *testing.T) {
+	repo := t.TempDir()
+	home := t.TempDir()
+	markerRoot := t.TempDir()
+	t.Setenv("TMPDIR", markerRoot)
+	marker := filepath.Join(markerRoot, "marker")
+	hook := filepath.Join(markerRoot, "hook.sh")
+	writeGitHook(t, hook, marker)
+	t.Setenv("GIT_EXTERNAL_DIFF", hook)
+	t.Setenv("GIT_PAGER", hook)
+	t.Setenv("PAGER", hook)
+	t.Setenv("GIT_CONFIG_COUNT", "1")
+	t.Setenv("GIT_CONFIG_KEY_0", "core.fsmonitor")
+	t.Setenv("GIT_CONFIG_VALUE_0", hook)
+	t.Setenv("GIT_CONFIG_PARAMETERS", "'core.fsmonitor'='"+hook+"'")
+
+	gitRun(t, home, repo, "init", "-q")
+	gitRun(t, home, repo, "config", "user.email", "test@example.com")
+	gitRun(t, home, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("one\n"), 0o600); err != nil {
+		t.Fatalf("write initial file: %v", err)
+	}
+	gitRun(t, home, repo, "add", "file.txt")
+	gitRun(t, home, repo, "commit", "-qm", "initial")
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("two\n"), 0o600); err != nil {
+		t.Fatalf("write changed file: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, ".gitattributes"), []byte("file.txt diff=hostile filter=hostile\n"), 0o600); err != nil {
+		t.Fatalf("write attributes: %v", err)
+	}
+	gitRun(t, home, repo, "add", ".gitattributes")
+	gitRun(t, home, repo, "commit", "-qm", "attributes")
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("three\n"), 0o600); err != nil {
+		t.Fatalf("write second changed file: %v", err)
+	}
+
+	for _, tc := range []struct {
+		name    string
+		command string
+		config  []string
+	}{
+		{name: "diff external", command: "git diff HEAD~1 HEAD", config: []string{"diff.external", hook}},
+		{name: "textconv", command: "git diff HEAD -- file.txt", config: []string{"--unset", "diff.external"}},
+		{name: "fsmonitor", command: "git status", config: []string{"core.fsmonitor", hook}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			commands := []string{
+				tc.command,
+				"git status",
+				"git diff HEAD -- file.txt",
+				"git log -p -1",
+				"git show HEAD",
+				"git blame file.txt",
+				"git branch -a",
+				"git rev-parse HEAD",
+				"git ls-files",
+			}
+			configArgs := append([]string{"config"}, tc.config...)
+			gitRun(t, home, repo, configArgs...)
+			if tc.name == "diff external" {
+				gitRun(t, home, repo, "config", "alias.diff", "!"+hook)
+			}
+			gitRun(t, home, repo, "config", "alias.config", "!"+hook)
+			if tc.name == "textconv" {
+				gitRun(t, home, repo, "config", "diff.hostile.textconv", hook)
+				gitRun(t, home, repo, "config", "filter.hostile.clean", hook)
+				gitRun(t, home, repo, "config", "filter.hostile.smudge", "cat")
+			}
+			if tc.name == "fsmonitor" {
+				gitRun(t, home, repo, "config", "alias.status", "!"+hook)
+			}
+
+			for _, command := range commands {
+				if decision, reason := policy.Evaluate(
+					policy.Sandbox("read-only"),
+					policy.ApprovalPolicy("untrusted"),
+					policy.Request{Tool: "shell", Command: command, Cwd: repo},
+				); decision != policy.Allow {
+					t.Fatalf("policy rejected %q: %v (%s)", command, decision, reason)
+				}
+			}
+
+			for _, runner := range []struct {
+				name string
+				run  func(string) (string, int, error)
+			}{
+				{name: "native", run: func(command string) (string, int, error) {
+					return RunShell(context.Background(), repo, command, 10*time.Second)
+				}},
+				{name: "landlock", run: func(command string) (string, int, error) {
+					return RunShellSandboxed(context.Background(), repo, command, 10*time.Second, []string{markerRoot})
+				}},
+			} {
+				t.Run(runner.name, func(t *testing.T) {
+					if runner.name == "landlock" {
+						if err := sandbox.Available(); err != nil {
+							t.Skipf("landlock unavailable: %v", err)
+						}
+					}
+					for _, command := range commands {
+						_ = os.Remove(marker)
+						out, code, err := func() (string, int, error) {
+							return runner.run(command)
+						}()
+						if err != nil || code != 0 {
+							t.Fatalf("%s runner %q = (%q, %d, %v)", runner.name, command, out, code, err)
+						}
+						if _, err := os.Stat(marker); err == nil {
+							t.Fatalf("%s runner executed repository-configured program for %q; output=%q", runner.name, command, out)
+						} else if !errors.Is(err, os.ErrNotExist) {
+							t.Fatalf("stat marker after %s runner %q: %v", runner.name, command, err)
+						}
+					}
+
+					_ = os.Remove(marker)
+					plainGit(t, home, repo, tc.command)
+					if _, err := os.Stat(marker); err != nil {
+						t.Fatalf("plain git did not execute repository-configured program: %v", err)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestRunShellGitFunctionDoesNotBreakCommit(t *testing.T) {
+	repo := t.TempDir()
+	home := t.TempDir()
+	gitRun(t, home, repo, "init", "-q")
+	gitRun(t, home, repo, "config", "user.email", "test@example.com")
+	gitRun(t, home, repo, "config", "user.name", "Test")
+	if err := os.WriteFile(filepath.Join(repo, "file.txt"), []byte("content\n"), 0o600); err != nil {
+		t.Fatalf("write file: %v", err)
+	}
+
+	out, code, err := RunShell(context.Background(), repo, "git add file.txt && git commit -qm initial", 10*time.Second)
+	if err != nil || code != 0 {
+		t.Fatalf("RunShell() = (%q, %d, %v), want a successful commit", out, code, err)
+	}
+	if _, err := os.Stat(filepath.Join(repo, ".git", "objects")); err != nil {
+		t.Fatalf("commit did not create git objects: %v", err)
+	}
+}
+
+func writeGitHook(t *testing.T, hook, marker string) {
+	t.Helper()
+	content := "#!/bin/sh\nprintf 'triggered\\n' > " + shellQuote(marker) + "\n"
+	if err := os.WriteFile(hook, []byte(content), 0o700); err != nil {
+		t.Fatalf("write git hook: %v", err)
+	}
+}
+
+func gitRun(t *testing.T, home, repo string, args ...string) {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = repo
+	cmd.Env = gitTestEnv(home)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+func plainGit(t *testing.T, home, repo, command string) {
+	t.Helper()
+	fields := strings.Fields(command)
+	if len(fields) < 2 || fields[0] != "git" {
+		t.Fatalf("plainGit got non-git command %q", command)
+	}
+	cmd := exec.Command("git", fields[1:]...)
+	cmd.Dir = repo
+	cmd.Env = gitTestEnv(home)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("plain git %s: %v\n%s", strings.Join(fields[1:], " "), err, out)
+	}
+}
+
+func gitTestEnv(home string) []string {
+	env := make([]string, 0, len(os.Environ())+3)
+	for _, entry := range os.Environ() {
+		name, _, _ := strings.Cut(entry, "=")
+		switch name {
+		case "GIT_CONFIG_GLOBAL", "GIT_CONFIG_SYSTEM", "GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0", "GIT_CONFIG_PARAMETERS", "GIT_EXTERNAL_DIFF", "GIT_PAGER", "PAGER":
+			continue
+		}
+		env = append(env, entry)
+	}
+	env = append(env,
+		"HOME="+home,
+		"GIT_CONFIG_GLOBAL="+filepath.Join(home, "global-config"),
+		"GIT_CONFIG_SYSTEM="+filepath.Join(home, "system-config"),
+		"GIT_PAGER=cat",
+		"PAGER=cat",
+	)
+	return env
+}
+
+func shellQuote(value string) string {
+	return "'" + strings.ReplaceAll(value, "'", "'\\''") + "'"
+}
+
 func TestRunShellScrubsLoginProfileProviderKeyAndKeepsPATH(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -309,6 +511,23 @@ func TestRunShellScrubsLoginProfileSubagentEnvironment(t *testing.T) {
 				t.Fatalf("shell saw profile SUBAGENT_MCP_ variable: %q", out)
 			}
 		})
+	}
+}
+
+func TestRunShellDisablesProfileAliasesAndFunctions(t *testing.T) {
+	home := t.TempDir()
+	profile := "shopt -s expand_aliases\nalias echo='printf alias\\n'\nfunction echo { printf 'function\\n'; }\n"
+	if err := os.WriteFile(filepath.Join(home, ".bash_profile"), []byte(profile), 0o600); err != nil {
+		t.Fatalf("write bash profile: %v", err)
+	}
+	t.Setenv("HOME", home)
+
+	out, code, err := RunShell(context.Background(), t.TempDir(), "echo safe", 5*time.Second)
+	if err != nil || code != 0 {
+		t.Fatalf("RunShell() = (%q, %d, %v)", out, code, err)
+	}
+	if out != "safe\n" {
+		t.Fatalf("RunShell() output = %q, want the builtin echo output", out)
 	}
 }
 
