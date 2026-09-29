@@ -45,7 +45,11 @@ type Message struct {
 	Opaque json.RawMessage
 }
 
-// Usage reports token counts for one turn.
+// Usage reports token counts for one turn. Every adapter maps its API onto
+// the same meaning: Input is the full prompt token count INCLUDING cached
+// tokens; Cached is the part of Input served from cache (Cached <= Input);
+// Output is the generated completion; Reasoning is the reasoning/thinking
+// share of the output when the API reports one; Total is Input + Output.
 type Usage struct {
 	Input     int
 	Cached    int

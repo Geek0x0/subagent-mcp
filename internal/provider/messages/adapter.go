@@ -104,7 +104,9 @@ func (a *Adapter) Turn(ctx context.Context, req provider.TurnRequest, onDelta fu
 		if message.StopReason != anthropic.StopReasonPauseTurn || attempt >= maxPauseContinuations {
 			break
 		}
-		params.Messages = append(params.Messages, message.ToParam())
+		if param, ok := replayMessage(message); ok {
+			params.Messages = append(params.Messages, param)
+		}
 	}
 	if turn[len(turn)-1].StopReason == anthropic.StopReasonPauseTurn {
 		return nil, fmt.Errorf("messages: turn still paused after %d continuations", maxPauseContinuations)
@@ -114,6 +116,8 @@ func (a *Adapter) Turn(ctx context.Context, req provider.TurnRequest, onDelta fu
 		return nil, fmt.Errorf("messages: model refused the request (category %q): %s", last.StopDetails.Category, last.StopDetails.Explanation)
 	case anthropic.StopReasonMaxTokens:
 		return nil, errors.New("messages: response hit max_tokens; raise max_output_tokens in the provider config")
+	case anthropic.StopReasonModelContextWindowExceeded:
+		return nil, errors.New("messages: response hit model_context_window_exceeded; shorten the conversation or use a model with a larger context window")
 	}
 	return toResult(turn, partials)
 }
@@ -127,6 +131,7 @@ func (a *Adapter) stream(ctx context.Context, params anthropic.MessageNewParams,
 	defer stream.Close()
 	message := anthropic.Message{}
 	partials := map[int64]string{}
+	var streamed strings.Builder
 	for stream.Next() {
 		event := stream.Current()
 		switch event.Type {
@@ -149,8 +154,11 @@ func (a *Adapter) stream(ctx context.Context, params anthropic.MessageNewParams,
 					partials[delta.Index] = delta.Delta.PartialJSON
 				}
 			case "text_delta":
-				if onDelta != nil && delta.Delta.Text != "" {
-					onDelta(delta.Delta.Text)
+				if delta.Delta.Text != "" {
+					streamed.WriteString(delta.Delta.Text)
+					if onDelta != nil {
+						onDelta(delta.Delta.Text)
+					}
 				}
 			}
 		}
@@ -158,7 +166,19 @@ func (a *Adapter) stream(ctx context.Context, params anthropic.MessageNewParams,
 			return anthropic.Message{}, nil, err
 		}
 	}
-	return message, partials, stream.Err()
+	if err := stream.Err(); err != nil {
+		return anthropic.Message{}, nil, err
+	}
+	// A stream that ends before message_delta carries no stop signal: it is a
+	// truncated reply, not an answer. The block JSON is refreshed only at
+	// block/message stop, so success here would report empty text even though
+	// deltas were streamed, and store a block the API rejects on replay.
+	if message.StopReason == "" {
+		return anthropic.Message{}, nil, fmt.Errorf(
+			"messages: stream ended without a terminal stop signal (partial text: %q)",
+			truncateRunes(streamed.String(), 120))
+	}
+	return message, partials, nil
 }
 
 // buildMessages replays neutral history; consecutive tool results become one user message.
@@ -186,12 +206,41 @@ func buildMessages(history []provider.Message) ([]anthropic.MessageParam, error)
 				return nil, fmt.Errorf("messages: corrupt replay payload: %w", err)
 			}
 			for _, message := range turn {
-				out = append(out, message.ToParam())
+				if param, ok := replayMessage(message); ok {
+					out = append(out, param)
+				}
 			}
 		}
 	}
 	flush()
 	return out, nil
+}
+
+// replayMessage converts one stored assistant message into a request message,
+// dropping empty text blocks. A message with nothing sendable left — an empty
+// content array from a legal empty end_turn reply, or only empty text blocks —
+// is not replayed at all: the Messages API rejects any message whose content
+// is empty, so replaying one would 400 every later turn on the session.
+func replayMessage(message anthropic.Message) (anthropic.MessageParam, bool) {
+	blocks := make([]anthropic.ContentBlockParamUnion, 0, len(message.Content))
+	for _, block := range message.Content {
+		if text, ok := block.AsAny().(anthropic.TextBlock); ok && text.Text == "" {
+			continue
+		}
+		blocks = append(blocks, block.ToParam())
+	}
+	if len(blocks) == 0 {
+		return anthropic.MessageParam{}, false
+	}
+	return anthropic.MessageParam{Role: anthropic.MessageParamRole(message.Role), Content: blocks}, true
+}
+
+// truncateRunes bounds text embedded in an error message.
+func truncateRunes(s string, max int) string {
+	if runes := []rune(s); len(runes) > max {
+		return string(runes[:max]) + "…"
+	}
+	return s
 }
 
 func buildTools(specs []provider.ToolSpec) []anthropic.ToolUnionParam {
@@ -234,16 +283,37 @@ func toResult(turn []anthropic.Message, partials []map[int64]string) (*provider.
 			}
 		}
 		u := message.Usage
-		out.Usage.Input += int(u.InputTokens)
+		input := int(u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens)
+		out.Usage.Input += input
 		out.Usage.Cached += int(u.CacheReadInputTokens)
 		out.Usage.Output += int(u.OutputTokens)
-		out.Usage.Total += int(u.InputTokens + u.CacheCreationInputTokens + u.CacheReadInputTokens + u.OutputTokens)
+		out.Usage.Reasoning += int(u.OutputTokensDetails.ThinkingTokens)
+		out.Usage.Total += input + int(u.OutputTokens)
 	}
 	out.Reasoning = strings.Join(reasoning, "\n")
-	opaque, err := json.Marshal(turn)
+	opaque, err := json.Marshal(replayTurn(turn))
 	if err != nil {
 		return nil, fmt.Errorf("messages: encode replay payload: %w", err)
 	}
 	out.Opaque = opaque
 	return out, nil
+}
+
+// replayTurn drops empty text blocks from the stored turn: such a block can
+// only come from a stream cut before its content_block_stop, and the API
+// rejects it on replay.
+func replayTurn(turn []anthropic.Message) []anthropic.Message {
+	stored := make([]anthropic.Message, len(turn))
+	for i, message := range turn {
+		blocks := make([]anthropic.ContentBlockUnion, 0, len(message.Content))
+		for _, block := range message.Content {
+			if text, ok := block.AsAny().(anthropic.TextBlock); ok && text.Text == "" {
+				continue
+			}
+			blocks = append(blocks, block)
+		}
+		message.Content = blocks
+		stored[i] = message
+	}
+	return stored
 }

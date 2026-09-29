@@ -132,6 +132,28 @@ func TestResponsesIncompleteAndFailed(t *testing.T) {
 	}
 }
 
+// A completed response whose message carries only a refusal part must not
+// complete the session with an empty answer.
+func TestResponsesRefusalPartFails(t *testing.T) {
+	fake := testutil.NewFakeResponses(t, []testutil.FakeResponse{{
+		Items: []testutil.FakeResponseItem{{MessageRefusal: "I cannot help with that."}},
+	}})
+	p := newAdapter(t, fake)
+	res, err := p.Turn(context.Background(), provider.TurnRequest{
+		Model: "gpt-x", Messages: []provider.Message{{Role: provider.RoleUser, Text: "hi"}},
+	}, nil)
+	if err == nil {
+		var text string
+		if res != nil {
+			text = res.Text
+		}
+		t.Fatalf("refusal must fail the turn, got err = nil and text %q", text)
+	}
+	if !strings.Contains(err.Error(), "I cannot help with that.") {
+		t.Fatalf("refusal text missing from error: %v", err)
+	}
+}
+
 func TestResponsesStreamError(t *testing.T) {
 	fake := testutil.NewFakeResponses(t, []testutil.FakeResponse{{
 		Items:       []testutil.FakeResponseItem{{MessageText: "partial"}},
