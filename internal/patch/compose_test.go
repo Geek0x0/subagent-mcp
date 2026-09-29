@@ -256,3 +256,68 @@ func TestHeaderPositionSelectsTheSecondBlock(t *testing.T) {
 		t.Errorf("f.txt = %q, want only the second block edited", got)
 	}
 }
+
+func TestMoveOntoAPlannedPathIsRejected(t *testing.T) {
+	tests := map[string]string{
+		"add then move onto it": patchText(
+			"*** Add File: b.txt", "+added",
+			"*** Update File: a.txt", "*** Move to: b.txt", "@@", "-a", "+A"),
+		"two moves to one target": patchText(
+			"*** Update File: a.txt", "*** Move to: b.txt", "@@", "-a", "+A",
+			"*** Update File: c.txt", "*** Move to: b.txt", "@@", "-c", "+C"),
+	}
+	for name, text := range tests {
+		t.Run(name, func(t *testing.T) {
+			cwd := t.TempDir()
+			write(t, filepath.Join(cwd, "a.txt"), "a\n")
+			write(t, filepath.Join(cwd, "c.txt"), "c\n")
+			_, err := applyText(t, cwd, text)
+			if err == nil || !strings.Contains(err.Error(), "b.txt") {
+				t.Fatalf("error = %v, want a rejection naming b.txt", err)
+			}
+			if got := read(t, filepath.Join(cwd, "a.txt")); got != "a\n" {
+				t.Errorf("a.txt = %q, want it untouched", got)
+			}
+			if _, err := os.Stat(filepath.Join(cwd, "b.txt")); !os.IsNotExist(err) {
+				t.Errorf("b.txt exists after a rejected patch")
+			}
+		})
+	}
+}
+
+// Deleting works on files the process cannot read, leaves nothing behind on
+// success, and a later failure puts the file back with its mode.
+func TestDeleteUnreadableFileAndItsRollback(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads mode-000 files")
+	}
+	cwd := t.TempDir()
+	locked := filepath.Join(cwd, "locked.txt")
+	write(t, locked, "secret\n")
+	write(t, filepath.Join(cwd, "keep.txt"), "keep\n")
+	if err := os.Chmod(locked, 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(locked, 0o600) })
+
+	changes := planOnly(t, cwd, patchText("*** Delete File: locked.txt", "*** Delete File: keep.txt"))
+	if err := os.Remove(filepath.Join(cwd, "keep.txt")); err != nil { // makes the second step fail
+		t.Fatal(err)
+	}
+	if err := Commit(changes); err == nil {
+		t.Fatal("Commit() error = nil, want the second delete to fail")
+	}
+	info, err := os.Stat(locked)
+	if err != nil || info.Mode().Perm() != 0 {
+		t.Fatalf("locked.txt after failed Commit = (%v, %v), want it back with mode 000", info, err)
+	}
+
+	changes = planOnly(t, cwd, patchText("*** Delete File: locked.txt"))
+	if err := Commit(changes); err != nil {
+		t.Fatalf("Commit() error = %v, want the unreadable file deleted", err)
+	}
+	entries, _ := os.ReadDir(cwd)
+	if len(entries) != 0 {
+		t.Errorf("directory holds %v after the delete, want it empty (no set-aside copy left)", entries)
+	}
+}

@@ -77,10 +77,14 @@ func Plan(cwd string, hunks []Hunk) ([]Change, error) {
 			if hunk.MoveTo != "" {
 				change.MoveTo = resolve(cwd, hunk.MoveTo)
 				if change.MoveTo != path {
-					if _, planned := p.files[change.MoveTo]; !planned {
-						if err := checkTarget(change.MoveTo, "move "+hunk.MoveTo, true); err != nil {
-							return nil, err
+					if state, planned := p.files[change.MoveTo]; planned {
+						// Overwriting a file that an earlier section of this patch
+						// created or wrote would silently drop that section.
+						if state.exists {
+							return nil, fmt.Errorf("move %s: file already exists", hunk.MoveTo)
 						}
+					} else if err := checkTarget(change.MoveTo, "move "+hunk.MoveTo, true); err != nil {
+						return nil, err
 					}
 					p.files[path] = fileState{}
 					p.files[change.MoveTo] = fileState{exists: true, content: content}
@@ -250,6 +254,7 @@ func Commit(changes []Change) error {
 			return tx.rollback(err)
 		}
 	}
+	tx.finish()
 	return nil
 }
 
@@ -276,18 +281,21 @@ func (t *commitTx) apply(change Change) error {
 
 // snapshot is what a path looked like before Commit first touched it.
 type snapshot struct {
-	exists bool
-	link   string // symlink target, when the path was a symlink
-	data   []byte // file content (through the link for a symlink); nil if unreadable
-	mode   os.FileMode
+	trashed string // where remove set the original aside; restore renames it back
+	exists  bool
+	link    string // symlink target, when the path was a symlink
+	data    []byte // file content (through the link for a symlink); nil if unreadable
+	mode    os.FileMode
 }
 
 // commitTx records the original state of every path Commit touches, and the
 // directories it creates, so a failure can put everything back.
 type commitTx struct {
-	saved map[string]snapshot
-	order []string
-	dirs  []string // created directories, deepest first
+	saved  map[string]snapshot
+	order  []string
+	dirs   []string // created directories, deepest first
+	trash  []string // files set aside by remove, deleted once Commit succeeds
+	serial int
 }
 
 func (t *commitTx) save(path string) error {
@@ -330,11 +338,37 @@ func (t *commitTx) write(path, content string) error {
 	return os.WriteFile(path, []byte(content), 0o644)
 }
 
+// remove deletes a file by setting it aside in its own directory, so it can be put
+// back exactly (any mode, any size, even unreadable) if a later step fails. The
+// set-aside copies are deleted once every step has succeeded.
 func (t *commitTx) remove(path string) error {
-	if err := t.save(path); err != nil {
+	if _, done := t.saved[path]; done {
+		// Already written by this Commit: its original is in the snapshot.
+		return os.Remove(path)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
 		return err
 	}
-	return os.Remove(path)
+	if info.IsDir() {
+		return fmt.Errorf("%s: is a directory", path)
+	}
+	t.serial++
+	trash := filepath.Join(filepath.Dir(path), fmt.Sprintf(".%s.subagent-mcp-trash-%d-%d", filepath.Base(path), os.Getpid(), t.serial))
+	if err := os.Rename(path, trash); err != nil {
+		return err
+	}
+	t.saved[path] = snapshot{exists: true, trashed: trash}
+	t.order = append(t.order, path)
+	t.trash = append(t.trash, trash)
+	return nil
+}
+
+// finish deletes the set-aside originals after a successful Commit.
+func (t *commitTx) finish() {
+	for _, trash := range t.trash {
+		_ = os.Remove(trash)
+	}
 }
 
 func (t *commitTx) mkdirAll(dir string) error {
@@ -375,6 +409,12 @@ func (t *commitTx) rollback(cause error) error {
 
 func (s snapshot) restore(path string) error {
 	switch {
+	case s.trashed != "":
+		// Whatever a later step put at the path goes; the original comes back.
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return os.Rename(s.trashed, path)
 	case !s.exists:
 		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
