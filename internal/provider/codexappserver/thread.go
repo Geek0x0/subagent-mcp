@@ -26,13 +26,45 @@ type thread struct {
 	closed    bool
 	closedCh  chan struct{} // Closed once, by the first Close.
 	active    *threadTurn
+	stray     *strayTurn // A turn that may still be running after its Run returned.
 }
 
 type threadTurn struct {
-	id     string // Protected by thread.mu; unknown until turn/start responds.
-	queue  *Subscription
-	cancel context.CancelFunc
+	// id is protected by thread.mu. It is unknown until the turn/start response
+	// or a turn/started notification, whichever arrives first; learn closes idCh.
+	id        string
+	idCh      chan struct{}
+	done      chan struct{} // Closed by finish.
+	queue     *Subscription
+	cancel    context.CancelFunc
+	completed bool // turn/completed was observed.
+	// uncertain: turn/start ended without a server verdict (cancelled, timed out
+	// or the connection failed), so the turn may exist even if its id is unknown.
+	uncertain bool
+	// closeTimedOut: Close gave up waiting for the id, so Run must interrupt
+	// the turn itself when the turn/start response finally arrives.
+	closeTimedOut bool
 }
+
+func (a *threadTurn) learn(id string) {
+	if a.id == "" && id != "" {
+		a.id = id
+		close(a.idCh)
+	}
+}
+
+// strayTurn is a turn that may still be running inside Codex although the Run
+// that started it has returned (interrupt never completed, or turn/start was
+// abandoned). The next Run must settle it before starting a new turn, or Codex
+// would steer the new input into the old turn.
+type strayTurn struct {
+	id   string // Empty until a turn/started notification names it.
+	gen  uint64
+	idCh chan struct{} // Closed when id is learned.
+	done chan struct{} // Closed when its turn/completed is observed.
+}
+
+const turnSettleBudget = 30 * time.Second
 
 var _ provider.Thread = (*thread)(nil)
 
@@ -72,6 +104,9 @@ func (t *thread) route(c *conn, sub *Subscription) {
 			rejectQueued(c, queued)
 			return
 		}
+		if t.conn == c && len(msg.ID) == 0 {
+			t.observeTurnEvent(c, active, msg)
+		}
 		reject := t.closed || t.conn != c || active == nil
 		if len(msg.ID) != 0 && !reject {
 			var p approvalParams
@@ -86,6 +121,43 @@ func (t *thread) route(c *conn, sub *Subscription) {
 			_ = rejectRequest(c, msg)
 		}
 	}
+}
+
+// observeTurnEvent lets the router learn a turn's id from turn/started before the
+// turn/start response arrives, and settle a stray turn that completes between
+// Runs. Callers hold t.mu.
+func (t *thread) observeTurnEvent(c *conn, active *threadTurn, msg Message) {
+	if msg.Method != "turn/started" && msg.Method != "turn/completed" {
+		return
+	}
+	var p notificationParams
+	if json.Unmarshal(msg.Params, &p) != nil || p.Turn.ID == "" {
+		return
+	}
+	switch {
+	case active != nil:
+		if msg.Method == "turn/started" {
+			active.learn(p.Turn.ID)
+		}
+	case t.stray != nil && t.stray.gen == c.gen:
+		stray := t.stray
+		if msg.Method == "turn/started" && stray.id == "" {
+			stray.id = p.Turn.ID
+			close(stray.idCh)
+			go interruptTurn(c, t.id, stray.id, 5*time.Second)
+		}
+		if msg.Method == "turn/completed" && (stray.id == "" || stray.id == p.Turn.ID) {
+			t.stray = nil
+			close(stray.done)
+		}
+	}
+}
+
+// interruptTurn sends a best-effort turn/interrupt bounded by timeout.
+func interruptTurn(c *conn, threadID, turnID string, timeout time.Duration) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+	_ = c.client.Call(ctx, "turn/interrupt", map[string]string{"threadId": threadID, "turnId": turnID}, nil)
 }
 
 func (t *thread) Run(ctx context.Context, prompt, effort string, cb provider.ThreadCallbacks) (string, error) {
@@ -115,6 +187,9 @@ func (t *thread) Run(ctx context.Context, prompt, effort string, cb provider.Thr
 			return "", c.failure(err)
 		}
 	}
+	if err := t.settleStray(ctx, c); err != nil {
+		return "", err
+	}
 
 	// Keep the turn/start response available if cancellation races it: we need
 	// its turn ID to interrupt. The same 30s cancellation budget bounds both
@@ -131,7 +206,10 @@ func (t *thread) Run(ctx context.Context, prompt, effort string, cb provider.Thr
 	})
 	defer stop()
 	defer cancel()
-	active := &threadTurn{queue: &Subscription{changed: make(chan struct{})}, cancel: cancel}
+	active := &threadTurn{
+		queue: &Subscription{changed: make(chan struct{})}, cancel: cancel,
+		idCh: make(chan struct{}), done: make(chan struct{}),
+	}
 	t.mu.Lock()
 	if t.closed {
 		t.mu.Unlock()
@@ -158,11 +236,20 @@ func (t *thread) Run(ctx context.Context, prompt, effort string, cb provider.Thr
 		Turn struct{ ID string } `json:"turn"`
 	}
 	if err := c.client.Call(runCtx, "turn/start", params, &result); err != nil {
-		return "", t.runError(ctx, c, err)
+		return "", t.startFailed(ctx, c, active, err)
 	}
 	t.mu.Lock()
-	active.id = result.Turn.ID
+	active.learn(result.Turn.ID)
+	closed, lateInterrupt := t.closed, active.closeTimedOut
 	t.mu.Unlock()
+	if closed {
+		// Close either interrupts the turn itself or, having given up waiting
+		// for the id, left that to us.
+		if lateInterrupt {
+			interruptTurn(c, t.id, active.id, 5*time.Second)
+		}
+		return "", errThreadClosed
+	}
 
 	var last, final string
 	var hasFinal bool
@@ -200,7 +287,7 @@ func (t *thread) Run(ctx context.Context, prompt, effort string, cb provider.Thr
 		}
 		t.emit(msg, cb)
 		if msg.Method == "turn/completed" {
-			t.markCompleted()
+			t.markCompleted(active)
 			if err := ctx.Err(); err != nil {
 				return "", err
 			}
@@ -236,9 +323,10 @@ func (t *thread) emit(msg Message, cb provider.ThreadCallbacks) {
 	}
 }
 
-func (t *thread) markCompleted() {
+func (t *thread) markCompleted(active *threadTurn) {
 	t.mu.Lock()
 	t.completed = true
+	active.completed = true
 	t.mu.Unlock()
 }
 
@@ -323,7 +411,7 @@ func (t *thread) interrupt(ctx context.Context, c *conn, active *threadTurn, cb 
 		}
 		t.emit(msg, cb)
 		if msg.Method == "turn/completed" {
-			t.markCompleted()
+			t.markCompleted(active)
 			return
 		}
 	}
@@ -342,9 +430,82 @@ func (t *thread) runError(ctx context.Context, c *conn, err error) error {
 	return c.failure(err)
 }
 
+// startFailed handles a failed turn/start. Unless the server itself refused the
+// turn, the turn may exist: if its id is already known (turn/started arrived) and
+// the caller is gone, interrupt it now; the rest is left to settleStray.
+func (t *thread) startFailed(ctx context.Context, c *conn, active *threadTurn, err error) error {
+	var rpcErr *RPCError
+	t.mu.Lock()
+	if !errors.As(err, &rpcErr) {
+		active.uncertain = true
+	}
+	id, closed := active.id, t.closed
+	t.mu.Unlock()
+	if id != "" && !closed && ctx.Err() != nil {
+		interruptTurn(c, t.id, id, 5*time.Second)
+	}
+	return t.runError(ctx, c, err)
+}
+
+// settleStray makes sure no earlier turn of this thread is still running: it
+// interrupts the remembered turn and waits (within one shared budget) for its
+// turn/completed. It fails rather than let Codex steer a new prompt into a turn
+// that is still executing.
+func (t *thread) settleStray(ctx context.Context, c *conn) error {
+	t.mu.Lock()
+	stray := t.stray
+	if stray != nil && stray.gen != c.gen {
+		// The app-server process that ran it is gone.
+		t.stray, stray = nil, nil
+	}
+	t.mu.Unlock()
+	if stray == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, turnSettleBudget)
+	defer cancel()
+	wait := func(ch chan struct{}) error {
+		select {
+		case <-ch:
+			return nil
+		case <-ctx.Done():
+			if err := ctx.Err(); errors.Is(err, context.DeadlineExceeded) {
+				return errors.New("codex is still running the previous turn of this thread; wait for it to finish or start a new session")
+			}
+			return ctx.Err()
+		}
+	}
+	select {
+	case <-stray.done:
+		return nil
+	case <-stray.idCh:
+	case <-ctx.Done():
+		return wait(stray.done)
+	}
+	t.mu.Lock()
+	id := stray.id
+	t.mu.Unlock()
+	// Wait for the completion while the interrupt RPC is in flight: the turn may
+	// finish before, or long after, the RPC is answered.
+	called := make(chan struct{})
+	go func() {
+		defer close(called)
+		_ = c.client.Call(ctx, "turn/interrupt", map[string]string{"threadId": t.id, "turnId": id}, nil)
+	}()
+	defer func() { cancel(); <-called }()
+	return wait(stray.done)
+}
+
 func (t *thread) finish(c *conn, active *threadTurn) {
 	t.mu.Lock()
 	t.active = nil
+	if !active.completed && !t.closed && (active.id != "" || active.uncertain) {
+		t.stray = &strayTurn{id: active.id, gen: c.gen, idCh: make(chan struct{}), done: make(chan struct{})}
+		if active.id != "" {
+			close(t.stray.idCh)
+		}
+	}
+	close(active.done)
 	queued := active.queue.close(errors.New("turn finished"))
 	t.mu.Unlock()
 	rejectQueued(c, queued)
@@ -359,15 +520,37 @@ func (t *thread) Close() {
 	t.closed = true
 	close(t.closedCh)
 	c := t.conn
+	active := t.active
 	var turnID string
-	if t.active != nil {
-		t.active.cancel()
-		turnID = t.active.id
+	switch {
+	case active != nil:
+		turnID = active.id
+		if turnID != "" {
+			active.cancel()
+		}
+	case t.stray != nil:
+		turnID = t.stray.id
 	}
 	t.mu.Unlock()
-	c.client.Unsubscribe(t.id)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+	if active != nil && turnID == "" {
+		// turn/start is still in flight. Cancelling it would discard the reply
+		// that names the turn, leaving Codex running it unobserved, so wait
+		// (within the Close budget) for the id and interrupt it below.
+		select {
+		case <-active.idCh:
+			active.cancel()
+		case <-active.done:
+		case <-ctx.Done():
+			time.AfterFunc(turnSettleBudget, active.cancel)
+		}
+		t.mu.Lock()
+		turnID = active.id
+		active.closeTimedOut = turnID == "" && ctx.Err() != nil
+		t.mu.Unlock()
+	}
+	c.client.Unsubscribe(t.id)
 	if turnID != "" && c.client.Err() == nil {
 		_ = c.client.Call(ctx, "turn/interrupt", map[string]string{"threadId": t.id, "turnId": turnID}, nil)
 	}
