@@ -9,6 +9,40 @@ import (
 	"strings"
 )
 
+// FS is the file system a patch is planned against and committed to. OS is the
+// default; a caller that must keep every access beneath one directory (the
+// sandboxed workspace) supplies an implementation that enforces it in the
+// kernel, so no path component can be swapped for a symlink between a check
+// and the use.
+type FS interface {
+	Stat(name string) (fs.FileInfo, error)
+	Lstat(name string) (fs.FileInfo, error)
+	ReadFile(name string) ([]byte, error)
+	Readlink(name string) (string, error)
+	WriteFile(name string, data []byte, perm fs.FileMode) error
+	MkdirAll(name string, perm fs.FileMode) error
+	Remove(name string) error
+	Rename(oldName, newName string) error
+	Symlink(target, name string) error
+	Chmod(name string, mode fs.FileMode) error
+}
+
+type osFS struct{}
+
+// OS is the ordinary file system.
+var OS FS = osFS{}
+
+func (osFS) Stat(n string) (fs.FileInfo, error)                { return os.Stat(n) }
+func (osFS) Lstat(n string) (fs.FileInfo, error)               { return os.Lstat(n) }
+func (osFS) ReadFile(n string) ([]byte, error)                 { return os.ReadFile(n) }
+func (osFS) Readlink(n string) (string, error)                 { return os.Readlink(n) }
+func (osFS) MkdirAll(n string, m fs.FileMode) error            { return os.MkdirAll(n, m) }
+func (osFS) Remove(n string) error                             { return os.Remove(n) }
+func (osFS) Rename(o, n string) error                          { return os.Rename(o, n) }
+func (osFS) Symlink(t, n string) error                         { return os.Symlink(t, n) }
+func (osFS) Chmod(n string, m fs.FileMode) error               { return os.Chmod(n, m) }
+func (osFS) WriteFile(n string, d []byte, m fs.FileMode) error { return os.WriteFile(n, d, m) }
+
 type Change struct {
 	Kind       Kind
 	Path       string
@@ -27,13 +61,19 @@ type fileState struct {
 // later section sees the edits (and deletions) of the earlier ones instead of the
 // file on disk. Paths are keyed by their cleaned absolute spelling.
 type planner struct {
+	fs    FS
 	files map[string]fileState
 }
 
 // Plan computes every resulting file in memory; it writes nothing. Sections that
 // touch the same path compose in order or fail with an error naming the path.
 func Plan(cwd string, hunks []Hunk) ([]Change, error) {
-	p := &planner{files: make(map[string]fileState)}
+	return PlanFS(OS, cwd, hunks)
+}
+
+// PlanFS is Plan against fsys.
+func PlanFS(fsys FS, cwd string, hunks []Hunk) ([]Change, error) {
+	p := &planner{fs: fsys, files: make(map[string]fileState)}
 	changes := make([]Change, 0, len(hunks))
 	for _, hunk := range hunks {
 		path := resolve(cwd, hunk.Path)
@@ -43,7 +83,7 @@ func Plan(cwd string, hunks []Hunk) ([]Change, error) {
 				if state.exists {
 					return nil, fmt.Errorf("add %s: file already exists", hunk.Path)
 				}
-			} else if err := checkTarget(path, "add "+hunk.Path, false); err != nil {
+			} else if err := checkTarget(p.fs, path, "add "+hunk.Path, false); err != nil {
 				return nil, err
 			}
 			p.files[path] = fileState{exists: true, content: hunk.Content}
@@ -54,7 +94,7 @@ func Plan(cwd string, hunks []Hunk) ([]Change, error) {
 					return nil, fmt.Errorf("delete %s: %w", hunk.Path, fs.ErrNotExist)
 				}
 			} else {
-				info, err := os.Stat(path)
+				info, err := p.fs.Stat(path)
 				if err != nil {
 					return nil, fmt.Errorf("delete %s: %w", hunk.Path, err)
 				}
@@ -83,7 +123,7 @@ func Plan(cwd string, hunks []Hunk) ([]Change, error) {
 						if state.exists {
 							return nil, fmt.Errorf("move %s: file already exists", hunk.MoveTo)
 						}
-					} else if err := checkTarget(change.MoveTo, "move "+hunk.MoveTo, true); err != nil {
+					} else if err := checkTarget(p.fs, change.MoveTo, "move "+hunk.MoveTo, true); err != nil {
 						return nil, err
 					}
 					p.files[path] = fileState{}
@@ -108,15 +148,15 @@ func (p *planner) read(path string) (string, error) {
 		}
 		return state.content, nil
 	}
-	data, err := os.ReadFile(path)
+	data, err := p.fs.ReadFile(path)
 	return string(data), err
 }
 
 // checkTarget rejects, before anything is written, a target that Commit could not
 // write as a regular file: an existing path (unless allowExisting), a directory, or
 // a path whose parent is not a directory.
-func checkTarget(path, label string, allowExisting bool) error {
-	info, err := os.Lstat(path)
+func checkTarget(fsys FS, path, label string, allowExisting bool) error {
+	info, err := fsys.Lstat(path)
 	switch {
 	case err == nil && !allowExisting:
 		return fmt.Errorf("%s: file already exists", label)
@@ -248,7 +288,12 @@ func matchAt(lines, pattern []string, at int, normalize func(string) string) boo
 // undo is reported in the returned error.
 // ponytail: Moved files are recreated with mode 0644; carry the source mode through Change if exec bits matter.
 func Commit(changes []Change) error {
-	tx := &commitTx{saved: make(map[string]snapshot)}
+	return CommitFS(OS, changes)
+}
+
+// CommitFS is Commit against fsys.
+func CommitFS(fsys FS, changes []Change) error {
+	tx := &commitTx{fs: fsys, saved: make(map[string]snapshot)}
 	for _, change := range changes {
 		if err := tx.apply(change); err != nil {
 			return tx.rollback(err)
@@ -291,6 +336,7 @@ type snapshot struct {
 // commitTx records the original state of every path Commit touches, and the
 // directories it creates, so a failure can put everything back.
 type commitTx struct {
+	fs     FS
 	saved  map[string]snapshot
 	order  []string
 	dirs   []string // created directories, deepest first
@@ -302,7 +348,7 @@ func (t *commitTx) save(path string) error {
 	if _, done := t.saved[path]; done {
 		return nil
 	}
-	info, err := os.Lstat(path)
+	info, err := t.fs.Lstat(path)
 	snap := snapshot{}
 	switch {
 	case errors.Is(err, fs.ErrNotExist):
@@ -313,11 +359,11 @@ func (t *commitTx) save(path string) error {
 	default:
 		snap.exists, snap.mode = true, info.Mode()
 		if info.Mode()&os.ModeSymlink != 0 {
-			if snap.link, err = os.Readlink(path); err != nil {
+			if snap.link, err = t.fs.Readlink(path); err != nil {
 				return err
 			}
 		}
-		snap.data, _ = os.ReadFile(path)
+		snap.data, _ = t.fs.ReadFile(path)
 		if snap.link == "" && snap.data == nil {
 			// A regular file whose content cannot be captured cannot be restored.
 			return fmt.Errorf("%s: cannot read the file to back it up", path)
@@ -335,7 +381,7 @@ func (t *commitTx) write(path, content string) error {
 	if err := t.mkdirAll(filepath.Dir(path)); err != nil {
 		return err
 	}
-	return os.WriteFile(path, []byte(content), 0o644)
+	return t.fs.WriteFile(path, []byte(content), 0o644)
 }
 
 // remove deletes a file by setting it aside in its own directory, so it can be put
@@ -344,9 +390,9 @@ func (t *commitTx) write(path, content string) error {
 func (t *commitTx) remove(path string) error {
 	if _, done := t.saved[path]; done {
 		// Already written by this Commit: its original is in the snapshot.
-		return os.Remove(path)
+		return t.fs.Remove(path)
 	}
-	info, err := os.Lstat(path)
+	info, err := t.fs.Lstat(path)
 	if err != nil {
 		return err
 	}
@@ -355,7 +401,7 @@ func (t *commitTx) remove(path string) error {
 	}
 	t.serial++
 	trash := filepath.Join(filepath.Dir(path), fmt.Sprintf(".%s.subagent-mcp-trash-%d-%d", filepath.Base(path), os.Getpid(), t.serial))
-	if err := os.Rename(path, trash); err != nil {
+	if err := t.fs.Rename(path, trash); err != nil {
 		return err
 	}
 	t.saved[path] = snapshot{exists: true, trashed: trash}
@@ -367,14 +413,14 @@ func (t *commitTx) remove(path string) error {
 // finish deletes the set-aside originals after a successful Commit.
 func (t *commitTx) finish() {
 	for _, trash := range t.trash {
-		_ = os.Remove(trash)
+		_ = t.fs.Remove(trash)
 	}
 }
 
 func (t *commitTx) mkdirAll(dir string) error {
 	var missing []string
 	for d := dir; ; d = filepath.Dir(d) {
-		if _, err := os.Lstat(d); !errors.Is(err, fs.ErrNotExist) {
+		if _, err := t.fs.Lstat(d); !errors.Is(err, fs.ErrNotExist) {
 			break
 		}
 		missing = append(missing, d)
@@ -382,7 +428,7 @@ func (t *commitTx) mkdirAll(dir string) error {
 			break
 		}
 	}
-	err := os.MkdirAll(dir, 0o755)
+	err := t.fs.MkdirAll(dir, 0o755)
 	t.dirs = append(t.dirs, missing...)
 	return err
 }
@@ -393,13 +439,13 @@ func (t *commitTx) rollback(cause error) error {
 	var failures []error
 	for i := len(t.order) - 1; i >= 0; i-- {
 		path := t.order[i]
-		if err := t.saved[path].restore(path); err != nil {
+		if err := t.saved[path].restore(t.fs, path); err != nil {
 			failures = append(failures, err)
 		}
 	}
 	for _, dir := range t.dirs {
 		// Best effort: a directory that is no longer empty is not ours to remove.
-		_ = os.Remove(dir)
+		_ = t.fs.Remove(dir)
 	}
 	if len(failures) > 0 {
 		return fmt.Errorf("%w (rollback failed, files may be left modified: %w)", cause, errors.Join(failures...))
@@ -407,42 +453,42 @@ func (t *commitTx) rollback(cause error) error {
 	return cause
 }
 
-func (s snapshot) restore(path string) error {
+func (s snapshot) restore(fsys FS, path string) error {
 	switch {
 	case s.trashed != "":
 		// Whatever a later step put at the path goes; the original comes back.
-		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := fsys.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
-		return os.Rename(s.trashed, path)
+		return fsys.Rename(s.trashed, path)
 	case !s.exists:
-		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if err := fsys.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return err
 		}
 		return nil
 	case s.link != "":
-		if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 || readlinkOrEmpty(path) != s.link {
-			if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		if info, err := fsys.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 || readlinkOrEmpty(fsys, path) != s.link {
+			if err := fsys.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
 				return err
 			}
-			if err := os.Symlink(s.link, path); err != nil {
+			if err := fsys.Symlink(s.link, path); err != nil {
 				return err
 			}
 		}
 		if s.data == nil {
 			return nil
 		}
-		return os.WriteFile(path, s.data, 0o644)
+		return fsys.WriteFile(path, s.data, 0o644)
 	default:
-		if err := os.WriteFile(path, s.data, s.mode.Perm()); err != nil {
+		if err := fsys.WriteFile(path, s.data, s.mode.Perm()); err != nil {
 			return err
 		}
-		return os.Chmod(path, s.mode.Perm())
+		return fsys.Chmod(path, s.mode.Perm())
 	}
 }
 
-func readlinkOrEmpty(path string) string {
-	target, _ := os.Readlink(path)
+func readlinkOrEmpty(fsys FS, path string) string {
+	target, _ := fsys.Readlink(path)
 	return target
 }
 

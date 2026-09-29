@@ -389,6 +389,7 @@ func (r *Runner) execToolCall(ctx context.Context, s *Session, toolCall provider
 
 	case "write_file":
 		path := args.Path
+		var confined patch.FS
 		if s.sandbox == policy.Sandbox("workspace-write") && !approved {
 			var err error
 			path, err = policy.BoundPath(s.cwd, args.Path, s.boundCwd)
@@ -396,8 +397,16 @@ func (r *Runner) execToolCall(ctx context.Context, s *Session, toolCall provider
 				toolErr = err
 				return "error: " + err.Error(), true
 			}
+			// The kernel keeps the write beneath the bound directory even if a
+			// path component is swapped for a symlink after the check above.
+			confined = s.boundCwd.FS()
 		}
-		err := tools.WriteFile(s.cwd, path, args.Content)
+		var err error
+		if confined != nil {
+			err = confined.WriteFile(path, []byte(args.Content), 0o644)
+		} else {
+			err = tools.WriteFile(s.cwd, path, args.Content)
+		}
 		toolErr = err
 
 		if err != nil {
@@ -407,6 +416,7 @@ func (r *Runner) execToolCall(ctx context.Context, s *Session, toolCall provider
 
 	case "apply_patch":
 		planned := hunks
+		fsys := patch.OS
 		if s.sandbox == policy.Sandbox("workspace-write") && !approved {
 			planned = append([]patch.Hunk(nil), hunks...)
 			for i := range planned {
@@ -420,10 +430,15 @@ func (r *Runner) execToolCall(ctx context.Context, s *Session, toolCall provider
 					return "error: " + err.Error(), true
 				}
 			}
+			// The kernel keeps every read and write beneath the bound directory
+			// even if a path component is swapped for a symlink after the checks.
+			if confined := s.boundCwd.FS(); confined != nil {
+				fsys = confined
+			}
 		}
-		changes, err := patch.Plan(s.cwd, planned)
+		changes, err := patch.PlanFS(fsys, s.cwd, planned)
 		if err == nil {
-			err = patch.Commit(changes)
+			err = patch.CommitFS(fsys, changes)
 		}
 		toolErr = err
 		if err != nil {

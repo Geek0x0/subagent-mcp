@@ -225,7 +225,7 @@ func TestRollbackFailureIsReported(t *testing.T) {
 	blocker := filepath.Join(dir, "blocker")
 	write(t, blocker, "a file, not a directory\n")
 
-	tx := &commitTx{saved: map[string]snapshot{}}
+	tx := &commitTx{fs: OS, saved: map[string]snapshot{}}
 	// The original of this path cannot be written back: its parent is a regular file.
 	path := filepath.Join(blocker, "orig.txt")
 	tx.saved[path] = snapshot{exists: true, data: []byte("orig\n"), mode: 0o644}
