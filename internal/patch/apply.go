@@ -17,34 +17,59 @@ type Change struct {
 	Diff       string
 }
 
-// Plan computes every resulting file in memory; it writes nothing.
-// ponytail: Each hunk reads its file from disk, so two hunks on the same file in one
-// patch do not see each other's edits; thread an in-memory overlay through Plan if needed.
+// fileState is the planned state of one path while a patch is planned.
+type fileState struct {
+	exists  bool
+	content string
+}
+
+// planner threads an in-memory overlay through Plan: sections apply in order, so a
+// later section sees the edits (and deletions) of the earlier ones instead of the
+// file on disk. Paths are keyed by their cleaned absolute spelling.
+type planner struct {
+	files map[string]fileState
+}
+
+// Plan computes every resulting file in memory; it writes nothing. Sections that
+// touch the same path compose in order or fail with an error naming the path.
 func Plan(cwd string, hunks []Hunk) ([]Change, error) {
+	p := &planner{files: make(map[string]fileState)}
 	changes := make([]Change, 0, len(hunks))
 	for _, hunk := range hunks {
 		path := resolve(cwd, hunk.Path)
 		switch hunk.Kind {
 		case Add:
-			if err := checkTarget(path, "add "+hunk.Path, false); err != nil {
+			if state, planned := p.files[path]; planned {
+				if state.exists {
+					return nil, fmt.Errorf("add %s: file already exists", hunk.Path)
+				}
+			} else if err := checkTarget(path, "add "+hunk.Path, false); err != nil {
 				return nil, err
 			}
+			p.files[path] = fileState{exists: true, content: hunk.Content}
 			changes = append(changes, Change{Kind: Add, Path: path, NewContent: hunk.Content, Diff: hunk.Content})
 		case Delete:
-			info, err := os.Stat(path)
-			if err != nil {
-				return nil, fmt.Errorf("delete %s: %w", hunk.Path, err)
+			if state, planned := p.files[path]; planned {
+				if !state.exists {
+					return nil, fmt.Errorf("delete %s: %w", hunk.Path, fs.ErrNotExist)
+				}
+			} else {
+				info, err := os.Stat(path)
+				if err != nil {
+					return nil, fmt.Errorf("delete %s: %w", hunk.Path, err)
+				}
+				if info.IsDir() {
+					return nil, fmt.Errorf("delete %s: is a directory", hunk.Path)
+				}
 			}
-			if info.IsDir() {
-				return nil, fmt.Errorf("delete %s: is a directory", hunk.Path)
-			}
+			p.files[path] = fileState{}
 			changes = append(changes, Change{Kind: Delete, Path: path})
 		case Update:
-			data, err := os.ReadFile(path)
+			original, err := p.read(path)
 			if err != nil {
 				return nil, fmt.Errorf("update %s: %w", hunk.Path, err)
 			}
-			content, diff, err := applyChunks(string(data), hunk.Chunks)
+			content, diff, err := applyChunks(original, hunk.Chunks)
 			if err != nil {
 				return nil, fmt.Errorf("update %s: %w", hunk.Path, err)
 			}
@@ -52,15 +77,35 @@ func Plan(cwd string, hunks []Hunk) ([]Change, error) {
 			if hunk.MoveTo != "" {
 				change.MoveTo = resolve(cwd, hunk.MoveTo)
 				if change.MoveTo != path {
-					if err := checkTarget(change.MoveTo, "move "+hunk.MoveTo, true); err != nil {
-						return nil, err
+					if _, planned := p.files[change.MoveTo]; !planned {
+						if err := checkTarget(change.MoveTo, "move "+hunk.MoveTo, true); err != nil {
+							return nil, err
+						}
 					}
+					p.files[path] = fileState{}
+					p.files[change.MoveTo] = fileState{exists: true, content: content}
 				}
+			}
+			if change.MoveTo == "" || change.MoveTo == path {
+				p.files[path] = fileState{exists: true, content: content}
 			}
 			changes = append(changes, change)
 		}
 	}
 	return changes, nil
+}
+
+// read returns the planned content of path: an earlier section's result if there
+// is one, else the file on disk.
+func (p *planner) read(path string) (string, error) {
+	if state, planned := p.files[path]; planned {
+		if !state.exists {
+			return "", fs.ErrNotExist
+		}
+		return state.content, nil
+	}
+	data, err := os.ReadFile(path)
+	return string(data), err
 }
 
 // checkTarget rejects, before anything is written, a target that Commit could not
@@ -194,42 +239,171 @@ func matchAt(lines, pattern []string, at int, normalize func(string) string) boo
 	return true
 }
 
-// Commit writes planned changes in order.
+// Commit writes planned changes in order. If any step fails it undoes the steps
+// already taken, so every touched file is left as it was before the call; a failed
+// undo is reported in the returned error.
 // ponytail: Moved files are recreated with mode 0644; carry the source mode through Change if exec bits matter.
 func Commit(changes []Change) error {
+	tx := &commitTx{saved: make(map[string]snapshot)}
 	for _, change := range changes {
-		switch change.Kind {
-		case Add:
-			if err := writeFile(change.Path, change.NewContent); err != nil {
-				return err
-			}
-		case Delete:
-			if err := os.Remove(change.Path); err != nil {
-				return err
-			}
-		case Update:
-			target := change.Path
-			if change.MoveTo != "" {
-				target = change.MoveTo
-			}
-			if err := writeFile(target, change.NewContent); err != nil {
-				return err
-			}
-			if change.MoveTo != "" && change.MoveTo != change.Path {
-				if err := os.Remove(change.Path); err != nil {
-					return err
-				}
-			}
+		if err := tx.apply(change); err != nil {
+			return tx.rollback(err)
 		}
 	}
 	return nil
 }
 
-func writeFile(path, content string) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+func (t *commitTx) apply(change Change) error {
+	switch change.Kind {
+	case Add:
+		return t.write(change.Path, change.NewContent)
+	case Delete:
+		return t.remove(change.Path)
+	case Update:
+		target := change.Path
+		if change.MoveTo != "" {
+			target = change.MoveTo
+		}
+		if err := t.write(target, change.NewContent); err != nil {
+			return err
+		}
+		if change.MoveTo != "" && change.MoveTo != change.Path {
+			return t.remove(change.Path)
+		}
+	}
+	return nil
+}
+
+// snapshot is what a path looked like before Commit first touched it.
+type snapshot struct {
+	exists bool
+	link   string // symlink target, when the path was a symlink
+	data   []byte // file content (through the link for a symlink); nil if unreadable
+	mode   os.FileMode
+}
+
+// commitTx records the original state of every path Commit touches, and the
+// directories it creates, so a failure can put everything back.
+type commitTx struct {
+	saved map[string]snapshot
+	order []string
+	dirs  []string // created directories, deepest first
+}
+
+func (t *commitTx) save(path string) error {
+	if _, done := t.saved[path]; done {
+		return nil
+	}
+	info, err := os.Lstat(path)
+	snap := snapshot{}
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+	case err != nil:
+		return err
+	case info.IsDir():
+		return fmt.Errorf("%s: is a directory", path)
+	default:
+		snap.exists, snap.mode = true, info.Mode()
+		if info.Mode()&os.ModeSymlink != 0 {
+			if snap.link, err = os.Readlink(path); err != nil {
+				return err
+			}
+		}
+		snap.data, _ = os.ReadFile(path)
+		if snap.link == "" && snap.data == nil {
+			// A regular file whose content cannot be captured cannot be restored.
+			return fmt.Errorf("%s: cannot read the file to back it up", path)
+		}
+	}
+	t.saved[path] = snap
+	t.order = append(t.order, path)
+	return nil
+}
+
+func (t *commitTx) write(path, content string) error {
+	if err := t.save(path); err != nil {
+		return err
+	}
+	if err := t.mkdirAll(filepath.Dir(path)); err != nil {
 		return err
 	}
 	return os.WriteFile(path, []byte(content), 0o644)
+}
+
+func (t *commitTx) remove(path string) error {
+	if err := t.save(path); err != nil {
+		return err
+	}
+	return os.Remove(path)
+}
+
+func (t *commitTx) mkdirAll(dir string) error {
+	var missing []string
+	for d := dir; ; d = filepath.Dir(d) {
+		if _, err := os.Lstat(d); !errors.Is(err, fs.ErrNotExist) {
+			break
+		}
+		missing = append(missing, d)
+		if filepath.Dir(d) == d {
+			break
+		}
+	}
+	err := os.MkdirAll(dir, 0o755)
+	t.dirs = append(t.dirs, missing...)
+	return err
+}
+
+// rollback restores every saved path in reverse order and removes the directories
+// Commit created, then returns cause, extended with any restore failure.
+func (t *commitTx) rollback(cause error) error {
+	var failures []error
+	for i := len(t.order) - 1; i >= 0; i-- {
+		path := t.order[i]
+		if err := t.saved[path].restore(path); err != nil {
+			failures = append(failures, err)
+		}
+	}
+	for _, dir := range t.dirs {
+		// Best effort: a directory that is no longer empty is not ours to remove.
+		_ = os.Remove(dir)
+	}
+	if len(failures) > 0 {
+		return fmt.Errorf("%w (rollback failed, files may be left modified: %w)", cause, errors.Join(failures...))
+	}
+	return cause
+}
+
+func (s snapshot) restore(path string) error {
+	switch {
+	case !s.exists:
+		if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			return err
+		}
+		return nil
+	case s.link != "":
+		if info, err := os.Lstat(path); err != nil || info.Mode()&os.ModeSymlink == 0 || readlinkOrEmpty(path) != s.link {
+			if err := os.Remove(path); err != nil && !errors.Is(err, fs.ErrNotExist) {
+				return err
+			}
+			if err := os.Symlink(s.link, path); err != nil {
+				return err
+			}
+		}
+		if s.data == nil {
+			return nil
+		}
+		return os.WriteFile(path, s.data, 0o644)
+	default:
+		if err := os.WriteFile(path, s.data, s.mode.Perm()); err != nil {
+			return err
+		}
+		return os.Chmod(path, s.mode.Perm())
+	}
+}
+
+func readlinkOrEmpty(path string) string {
+	target, _ := os.Readlink(path)
+	return target
 }
 
 // Summary renders the Codex-style success message.
