@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/Geek0x0/subagent-mcp/internal/testutil"
 )
 
 func writeFile(t *testing.T, path, content string) {
@@ -27,8 +29,11 @@ func TestRoot(t *testing.T) {
 	if got, ok := Root(nested); !ok || got != root {
 		t.Fatalf("Root(nested) = (%q, %v), want (%q, true)", got, ok, root)
 	}
-	if _, ok := Root(t.TempDir()); ok {
-		t.Fatalf("Root(non-repo) ok = true, want false")
+	// A temp dir is only a non-repo when no parent of the temp root holds a .git.
+	if nonRepo := t.TempDir(); !testutil.GitAncestor(nonRepo) {
+		if _, ok := Root(nonRepo); ok {
+			t.Fatalf("Root(non-repo) ok = true, want false")
+		}
 	}
 }
 

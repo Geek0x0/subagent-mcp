@@ -43,9 +43,9 @@ The shell-command allowlist contains `ls`, `cat`, `head`, `tail`, `rg`, `grep`, 
 
 `apply_patch` is treated as one `write_file` request per touched path, and a denial on any path denies the whole patch; all approval-requiring paths are combined into a single approval request.
 
-The kernel sandbox fails closed: on a kernel without Landlock (Linux below 5.13) or on a non-Linux platform, an auto-allowed shell call exits with code 126 and a `subagent-mcp: landlock unavailable: ...` message rather than running unsandboxed. Shell calls a human approves run without the wrapper, and `danger-full-access` never applies it.
+Shell output is capped at 16 KiB (the start is kept, the end dropped) and the default shell timeout is 60 seconds, clamped to 600. The kernel sandbox fails closed: on a kernel without Landlock (Linux below 5.13) or on a non-Linux platform, an auto-allowed shell call exits with code 126 and a `subagent-mcp: landlock unavailable: ...` message rather than running unsandboxed. Shell calls a human approves run without the wrapper, and `danger-full-access` never applies it.
 
-**Safety: the policy prevents accidental misuse, and the Landlock wrapper confines auto-allowed shell writes to the roots above. Reads and network access remain unrestricted, `write_file` and `apply_patch` writes are limited to `cwd` in-process rather than by the kernel, and on Landlock ABI v1 (Linux 5.13–5.18) renaming or hard-linking into a different directory always fails with `EXDEV` while truncating files outside the writable roots is not restricted. Use stronger operating-system isolation when the trust boundary requires it.**
+**Safety: the policy prevents accidental misuse, and the Landlock wrapper confines auto-allowed shell writes to the roots above. Reads and network access remain unrestricted, `write_file` and `apply_patch` writes are limited to `cwd` in-process rather than by the kernel, and on Landlock ABI v1 (Linux 5.13–5.18) renaming or hard-linking into a different directory always fails with `EXDEV`, and below Landlock ABI v3 (Linux 6.2) truncating existing files outside the writable roots is not restricted. Use stronger operating-system isolation when the trust boundary requires it.**
 
 The `approval-policy` determines what happens to operations inside or outside the selected sandbox:
 

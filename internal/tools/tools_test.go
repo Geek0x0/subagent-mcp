@@ -15,6 +15,7 @@ import (
 
 	"github.com/Geek0x0/subagent-mcp/internal/policy"
 	"github.com/Geek0x0/subagent-mcp/internal/sandbox"
+	"github.com/Geek0x0/subagent-mcp/internal/testutil"
 )
 
 func TestRunShell(t *testing.T) {
@@ -208,7 +209,7 @@ func TestScrubbedEnvConfigurable(t *testing.T) {
 
 func TestScrubbedEnvSandboxed(t *testing.T) {
 	if err := sandbox.Available(); err != nil {
-		t.Skipf("landlock unavailable: %v", err)
+		testutil.LandlockUnavailable(t, err)
 	}
 	t.Cleanup(func() { SetScrubbedEnv(nil, []string{"SUBAGENT_MCP_"}) })
 	SetScrubbedEnv([]string{"MY_PROVIDER_KEY"}, []string{"SUBAGENT_MCP_"})
@@ -316,7 +317,7 @@ func TestAutoAllowedGitCommandsDoNotRunRepositoryPrograms(t *testing.T) {
 				t.Run(runner.name, func(t *testing.T) {
 					if runner.name == "landlock" {
 						if err := sandbox.Available(); err != nil {
-							t.Skipf("landlock unavailable: %v", err)
+							testutil.LandlockUnavailable(t, err)
 						}
 					}
 					for _, command := range commands {
@@ -431,7 +432,7 @@ func TestRunShellScrubsLoginProfileProviderKeyAndKeepsPATH(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.sandbox {
 				if err := sandbox.Available(); err != nil {
-					t.Skipf("landlock unavailable: %v", err)
+					testutil.LandlockUnavailable(t, err)
 				}
 			}
 
@@ -484,7 +485,7 @@ func TestRunShellScrubsLoginProfileSubagentEnvironment(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if tc.sandbox {
 				if err := sandbox.Available(); err != nil {
-					t.Skipf("landlock unavailable: %v", err)
+					testutil.LandlockUnavailable(t, err)
 				}
 			}
 
@@ -828,7 +829,7 @@ func TestWriteFile(t *testing.T) {
 
 func TestRunShellSandboxed(t *testing.T) {
 	if err := sandbox.Available(); err != nil {
-		t.Skipf("landlock unavailable: %v", err)
+		testutil.LandlockUnavailable(t, err)
 	}
 	cwd := t.TempDir()
 	outside := t.TempDir()
@@ -849,7 +850,7 @@ func TestRunShellSandboxed(t *testing.T) {
 
 func TestRunShellSandboxedTimeoutKillsCommand(t *testing.T) {
 	if err := sandbox.Available(); err != nil {
-		t.Skipf("landlock unavailable: %v", err)
+		testutil.LandlockUnavailable(t, err)
 	}
 	start := time.Now()
 	_, code, err := RunShellSandboxed(context.Background(), t.TempDir(), "sleep 5", 200*time.Millisecond, nil)

@@ -41,6 +41,11 @@ Run these checks with Bash:
    error. Warnings that a configured model id is not in the provider's current
    model list do not affect the exit code.
 
+   The output also has a `sandbox  Landlock` line. `OK` means auto-allowed shell
+   calls run under the kernel sandbox; `WARN` (macOS or Linux below 5.13) means
+   the native file tools work but every auto-allowed `shell` call exits with
+   code 126. It does not affect the exit code, but report it.
+
    Do not add `--live` here: it makes real, billed API calls. Mention it only if
    the user asks how to verify a provider end to end.
 
@@ -52,6 +57,7 @@ Then report:
 
 - subagent-mcp binary: <absolute path and version, or MISSING with the install hint>
 - config file: <path, and OK, MISSING with the copy hint, or FAILED with the failing check-config line>
+- sandbox: <the `sandbox  Landlock` line: OK, or the WARN with its consequence>
 - providers: <for each provider in the check-config output: name, key name set
   or skipped, api OK or FAIL; never key values>
 - ready: <when the binary, the config, and at least one provider's key all

@@ -25,6 +25,8 @@ subagent-mcp is one MCP server binary that exposes a coding agent — real shell
 
    Make sure `$(go env GOPATH)/bin` is on `PATH`.
 
+   Linux is the supported platform. The kernel sandbox needs Landlock (Linux 5.13 or newer); on macOS or an older kernel the server still starts and the native `read_file`, `write_file`, and `apply_patch` tools work, but every auto-allowed `shell` call exits with code 126 rather than run unsandboxed (see [Kernel sandbox for shell calls](#kernel-sandbox-for-shell-calls)). `--check-config` prints a `sandbox  Landlock` line that says which case applies.
+
 2. Add this repository as a Claude Code plugin marketplace:
 
    ```bash
@@ -126,7 +128,7 @@ The session inherits the user's whole Codex environment — auth, config, plugin
 
 ## Validating the config
 
-`--check-config` loads and validates the config file, reports each model API provider's `env_key` name and whether it is set (or Codex's `auth` status), and asks each reachable provider for its model list so authentication and reachability errors fail loudly and unlisted model ids are warned about:
+`--check-config` loads and validates the config file, reports whether the Landlock kernel sandbox is usable on this machine (a `WARN` there does not change the exit code), reports each model API provider's `env_key` name and whether it is set (or Codex's `auth` status), and asks each reachable provider for its model list so authentication and reachability errors fail loudly and unlisted model ids are warned about:
 
 ```bash
 subagent-mcp --check-config [path]
@@ -220,7 +222,7 @@ The agent runs inside the thread with four built-in tools:
 
 | Tool | Arguments | Description |
 |---|---|---|
-| `shell` | `command`, optional `timeout_seconds`, optional `justification` | Run a bash command in `cwd`. Timeouts are clamped to 600 seconds. |
+| `shell` | `command`, optional `timeout_seconds`, optional `justification` | Run a bash command in `cwd`. The default timeout is 60 seconds and requests are clamped to 600 seconds. Combined stdout and stderr is capped at 16 KiB: the start is kept, the end is dropped, and `[output truncated: N bytes total]` is appended. |
 | `read_file` | `path`, optional `offset`, optional `limit`, optional `justification` | Read a file; relative paths resolve against `cwd`. `offset` is a 1-based start line and `limit` caps the number of lines. Output is capped at 16 KiB of whole lines; truncation appends `[content truncated: N bytes total; continue with offset=K]`, a line limit appends `[more lines follow; continue with offset=K]`, and an offset past the end returns `[offset K is past the end of the file (N lines)]`. |
 | `write_file` | `path`, `content`, optional `justification` | Create or overwrite a whole file, creating parent directories. |
 | `apply_patch` | `patch`, optional `justification` | Edit files with a Codex-format patch. |
@@ -293,7 +295,7 @@ In both wrapped modes the device files `/dev/null`, `/dev/zero`, `/dev/full`, `/
 
 For auto-allowed `write_file` and `apply_patch` calls, the in-process path check uses the session's bound cwd. If the original cwd path no longer names that directory, the write fails closed; a replacement symlink cannot redirect it. Shell calls that a human approved through elicitation run without the kernel sandbox, matching Codex escalation semantics. The sandbox fails closed: on a kernel without Landlock (Linux below 5.13) or on a non-Linux platform, a wrapped shell call exits with code 126 and `subagent-mcp: landlock unavailable: ...` instead of running unsandboxed.
 
-**Safety: the application-layer policy prevents accidental misuse, and the Landlock wrapper confines auto-allowed shell writes to the roots above. Reads and network access are still unrestricted, and `write_file` and `apply_patch` writes are limited to `cwd` by an in-process path check rather than by the kernel. On Landlock ABI v1 kernels (Linux 5.13–5.18), renaming or hard-linking a file into a different directory always fails with `EXDEV` (tools such as `git mv` break, while `mv` falls back to copying), and truncating existing files outside the writable roots is not restricted. Human-approved and `danger-full-access` shell calls are not sandboxed at all. Use stronger operating-system isolation when the trust boundary requires it.**
+**Safety: the application-layer policy prevents accidental misuse, and the Landlock wrapper confines auto-allowed shell writes to the roots above. Reads and network access are still unrestricted, and `write_file` and `apply_patch` writes are limited to `cwd` by an in-process path check rather than by the kernel. On Landlock ABI v1 kernels (Linux 5.13–5.18), renaming or hard-linking a file into a different directory always fails with `EXDEV` (tools such as `git mv` break, while `mv` falls back to copying). Truncation is only restricted from Landlock ABI v3 (Linux 6.2): on older kernels, truncating existing files outside the writable roots is not restricted. Human-approved and `danger-full-access` shell calls are not sandboxed at all. Use stronger operating-system isolation when the trust boundary requires it.**
 
 ## Events
 

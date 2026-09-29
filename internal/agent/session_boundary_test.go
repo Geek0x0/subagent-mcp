@@ -12,11 +12,12 @@ import (
 
 	"github.com/Geek0x0/subagent-mcp/internal/policy"
 	"github.com/Geek0x0/subagent-mcp/internal/sandbox"
+	"github.com/Geek0x0/subagent-mcp/internal/testutil"
 )
 
 func TestSessionCwdRenameCannotMoveSandboxBoundary(t *testing.T) {
 	if err := sandbox.Available(); err != nil {
-		t.Skipf("landlock unavailable: %v", err)
+		testutil.LandlockUnavailable(t, err)
 	}
 	parent, err := os.MkdirTemp(".", "bound-parent-")
 	if err != nil {
@@ -93,7 +94,7 @@ func TestSessionCwdRenameCannotMoveSandboxBoundary(t *testing.T) {
 
 func TestSessionConfiguredAndTmpdirRootsReachLandlock(t *testing.T) {
 	if err := sandbox.Available(); err != nil {
-		t.Skipf("landlock unavailable: %v", err)
+		testutil.LandlockUnavailable(t, err)
 	}
 	newDir := func(prefix string) string {
 		t.Helper()
@@ -135,7 +136,7 @@ func TestSessionConfiguredAndTmpdirRootsReachLandlock(t *testing.T) {
 
 func TestSessionWritableRootReplacementCannotRedirectLandlock(t *testing.T) {
 	if err := sandbox.Available(); err != nil {
-		t.Skipf("landlock unavailable: %v", err)
+		testutil.LandlockUnavailable(t, err)
 	}
 	parent, err := os.MkdirTemp(".", "root-parent-")
 	if err != nil {
@@ -252,7 +253,7 @@ func TestSessionMissingBoundRootFailsClosed(t *testing.T) {
 
 func TestRunnerApprovedShellCallIsUnsandboxed(t *testing.T) {
 	if err := sandbox.Available(); err != nil {
-		t.Skipf("landlock unavailable: %v", err)
+		testutil.LandlockUnavailable(t, err)
 	}
 	outside, err := os.MkdirTemp(".", "approved-outside-")
 	if err != nil {

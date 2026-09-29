@@ -12,6 +12,7 @@ import (
 
 	"github.com/Geek0x0/subagent-mcp/internal/config"
 	"github.com/Geek0x0/subagent-mcp/internal/provider"
+	"github.com/Geek0x0/subagent-mcp/internal/sandbox"
 )
 
 const (
@@ -33,6 +34,17 @@ var checkTool = provider.ToolSpec{
 	Name:        checkToolName,
 	Description: "Returns the secret number. Always call this before answering.",
 	Parameters:  json.RawMessage(`{"type":"object","properties":{},"required":[]}`),
+}
+
+// reportSandbox prints whether the kernel sandbox is usable. It is informational
+// and never changes the exit code: the native tools work without Landlock, but
+// auto-allowed shell calls then exit 126 instead of running unsandboxed.
+func reportSandbox(w io.Writer) {
+	if err := sandbox.Available(); err != nil {
+		fmt.Fprintf(w, "sandbox  Landlock   WARN: %v; auto-allowed shell calls will exit 126 (Linux 5.13+ required)\n", err)
+		return
+	}
+	fmt.Fprintln(w, "sandbox  Landlock   OK")
 }
 
 // runCheck validates every configured provider's auth, endpoint and models,

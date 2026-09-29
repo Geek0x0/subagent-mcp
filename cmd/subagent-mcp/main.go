@@ -47,6 +47,7 @@ func main() {
 		}
 		configureRuntime(cfg)
 		fmt.Printf("config   %s   OK\n", path)
+		reportSandbox(os.Stdout)
 		os.Exit(runCheck(os.Stdout, cfg, *liveFlag))
 	}
 

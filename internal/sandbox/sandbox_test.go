@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"errors"
+	"github.com/Geek0x0/subagent-mcp/internal/testutil"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -100,7 +101,7 @@ func runHelper(t *testing.T, roots []string, script string) (string, int) {
 
 func TestHelperRestrictsWrites(t *testing.T) {
 	if err := Available(); err != nil {
-		t.Skipf("landlock unavailable: %v", err)
+		testutil.LandlockUnavailable(t, err)
 	}
 	inside := t.TempDir()
 	outside := t.TempDir()
@@ -121,7 +122,7 @@ func TestHelperRestrictsWrites(t *testing.T) {
 
 func TestHelperAllowsCrossDirectoryRenameInsideRoot(t *testing.T) {
 	if err := Available(); err != nil {
-		t.Skipf("landlock unavailable: %v", err)
+		testutil.LandlockUnavailable(t, err)
 	}
 	inside := t.TempDir()
 
@@ -134,7 +135,7 @@ func TestHelperAllowsCrossDirectoryRenameInsideRoot(t *testing.T) {
 
 func TestHelperDeniesDeviceDirectoryWrites(t *testing.T) {
 	if err := Available(); err != nil {
-		t.Skipf("landlock unavailable: %v", err)
+		testutil.LandlockUnavailable(t, err)
 	}
 	if info, err := os.Stat("/dev/shm"); err != nil || !info.IsDir() {
 		t.Skip("/dev/shm unavailable")

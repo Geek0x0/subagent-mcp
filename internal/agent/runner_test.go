@@ -18,6 +18,7 @@ import (
 	"github.com/Geek0x0/subagent-mcp/internal/policy"
 	"github.com/Geek0x0/subagent-mcp/internal/provider"
 	"github.com/Geek0x0/subagent-mcp/internal/sandbox"
+	"github.com/Geek0x0/subagent-mcp/internal/testutil"
 )
 
 type stubTurn struct {
@@ -1680,7 +1681,7 @@ func runShellOnce(t *testing.T, options Options, approver *stubApprover, command
 
 func TestRunnerShellSandboxing(t *testing.T) {
 	if err := sandbox.Available(); err != nil {
-		t.Skipf("landlock unavailable: %v", err)
+		testutil.LandlockUnavailable(t, err)
 	}
 	outside := t.TempDir()
 	extra := t.TempDir()

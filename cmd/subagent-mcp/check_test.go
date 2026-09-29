@@ -15,6 +15,7 @@ import (
 
 	"github.com/Geek0x0/subagent-mcp/internal/config"
 	"github.com/Geek0x0/subagent-mcp/internal/provider"
+	"github.com/Geek0x0/subagent-mcp/internal/sandbox"
 	"github.com/Geek0x0/subagent-mcp/internal/testutil"
 )
 
@@ -686,5 +687,21 @@ func TestCheckLiveThreadFailsWhenReplyEchoesPrompt(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "does not contain "+checkSecretNumber) {
 		t.Errorf("checkLiveThread() = %v, want answer-does-not-contain-%s error", err, checkSecretNumber)
+	}
+}
+
+func TestReportSandbox(t *testing.T) {
+	var out bytes.Buffer
+	reportSandbox(&out)
+	line := strings.TrimSpace(out.String())
+	if err := sandbox.Available(); err != nil {
+		if !strings.HasPrefix(line, "sandbox  Landlock   WARN: ") || !strings.Contains(line, "exit 126") {
+			t.Errorf("reportSandbox() = %q, want a WARN naming the exit-126 consequence", line)
+		}
+	} else if line != "sandbox  Landlock   OK" {
+		t.Errorf("reportSandbox() = %q, want the OK line", line)
+	}
+	if strings.Count(out.String(), "\n") != 1 {
+		t.Errorf("reportSandbox() wrote %q, want one line", out.String())
 	}
 }

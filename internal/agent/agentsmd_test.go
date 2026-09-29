@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"github.com/Geek0x0/subagent-mcp/internal/testutil"
 )
 
 func writeAgentsFile(t *testing.T, path, content string) {
@@ -50,6 +52,9 @@ func TestLoadAgentsMDRootToCwd(t *testing.T) {
 
 func TestLoadAgentsMDOutsideRepoReadsOnlyCwd(t *testing.T) {
 	parent := evalDir(t, t.TempDir())
+	if testutil.GitAncestor(parent) {
+		t.Skip("the temp dir sits inside a git checkout, so cwd is not outside a repo")
+	}
 	writeAgentsFile(t, filepath.Join(parent, "AGENTS.md"), "parent rules")
 	cwd := filepath.Join(parent, "child")
 	writeAgentsFile(t, filepath.Join(cwd, "AGENTS.md"), "child rules")
