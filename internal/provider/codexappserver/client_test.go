@@ -174,28 +174,35 @@ func TestClientServerRequestDelivered(t *testing.T) {
 	}
 }
 
+// isEOF accepts a clean EOF and io.ErrUnexpectedEOF: crashing the fake can cut a
+// server request it is still writing, and the half line then ends the stream
+// with the latter.
+func isEOF(err error) bool {
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
+}
+
 func TestClientEOF(t *testing.T) {
 	baseline := runtime.NumGoroutine()
 	c, f := newTestClient(t)
 	callErr, nextErr := pendingCallAndNext(t, c, f)
 	f.Crash()
-	if err := receive(t, callErr); !errors.Is(err, io.EOF) {
+	if err := receive(t, callErr); !isEOF(err) {
 		t.Fatalf("Call error = %v, want wrapped EOF", err)
 	}
-	if err := receive(t, nextErr); !errors.Is(err, io.EOF) {
+	if err := receive(t, nextErr); !isEOF(err) {
 		t.Fatalf("Next error = %v, want EOF", err)
 	}
 	receive(t, c.Done())
-	if !errors.Is(c.Err(), io.EOF) {
+	if !isEOF(c.Err()) {
 		t.Fatalf("Err = %v, want EOF", c.Err())
 	}
-	if err := c.Call(testContext(t), "after/exit", nil, nil); !errors.Is(err, io.EOF) {
+	if err := c.Call(testContext(t), "after/exit", nil, nil); !isEOF(err) {
 		t.Fatalf("Call after EOF = %v", err)
 	}
-	if _, err := c.Subscribe("after-exit").Next(testContext(t)); !errors.Is(err, io.EOF) {
+	if _, err := c.Subscribe("after-exit").Next(testContext(t)); !isEOF(err) {
 		t.Fatalf("Next after EOF = %v", err)
 	}
-	if _, err := c.Subscribe("blocked").Next(testContext(t)); !errors.Is(err, io.EOF) {
+	if _, err := c.Subscribe("blocked").Next(testContext(t)); !isEOF(err) {
 		t.Fatalf("queued Next after EOF = %v", err)
 	}
 	deadline := time.Now().Add(2 * time.Second)

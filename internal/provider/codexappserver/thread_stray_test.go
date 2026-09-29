@@ -271,3 +271,35 @@ func TestCloseDuringTurnStartGoroutines(t *testing.T) {
 	await(t, c.client.Done())
 	assertThreadGoroutines(t, baseline, "transport shutdown")
 }
+
+// A turn/completed that reached the router but was never dequeued by Run (the
+// 30s budget and the completion raced) still ends the turn: nothing is left
+// running, so no stray may be recorded.
+func TestQueuedCompletionLeavesNoStray(t *testing.T) {
+	f := threadFake(t)
+	th := mustStartThread(t, fakePool(t, f), provider.ThreadOptions{})
+	th.mu.Lock()
+	c := th.conn
+	th.mu.Unlock()
+	active := &threadTurn{
+		queue: &Subscription{changed: make(chan struct{})}, cancel: func() {},
+		idCh: make(chan struct{}), done: make(chan struct{}),
+	}
+	th.mu.Lock()
+	active.learn("turn-1")
+	th.active = active
+	th.observeTurnEvent(c, active, Message{
+		Method: "turn/completed",
+		Params: json.RawMessage(`{"threadId":"thr-1","turn":{"id":"turn-1","status":"interrupted"}}`),
+	})
+	th.mu.Unlock()
+
+	th.finish(c, active)
+
+	th.mu.Lock()
+	stray := th.stray
+	th.mu.Unlock()
+	if stray != nil {
+		t.Fatalf("stray = %+v after a turn whose completion was routed, want none", stray)
+	}
+}

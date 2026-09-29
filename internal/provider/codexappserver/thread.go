@@ -139,6 +139,11 @@ func (t *thread) observeTurnEvent(c *conn, active *threadTurn, msg Message) {
 		if msg.Method == "turn/started" {
 			active.learn(p.Turn.ID)
 		}
+		// The turn is over once its completion reaches the router, even if
+		// Run gives up before it dequeues the message.
+		if msg.Method == "turn/completed" && (active.id == "" || active.id == p.Turn.ID) {
+			active.completed = true
+		}
 	case t.stray != nil && t.stray.gen == c.gen:
 		stray := t.stray
 		if msg.Method == "turn/started" && stray.id == "" {
