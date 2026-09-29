@@ -42,9 +42,7 @@ func New(name string, cfg config.Provider, apiKey string) (provider.Provider, er
 		option.WithAdminAPIKey(""), // never fall back to OPENAI_ADMIN_KEY
 		option.WithBaseURL(cfg.BaseURL),
 		option.WithMiddleware(keepAllowedHeaders),
-		option.WithHTTPClient(&http.Client{
-			Transport: provider.SharedTransport(provider.KindResponses, cfg.BaseURL, 0),
-		}),
+		option.WithHTTPClient(provider.PooledClient(provider.KindResponses, cfg.BaseURL, 0)),
 	)
 	return &Adapter{name: name, client: client}, nil
 }

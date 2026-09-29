@@ -37,9 +37,7 @@ func NewClient(apiKey, baseURL string) *Client {
 	// instead: sessions against one endpoint reuse its connections without
 	// coupling the endpoint (or other endpoints) to the process-wide default.
 	// The client itself stays per adapter, carrying this session's key.
-	cfg.HTTPClient = &http.Client{
-		Transport: provider.SharedTransport(provider.KindChatCompletions, baseURL, 0),
-	}
+	cfg.HTTPClient = provider.PooledClient(provider.KindChatCompletions, baseURL, 0)
 
 	return &Client{
 		oai:     openai.NewClientWithConfig(cfg),

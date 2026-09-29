@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"strings"
 	"time"
 
@@ -40,9 +39,7 @@ func New(name string, cfg config.Provider, apiKey string) (provider.Provider, er
 	// itself stays per adapter, carrying this session's key.
 	client := anthropic.NewClient(
 		option.WithoutEnvironmentDefaults(),
-		option.WithHTTPClient(&http.Client{
-			Transport: provider.SharedTransport(provider.KindMessages, cfg.BaseURL, responseHeaderTimeout),
-		}),
+		option.WithHTTPClient(provider.PooledClient(provider.KindMessages, cfg.BaseURL, responseHeaderTimeout)),
 		option.WithAPIKey(apiKey),
 		option.WithBaseURL(cfg.BaseURL),
 	)
