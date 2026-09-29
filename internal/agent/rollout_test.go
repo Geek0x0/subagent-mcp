@@ -80,6 +80,7 @@ func TestRunnerWritesRollout(t *testing.T) {
 		"event_msg:task_started",
 		"response_item:message",
 		"event_msg:user_message",
+		"event_msg:provider_request",
 		"response_item:reasoning",
 		"event_msg:token_count",
 		"response_item:message",
@@ -89,6 +90,7 @@ func TestRunnerWritesRollout(t *testing.T) {
 		"response_item:custom_tool_call",
 		"event_msg:patch_apply_end",
 		"response_item:custom_tool_call_output",
+		"event_msg:provider_request",
 		"event_msg:token_count",
 		"response_item:message",
 		"event_msg:agent_message",
@@ -102,18 +104,25 @@ func TestRunnerWritesRollout(t *testing.T) {
 		lines[0].Payload["model"] != "deepseek-v4-pro" {
 		t.Fatalf("turn_context = %#v", lines[0].Payload)
 	}
-	info := lines[13].Payload["info"].(map[string]any)
+	info := lines[15].Payload["info"].(map[string]any)
 	total := info["total_token_usage"].(map[string]any)
 	last := info["last_token_usage"].(map[string]any)
 	if total["input_tokens"] != float64(20) || total["cached_input_tokens"] != float64(12) ||
 		total["reasoning_output_tokens"] != float64(4) || last["total_tokens"] != float64(14) {
 		t.Fatalf("token_count info = %#v", info)
 	}
-	if lines[11].Payload["success"] != true {
-		t.Fatalf("patch_apply_end = %#v", lines[11].Payload)
+	if lines[12].Payload["success"] != true {
+		t.Fatalf("patch_apply_end = %#v", lines[12].Payload)
 	}
-	if lines[16].Payload["last_agent_message"] != "all done" {
-		t.Fatalf("task_complete = %#v", lines[16].Payload)
+	if lines[18].Payload["last_agent_message"] != "all done" {
+		t.Fatalf("task_complete = %#v", lines[18].Payload)
+	}
+	request := lines[4].Payload
+	if request["provider"] != "stub" || request["model"] != session.model {
+		t.Fatalf("provider_request = %#v", request)
+	}
+	if _, ok := request["duration_ms"].(float64); !ok {
+		t.Fatalf("duration_ms = %#v (%T), want numeric JSON value", request["duration_ms"], request["duration_ms"])
 	}
 }
 

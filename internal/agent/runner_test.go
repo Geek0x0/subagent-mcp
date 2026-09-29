@@ -432,6 +432,7 @@ func TestRunnerPureTextOneTurn(t *testing.T) {
 	}
 	if gotTypes := eventTypes(t, emitter.recordedEvents()); !reflect.DeepEqual(gotTypes, []string{
 		"task_started",
+		"provider_request",
 		"agent_message",
 		"task_complete",
 	}) {
@@ -510,18 +511,20 @@ func TestRunnerShellToolCallThenText(t *testing.T) {
 	events := emitter.recordedEvents()
 	if gotTypes := eventTypes(t, events); !reflect.DeepEqual(gotTypes, []string{
 		"task_started",
+		"provider_request",
 		"exec_command_begin",
 		"exec_command_end",
+		"provider_request",
 		"agent_message",
 		"task_complete",
 	}) {
 		t.Fatalf("event types = %v", gotTypes)
 	}
-	begin := events[1]
+	begin := events[2]
 	if begin["call_id"] != call.ID || begin["tool"] != "shell" || begin["command"] != "echo hi" {
 		t.Fatalf("begin event = %#v", begin)
 	}
-	end := events[2]
+	end := events[3]
 	if end["call_id"] != call.ID || end["tool"] != "shell" || end["exit_code"] != 0 {
 		t.Fatalf("end event = %#v", end)
 	}
@@ -693,16 +696,18 @@ func TestRunnerRecoversToolExecutionPanicAndCompletesHistory(t *testing.T) {
 	events := recorder.recordedEvents()
 	if gotTypes := eventTypes(t, events); !reflect.DeepEqual(gotTypes, []string{
 		"task_started",
+		"provider_request",
 		"exec_command_begin",
 		"exec_command_end",
 		"exec_command_begin",
 		"exec_command_end",
+		"provider_request",
 		"agent_message",
 		"task_complete",
 	}) {
 		t.Fatalf("event types = %v", gotTypes)
 	}
-	end := events[2]
+	end := events[3]
 	if end["call_id"] != call.ID || end["tool"] != "shell" || end["exit_code"] != -1 {
 		t.Fatalf("panic end event = %#v", end)
 	}
@@ -1091,7 +1096,7 @@ func TestRunnerClientErrorPreservesSessionAndUnlocks(t *testing.T) {
 	if len(session.messages) != 1 || session.messages[0].Role != provider.RoleUser || session.messages[0].Text != "first prompt" {
 		t.Fatalf("messages after client error = %#v", session.messages)
 	}
-	if gotTypes := eventTypes(t, emitter.recordedEvents()); !reflect.DeepEqual(gotTypes, []string{"task_started", "error"}) {
+	if gotTypes := eventTypes(t, emitter.recordedEvents()); !reflect.DeepEqual(gotTypes, []string{"task_started", "provider_request", "error"}) {
 		t.Fatalf("first run event types = %v", gotTypes)
 	}
 
@@ -1128,6 +1133,7 @@ func TestRunnerEmitsDeltasAndUsageInOrder(t *testing.T) {
 		"task_started",
 		"agent_message_delta",
 		"agent_message_delta",
+		"provider_request",
 		"token_count",
 		"agent_message",
 		"task_complete",
@@ -1137,8 +1143,67 @@ func TestRunnerEmitsDeltasAndUsageInOrder(t *testing.T) {
 	if events[1]["delta"] != "do" || events[2]["delta"] != "ne" {
 		t.Fatalf("delta events = %#v, %#v", events[1], events[2])
 	}
-	if events[3]["prompt_tokens"] != 7 || events[3]["completion_tokens"] != 5 || events[3]["total_tokens"] != 12 {
-		t.Fatalf("token event = %#v", events[3])
+	request := events[3]
+	if request["provider"] != "stub" || request["model"] != session.model {
+		t.Fatalf("provider request event = %#v", request)
+	}
+	if _, ok := request["duration_ms"].(int64); !ok {
+		t.Fatalf("duration_ms = %#v (%T), want int64", request["duration_ms"], request["duration_ms"])
+	}
+	if _, ok := request["ttft_ms"].(int64); !ok {
+		t.Fatalf("ttft_ms = %#v (%T), want int64", request["ttft_ms"], request["ttft_ms"])
+	}
+	if _, ok := request["error"]; ok {
+		t.Fatalf("successful provider request unexpectedly contains error: %#v", request)
+	}
+	if events[4]["prompt_tokens"] != 7 || events[4]["completion_tokens"] != 5 || events[4]["total_tokens"] != 12 {
+		t.Fatalf("token event = %#v", events[4])
+	}
+}
+
+func TestRunnerProviderRequestWithoutDeltasOmitsTTFT(t *testing.T) {
+	client := &stubProvider{turns: []stubTurn{{result: &provider.TurnResult{Text: "done"}}}}
+	emitter := &recEmitter{}
+	session := newTestSession(t, Options{Provider: client})
+	runner := &Runner{Emitter: emitter, Approver: &stubApprover{}}
+
+	if _, err := runner.Run(context.Background(), session, "finish"); err != nil {
+		t.Fatalf("Run() error = %v", err)
+	}
+	for _, event := range emitter.recordedEvents() {
+		if event["type"] != "provider_request" {
+			continue
+		}
+		if _, ok := event["ttft_ms"]; ok {
+			t.Fatalf("provider request without deltas has ttft_ms: %#v", event)
+		}
+		if _, ok := event["duration_ms"].(int64); !ok {
+			t.Fatalf("duration_ms = %#v (%T), want int64", event["duration_ms"], event["duration_ms"])
+		}
+		return
+	}
+	t.Fatal("provider_request event not emitted")
+}
+
+func TestRunnerProviderRequestFailureEmitsBeforeError(t *testing.T) {
+	client := &stubProvider{turns: []stubTurn{{err: errors.New("upstream failed")}}}
+	emitter := &recEmitter{}
+	session := newTestSession(t, Options{Provider: client})
+	runner := &Runner{Emitter: emitter, Approver: &stubApprover{}}
+
+	if _, err := runner.Run(context.Background(), session, "fail"); err == nil {
+		t.Fatal("Run() error = nil, want upstream failure")
+	}
+	events := emitter.recordedEvents()
+	if got := eventTypes(t, events); !reflect.DeepEqual(got, []string{"task_started", "provider_request", "error"}) {
+		t.Fatalf("event types = %v", got)
+	}
+	request := events[1]
+	if request["error"] != "upstream failed" {
+		t.Fatalf("provider request error = %#v", request["error"])
+	}
+	if _, ok := request["duration_ms"].(int64); !ok {
+		t.Fatalf("duration_ms = %#v (%T), want int64", request["duration_ms"], request["duration_ms"])
 	}
 }
 
@@ -1238,12 +1303,12 @@ func TestRunnerApplyPatchUpdatesFile(t *testing.T) {
 		t.Fatalf("a.txt = %q", data)
 	}
 	events := emitter.recordedEvents()
-	begin := events[1]
+	begin := events[2]
 	if begin["type"] != "exec_command_begin" || begin["tool"] != "apply_patch" ||
 		!reflect.DeepEqual(begin["paths"], []string{"a.txt"}) {
 		t.Fatalf("begin event = %#v", begin)
 	}
-	if end := events[2]; end["type"] != "exec_command_end" || !reflect.DeepEqual(end["paths"], []string{"a.txt"}) {
+	if end := events[3]; end["type"] != "exec_command_end" || !reflect.DeepEqual(end["paths"], []string{"a.txt"}) {
 		t.Fatalf("end event = %#v", end)
 	}
 }

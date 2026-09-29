@@ -128,6 +128,10 @@ func recordTaskComplete(s *Session, message string, started time.Time) {
 	})
 }
 
+func recordProviderRequest(s *Session, payload map[string]any) {
+	s.rollout.Event(payload)
+}
+
 func recordError(s *Session, err error) {
 	s.rollout.Event(map[string]any{"type": "error", "message": err.Error()})
 }

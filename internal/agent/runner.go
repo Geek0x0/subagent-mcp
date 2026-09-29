@@ -137,6 +137,8 @@ func (r *Runner) Run(ctx context.Context, s *Session, prompt string) (string, er
 	s.messages = append(s.messages, provider.Message{Role: provider.RoleUser, Text: prompt})
 
 	for turn := 0; turn < s.maxTurns; turn++ {
+		requestStarted := time.Now()
+		var firstDelta time.Time
 		res, err := s.provider.Turn(ctx, provider.TurnRequest{
 			Model:    s.model,
 			Effort:   s.effortSent,
@@ -144,11 +146,29 @@ func (r *Runner) Run(ctx context.Context, s *Session, prompt string) (string, er
 			Messages: s.messages,
 			Tools:    BuiltinTools(),
 		}, func(delta string) {
+			if firstDelta.IsZero() {
+				firstDelta = time.Now()
+			}
 			r.Emitter.Emit(ctx, s.ID, map[string]any{
 				"type":  "agent_message_delta",
 				"delta": delta,
 			})
 		})
+		requestFinished := time.Now()
+		requestEvent := map[string]any{
+			"type":        "provider_request",
+			"provider":    s.provider.Name(),
+			"model":       s.model,
+			"duration_ms": requestFinished.Sub(requestStarted).Milliseconds(),
+		}
+		if !firstDelta.IsZero() {
+			requestEvent["ttft_ms"] = firstDelta.Sub(requestStarted).Milliseconds()
+		}
+		if err != nil {
+			requestEvent["error"] = err.Error()
+		}
+		recordProviderRequest(s, requestEvent)
+		r.Emitter.Emit(ctx, s.ID, requestEvent)
 		if err != nil {
 			r.Emitter.Emit(ctx, s.ID, map[string]any{
 				"type":    "error",
