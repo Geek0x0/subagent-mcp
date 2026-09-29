@@ -645,19 +645,20 @@ func (s *Server) handleReply(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		return mcp.NewToolResultError("prompt must not be empty or whitespace-only"), nil
 	}
 
-	sess, ok := s.mgr.Get(threadID)
-	if !ok {
+	sess, err := s.mgr.Acquire(threadID)
+	switch {
+	case errors.Is(err, agent.ErrUnknownSession):
 		return mcp.NewToolResultError("unknown threadId: " + threadID), nil
-	}
-
-	text, err := s.runner.Run(ctx, sess, prompt)
-	if errors.Is(err, agent.ErrBusy) {
+	case err != nil:
 		return resultWithThreadID(
 			threadID,
 			"",
 			fmt.Errorf("thread %s is busy with another call", threadID),
 		), nil
 	}
+	defer s.mgr.Release(sess)
+
+	text, err := s.runner.RunLocked(ctx, sess, prompt)
 	return resultWithThreadID(threadID, text, err), nil
 }
 

@@ -115,7 +115,13 @@ func (r *Runner) Run(ctx context.Context, s *Session, prompt string) (string, er
 		return "", ErrBusy
 	}
 	defer s.mu.Unlock()
-	defer func() { s.lastUsed = time.Now() }()
+	return r.RunLocked(ctx, s, prompt)
+}
+
+// RunLocked is Run for a session the caller already holds through
+// Manager.Acquire; it neither takes nor releases the session lock.
+func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (string, error) {
+	defer func() { s.setLastUsed(time.Now()) }()
 
 	if s.thread != nil {
 		text, err := s.thread.Run(ctx, prompt, s.effortSent, provider.ThreadCallbacks{

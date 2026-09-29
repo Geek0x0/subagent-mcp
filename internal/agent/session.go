@@ -71,6 +71,11 @@ type Session struct {
 	totalUsage      provider.Usage
 	lastUsed        time.Time
 	mu              sync.Mutex
+
+	// usedMu guards lastUsed for readers that do not hold mu: the eviction sweep
+	// must judge idleness without probing mu, since a probe makes a concurrent
+	// caller see an idle session as busy.
+	usedMu sync.Mutex
 }
 
 type Manager struct {
@@ -231,25 +236,19 @@ func (m *Manager) Close() {
 
 // evictLocked drops idle sessions that have been unused for longer than
 // sessionIdleTTL, then trims the map to leave room for one new session.
-// m.mu must be held. Sessions whose mu is held are busy and never evicted.
+// m.mu must be held. Only sessions chosen for eviction have their mu probed, and
+// a session whose mu is held (acquired or running) is never evicted.
 // Returned threads must be closed after releasing m.mu.
 func (m *Manager) evictLocked() []provider.Thread {
 	var evicted []provider.Thread
 	now := m.now()
 	for id, existing := range m.sessions {
-		if !existing.mu.TryLock() {
+		if now.Sub(existing.lastUsedAt()) <= sessionIdleTTL {
 			continue
 		}
-		if now.Sub(existing.lastUsed) > sessionIdleTTL {
-			delete(m.sessions, id)
-			existing.closeDirectories()
-			existing.bindErr = errors.New("session was evicted")
-			if existing.thread != nil && !existing.threadClosed {
-				existing.threadClosed = true
-				evicted = append(evicted, existing.thread)
-			}
+		if thread, ok := m.evictIfIdleLocked(id, existing); ok && thread != nil {
+			evicted = append(evicted, thread)
 		}
-		existing.mu.Unlock()
 	}
 
 	if len(m.sessions) < maxSessions {
@@ -262,11 +261,7 @@ func (m *Manager) evictLocked() []provider.Thread {
 	}
 	idle := make([]idleSession, 0, len(m.sessions))
 	for id, existing := range m.sessions {
-		if !existing.mu.TryLock() {
-			continue
-		}
-		idle = append(idle, idleSession{id: id, lastUsed: existing.lastUsed})
-		existing.mu.Unlock()
+		idle = append(idle, idleSession{id: id, lastUsed: existing.lastUsedAt()})
 	}
 	sort.Slice(idle, func(i, j int) bool {
 		return idle[i].lastUsed.Before(idle[j].lastUsed)
@@ -275,20 +270,66 @@ func (m *Manager) evictLocked() []provider.Thread {
 		if len(m.sessions) < maxSessions {
 			break
 		}
-		existing, ok := m.sessions[candidate.id]
-		if !ok || !existing.mu.TryLock() {
-			continue
+		if thread, ok := m.evictIfIdleLocked(candidate.id, m.sessions[candidate.id]); ok && thread != nil {
+			evicted = append(evicted, thread)
 		}
-		delete(m.sessions, candidate.id)
-		existing.closeDirectories()
-		existing.bindErr = errors.New("session was evicted")
-		if existing.thread != nil && !existing.threadClosed {
-			existing.threadClosed = true
-			evicted = append(evicted, existing.thread)
-		}
-		existing.mu.Unlock()
 	}
 	return evicted
+}
+
+// evictIfIdleLocked removes the session unless its mu is held. m.mu must be held;
+// because Acquire also takes mu only under m.mu, a session cannot be handed out
+// and evicted at the same time.
+func (m *Manager) evictIfIdleLocked(id string, existing *Session) (provider.Thread, bool) {
+	if !existing.mu.TryLock() {
+		return nil, false
+	}
+	defer existing.mu.Unlock()
+	delete(m.sessions, id)
+	existing.closeDirectories()
+	existing.bindErr = errors.New("session was evicted")
+	if existing.thread != nil && !existing.threadClosed {
+		existing.threadClosed = true
+		return existing.thread, true
+	}
+	return nil, true
+}
+
+// ErrUnknownSession reports that Acquire found no session with the given ID
+// (never created, closed, or evicted).
+var ErrUnknownSession = errors.New("unknown session")
+
+// Acquire looks a session up and takes its lock in one step, so the session
+// cannot be evicted between lookup and use, and an evicted one is never handed
+// out. It fails with ErrUnknownSession or, when another call holds the session,
+// ErrBusy. The caller runs the session with Runner.RunLocked and then calls
+// Release.
+func (m *Manager) Acquire(id string) (*Session, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	session, ok := m.sessions[id]
+	if !ok {
+		return nil, ErrUnknownSession
+	}
+	if !session.mu.TryLock() {
+		return nil, ErrBusy
+	}
+	return session, nil
+}
+
+// Release returns a session obtained from Acquire.
+func (m *Manager) Release(s *Session) { s.mu.Unlock() }
+
+func (s *Session) lastUsedAt() time.Time {
+	s.usedMu.Lock()
+	defer s.usedMu.Unlock()
+	return s.lastUsed
+}
+
+func (s *Session) setLastUsed(t time.Time) {
+	s.usedMu.Lock()
+	s.lastUsed = t
+	s.usedMu.Unlock()
 }
 
 func (m *Manager) Get(id string) (*Session, bool) {
