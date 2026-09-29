@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -57,6 +58,7 @@ type FakeMessages struct {
 
 	t            testing.TB
 	mu           sync.Mutex
+	conns        atomic.Int64
 	messages     []FakeMessage
 	requests     []map[string]any
 	headers      []http.Header
@@ -83,7 +85,7 @@ func NewFakeMessages(t testing.TB, messages []FakeMessage) *FakeMessages {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/messages", fake.handleMessages)
 	mux.HandleFunc("/v1/models", fake.handleModels)
-	fake.Server = httptest.NewServer(mux)
+	fake.Server = newConnCountingServer(mux, &fake.conns)
 	t.Cleanup(fake.Close)
 
 	return fake
@@ -134,6 +136,11 @@ func (f *FakeMessages) RequestHeaderCount() int {
 	defer f.mu.Unlock()
 
 	return len(f.headers)
+}
+
+// ConnectionCount returns the number of TCP connections the server accepted.
+func (f *FakeMessages) ConnectionCount() int64 {
+	return f.conns.Load()
 }
 
 // RequestHeaders returns a snapshot of the HTTP headers of the i-th request

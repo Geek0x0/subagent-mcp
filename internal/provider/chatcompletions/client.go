@@ -10,6 +10,8 @@ import (
 	"time"
 
 	openai "github.com/sashabaranov/go-openai"
+
+	"github.com/Geek0x0/subagent-mcp/internal/provider"
 )
 
 type TurnResult struct {
@@ -28,6 +30,15 @@ type Client struct {
 func NewClient(apiKey, baseURL string) *Client {
 	cfg := openai.DefaultConfig(apiKey)
 	cfg.BaseURL = baseURL
+	// go-openai's DefaultConfig gives every client an &http.Client{} whose
+	// nil Transport resolves to the process-global http.DefaultTransport at
+	// request time. Bind the client to the pool registered for this base URL
+	// instead: sessions against one endpoint reuse its connections without
+	// coupling the endpoint (or other endpoints) to the process-wide default.
+	// The client itself stays per adapter, carrying this session's key.
+	cfg.HTTPClient = &http.Client{
+		Transport: provider.SharedTransport(provider.KindChatCompletions, baseURL, 0),
+	}
 
 	return &Client{
 		oai:     openai.NewClientWithConfig(cfg),

@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	openai "github.com/sashabaranov/go-openai"
@@ -37,6 +38,7 @@ type FakeChat struct {
 
 	t            testing.TB
 	mu           sync.Mutex
+	conns        atomic.Int64
 	turns        []FakeTurn
 	requests     []map[string]any
 	headers      []http.Header
@@ -60,7 +62,7 @@ func NewFakeChat(t testing.TB, turns []FakeTurn) *FakeChat {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/chat/completions", fake.handleChatCompletions)
 	mux.HandleFunc("/models", fake.handleModels)
-	fake.Server = httptest.NewServer(mux)
+	fake.Server = newConnCountingServer(mux, &fake.conns)
 	t.Cleanup(fake.Close)
 
 	return fake
@@ -109,6 +111,11 @@ func (f *FakeChat) RequestHeaderCount() int {
 	defer f.mu.Unlock()
 
 	return len(f.headers)
+}
+
+// ConnectionCount returns the number of TCP connections the server accepted.
+func (f *FakeChat) ConnectionCount() int64 {
+	return f.conns.Load()
 }
 
 // RequestHeaders returns a snapshot of the HTTP headers of the i-th request

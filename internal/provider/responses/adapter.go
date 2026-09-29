@@ -33,11 +33,18 @@ func New(name string, cfg config.Provider, apiKey string) (provider.Provider, er
 	// defaults, so an allowlist middleware drops every header this adapter
 	// did not configure (OPENAI_ORG_ID, OPENAI_PROJECT_ID,
 	// OPENAI_CUSTOM_HEADERS, ...) immediately before each attempt is sent.
+	// The SDK's default client clones http.DefaultTransport per client, so
+	// sessions would never share connections; hand it the pool registered
+	// for this base URL instead. The client stays per adapter (and per
+	// session key); only the pool is shared.
 	client := openai.NewClient(
 		option.WithAPIKey(apiKey),
 		option.WithAdminAPIKey(""), // never fall back to OPENAI_ADMIN_KEY
 		option.WithBaseURL(cfg.BaseURL),
 		option.WithMiddleware(keepAllowedHeaders),
+		option.WithHTTPClient(&http.Client{
+			Transport: provider.SharedTransport(provider.KindResponses, cfg.BaseURL, 0),
+		}),
 	)
 	return &Adapter{name: name, client: client}, nil
 }

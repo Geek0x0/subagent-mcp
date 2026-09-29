@@ -35,10 +35,14 @@ func New(name string, cfg config.Provider, apiKey string) (provider.Provider, er
 	// credential environment (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN,
 	// ANTHROPIC_CUSTOM_HEADERS, ANTHROPIC_BASE_URL, profiles, federation):
 	// the only credential on the wire is the configured key below, no
-	// matter what the process environment holds.
+	// matter what the process environment holds. The transport is the pool
+	// shared for this base URL (sessions reuse connections); the client
+	// itself stays per adapter, carrying this session's key.
 	client := anthropic.NewClient(
 		option.WithoutEnvironmentDefaults(),
-		option.WithHTTPClient(defaultHTTPClient()),
+		option.WithHTTPClient(&http.Client{
+			Transport: provider.SharedTransport(provider.KindMessages, cfg.BaseURL, responseHeaderTimeout),
+		}),
 		option.WithAPIKey(apiKey),
 		option.WithBaseURL(cfg.BaseURL),
 	)
@@ -51,18 +55,6 @@ func New(name string, cfg config.Provider, apiKey string) (provider.Provider, er
 // the connection but never responds cannot hang a request forever. The
 // timeout does not apply to the response body, so streams are unaffected.
 const responseHeaderTimeout = 10 * time.Minute
-
-// defaultHTTPClient mirrors the SDK's default client (a clone of
-// http.DefaultTransport with responseHeaderTimeout) for clients that opt out
-// of the environment defaults.
-func defaultHTTPClient() *http.Client {
-	if transport, ok := http.DefaultTransport.(*http.Transport); ok {
-		transport = transport.Clone()
-		transport.ResponseHeaderTimeout = responseHeaderTimeout
-		return &http.Client{Transport: transport}
-	}
-	return &http.Client{Transport: http.DefaultTransport}
-}
 
 func (a *Adapter) Name() string { return a.name }
 
