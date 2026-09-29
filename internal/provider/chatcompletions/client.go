@@ -3,6 +3,7 @@ package chatcompletions
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"sort"
@@ -70,7 +71,8 @@ func (c *Client) ChatTurn(
 
 	var content strings.Builder
 	var reasoning strings.Builder
-	toolCallsByIndex := make(map[int]*openai.ToolCall)
+	var finishReason string
+	assembler := newToolCallAssembler()
 	var usage *openai.Usage
 
 	for {
@@ -88,6 +90,14 @@ func (c *Client) ChatTurn(
 		}
 
 		for _, choice := range response.Choices {
+			// The finish reason can ride on any chunk: some servers put it on
+			// an otherwise-empty delta after the last content delta, and the
+			// usage chunk (empty choices) comes after it. Keep the last
+			// non-empty reason the stream reports.
+			if choice.FinishReason != "" {
+				finishReason = string(choice.FinishReason)
+			}
+
 			delta := choice.Delta
 			if delta.ReasoningContent != "" {
 				reasoning.WriteString(delta.ReasoningContent)
@@ -99,46 +109,51 @@ func (c *Client) ChatTurn(
 				}
 			}
 
-			for chunkPosition, entry := range delta.ToolCalls {
-				index := chunkPosition
-				if entry.Index != nil {
-					index = *entry.Index
-				} else {
-					// ponytail: Chunk position recovers the common single-call case
-					// when a provider omits Index. Selectively omitted indices in a
-					// multi-call batch can still misassign continuations; robust
-					// recovery would require provider-supplied correlation metadata.
-				}
-
-				call, ok := toolCallsByIndex[index]
-				if !ok {
-					toolType := entry.Type
-					if toolType == "" {
-						toolType = openai.ToolTypeFunction
-					}
-
-					toolCallsByIndex[index] = &openai.ToolCall{
-						ID:   entry.ID,
-						Type: toolType,
-						Function: openai.FunctionCall{
-							Name:      entry.Function.Name,
-							Arguments: entry.Function.Arguments,
-						},
-					}
-					continue
-				}
-
-				call.Function.Arguments += entry.Function.Arguments
+			for _, entry := range delta.ToolCalls {
+				assembler.add(entry)
 			}
 		}
+	}
+
+	if err := finishReasonError(finishReason); err != nil {
+		return nil, err
+	}
+	toolCalls, err := assembler.result()
+	if err != nil {
+		return nil, err
 	}
 
 	return &TurnResult{
 		Content:   content.String(),
 		Reasoning: reasoning.String(),
-		ToolCalls: sortedToolCalls(toolCallsByIndex),
+		ToolCalls: toolCalls,
 		Usage:     usage,
 	}, nil
+}
+
+// finishReasonError maps the stream's finish_reason to a turn error. Only
+// "stop" and "tool_calls" mean the model finished cleanly; "length" and
+// "content_filter" are truncated or filtered answers, and no finish reason at
+// all means the transport ended mid-stream (go-openai reports both a clean
+// [DONE] and a body that just ends as io.EOF, so the loop alone cannot tell
+// them apart). Any other non-empty reason fails closed as well: an unknown
+// reason may be another truncation or refusal signal, and handing back a
+// partial answer as success is the bug this guards against (the messages
+// adapter likewise errors on max_tokens and refusal instead of returning
+// partial content).
+func finishReasonError(reason string) error {
+	switch reason {
+	case string(openai.FinishReasonStop), string(openai.FinishReasonToolCalls):
+		return nil
+	case string(openai.FinishReasonLength):
+		return errors.New(`chat completions: finish_reason "length": response was truncated by the output token limit`)
+	case string(openai.FinishReasonContentFilter):
+		return errors.New(`chat completions: finish_reason "content_filter": response was stopped by the content filter`)
+	case "":
+		return errors.New("chat completions: stream ended without a finish reason (truncated response)")
+	default:
+		return fmt.Errorf("chat completions: unexpected finish_reason %q; failing closed instead of returning a possibly partial answer", reason)
+	}
 }
 
 func (c *Client) openStreamWithRetry(
@@ -194,21 +209,116 @@ func waitForBackoff(ctx context.Context, delay time.Duration) error {
 	}
 }
 
-func sortedToolCalls(callsByIndex map[int]*openai.ToolCall) []openai.ToolCall {
-	if len(callsByIndex) == 0 {
-		return nil
+// toolCallAssembler rebuilds the tool calls the server sent from the streamed
+// fragments. A fragment carrying an index continues the call with that index.
+// A fragment without an index starts a new call when it carries an id the
+// current call does not already have, and otherwise continues the most recent
+// call: arguments append, and an id, name or type that earlier fragments left
+// empty gets filled in (some servers send only the index, or only the id and
+// name, in the first fragment).
+type toolCallAssembler struct {
+	calls    []assembledCall
+	indexPos map[int]int // server index -> position in calls
+	last     int         // position of the most recently touched call, -1 if none
+}
+
+type assembledCall struct {
+	call  openai.ToolCall
+	index int // server-supplied index; -1 when the server omitted it
+}
+
+func newToolCallAssembler() *toolCallAssembler {
+	return &toolCallAssembler{indexPos: make(map[int]int), last: -1}
+}
+
+func (a *toolCallAssembler) add(entry openai.ToolCall) {
+	pos := a.positionFor(entry)
+	a.last = pos
+
+	call := &a.calls[pos].call
+	if entry.ID != "" && call.ID == "" {
+		call.ID = entry.ID
+	}
+	if entry.Type != "" && call.Type == "" {
+		call.Type = entry.Type
+	}
+	if entry.Function.Name != "" && call.Function.Name == "" {
+		call.Function.Name = entry.Function.Name
+	}
+	call.Function.Arguments += entry.Function.Arguments
+}
+
+func (a *toolCallAssembler) positionFor(entry openai.ToolCall) int {
+	if entry.Index != nil {
+		if pos, ok := a.indexPos[*entry.Index]; ok {
+			return pos
+		}
+		return a.append(*entry.Index)
 	}
 
-	indices := make([]int, 0, len(callsByIndex))
-	for index := range callsByIndex {
-		indices = append(indices, index)
+	if a.last < 0 {
+		return a.append(-1)
 	}
-	sort.Ints(indices)
+	// No index: a new non-empty id that the most recent call does not already
+	// carry starts the next call; anything else continues that call.
+	if entry.ID != "" && a.calls[a.last].call.ID != "" && a.calls[a.last].call.ID != entry.ID {
+		return a.append(-1)
+	}
+	return a.last
+}
 
-	calls := make([]openai.ToolCall, 0, len(indices))
-	for _, index := range indices {
-		calls = append(calls, *callsByIndex[index])
+func (a *toolCallAssembler) append(index int) int {
+	pos := len(a.calls)
+	a.calls = append(a.calls, assembledCall{index: index})
+	if index >= 0 {
+		a.indexPos[index] = pos
 	}
 
-	return calls
+	return pos
+}
+
+// result returns the assembled calls in the order the server sent them,
+// sorted by index when every call carries one (the historical behavior). A
+// call the stream never gave an id or a name fails the turn: the agent could
+// not address a tool result for it, and the API rejects an empty
+// tool_call_id.
+func (a *toolCallAssembler) result() ([]openai.ToolCall, error) {
+	if len(a.calls) == 0 {
+		return nil, nil
+	}
+
+	allIndexed := true
+	for _, assembled := range a.calls {
+		if assembled.index < 0 {
+			allIndexed = false
+			break
+		}
+	}
+
+	order := make([]int, len(a.calls))
+	for i := range order {
+		order[i] = i
+	}
+	if allIndexed {
+		sort.Slice(order, func(i, j int) bool {
+			return a.calls[order[i]].index < a.calls[order[j]].index
+		})
+	}
+
+	calls := make([]openai.ToolCall, 0, len(a.calls))
+	for _, pos := range order {
+		call := a.calls[pos].call
+		if call.ID == "" {
+			return nil, fmt.Errorf("chat completions: tool call %d has no id (name %q)", len(calls), call.Function.Name)
+		}
+		if call.Function.Name == "" {
+			return nil, fmt.Errorf("chat completions: tool call %q has no name", call.ID)
+		}
+		if call.Type == "" {
+			call.Type = openai.ToolTypeFunction
+		}
+		calls = append(calls, call)
+	}
+
+	return calls, nil
 }

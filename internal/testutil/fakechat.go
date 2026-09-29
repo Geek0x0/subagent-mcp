@@ -31,6 +31,11 @@ type FakeTurn struct {
 	Reasoning string
 	Text      string
 	ToolCalls []FakeToolCall
+	// SSE, when non-empty, is written verbatim as the response body instead
+	// of the scripted chunks. It lets a test script an exact stream: a custom
+	// finish reason, omitted tool-call indices, a body without [DONE], and so
+	// on. Status still takes precedence when it is a failure.
+	SSE string
 }
 
 type FakeChat struct {
@@ -51,6 +56,9 @@ func NewFakeChat(t testing.TB, turns []FakeTurn) *FakeChat {
 	for i, turn := range turns {
 		if turn.Text != "" && len(turn.ToolCalls) > 0 {
 			t.Fatalf("FakeTurn %d: Text and ToolCalls are mutually exclusive", i)
+		}
+		if turn.SSE != "" && (turn.Text != "" || turn.Reasoning != "" || len(turn.ToolCalls) > 0) {
+			t.Fatalf("FakeTurn %d: SSE is mutually exclusive with Text, Reasoning, and ToolCalls", i)
 		}
 	}
 
@@ -166,6 +174,18 @@ func (f *FakeChat) handleChatCompletions(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	if turn.SSE != "" {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if _, err := io.WriteString(w, turn.SSE); err != nil {
+			f.t.Errorf("write scripted SSE body: %v", err)
+			return
+		}
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		return
+	}
+
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		f.t.Errorf("response writer does not support streaming")
@@ -185,6 +205,7 @@ func (f *FakeChat) handleChatCompletions(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	finishReason := openai.FinishReasonStop
 	if len(turn.ToolCalls) == 0 {
 		first, second := splitInHalf(turn.Text)
 		for _, content := range []string{first, second} {
@@ -234,13 +255,17 @@ func (f *FakeChat) handleChatCompletions(w http.ResponseWriter, r *http.Request)
 			}
 		}
 
-		if !f.writeChunk(w, flusher, openai.ChatCompletionStreamResponse{
-			Choices: []openai.ChatCompletionStreamChoice{{
-				FinishReason: openai.FinishReasonToolCalls,
-			}},
-		}) {
-			return
-		}
+		finishReason = openai.FinishReasonToolCalls
+	}
+
+	// The finish chunk carries an empty delta, the way OpenAI-compatible
+	// servers send it, and the usage chunk follows it.
+	if !f.writeChunk(w, flusher, openai.ChatCompletionStreamResponse{
+		Choices: []openai.ChatCompletionStreamChoice{{
+			FinishReason: finishReason,
+		}},
+	}) {
+		return
 	}
 
 	if !f.writeChunk(w, flusher, openai.ChatCompletionStreamResponse{
