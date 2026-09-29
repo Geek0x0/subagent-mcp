@@ -389,7 +389,21 @@ func TestAgentLoopAPIRetryRecovery(t *testing.T) {
 		if got := fake.RequestCount(); got != 5 {
 			t.Fatalf("request count after resumed Run() = %d, want 5", got)
 		}
-		assertRequestHistory(t, fake, 4, "first")
+		// The "first" prompt failed before any assistant message was
+		// appended, so its Run restored the history to its entry length:
+		// the resumed Run carries only its own prompt.
+		assertRequestHistory(t, fake, 4, "second")
+		for i, messageValue := range requestMessages(t, fake, 4) {
+			message, ok := messageValue.(map[string]any)
+			if !ok {
+				t.Fatalf("request 4 message %d = %#v, want an object", i, messageValue)
+			}
+			if role, _ := message["role"].(string); role == "user" {
+				if content, _ := message["content"].(string); content == "first" {
+					t.Fatalf("request 4 replays the abandoned prompt %q", content)
+				}
+			}
+		}
 	})
 }
 

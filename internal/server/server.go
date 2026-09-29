@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/Geek0x0/subagent-mcp/internal/agent"
 	"github.com/Geek0x0/subagent-mcp/internal/config"
@@ -463,6 +464,9 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	if err != nil {
 		return mcp.NewToolResultError("prompt is required: " + err.Error()), nil
 	}
+	if strings.TrimSpace(prompt) == "" {
+		return mcp.NewToolResultError("prompt must not be empty or whitespace-only"), nil
+	}
 	arguments := req.GetArguments()
 
 	providerCfg, selectedProvider, errResult := s.resolveProvider(arguments)
@@ -637,6 +641,9 @@ func (s *Server) handleReply(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	if err != nil {
 		return mcp.NewToolResultError("prompt is required: " + err.Error()), nil
 	}
+	if strings.TrimSpace(prompt) == "" {
+		return mcp.NewToolResultError("prompt must not be empty or whitespace-only"), nil
+	}
 
 	sess, ok := s.mgr.Get(threadID)
 	if !ok {
@@ -748,9 +755,9 @@ func (s *Server) Approve(ctx context.Context, threadID string, req agent.Approva
 			Message: fmt.Sprintf(
 				"subagent-mcp approval request (thread %s)\ntool: %s\ntarget: %s\nreason: %s",
 				threadID,
-				req.Tool,
-				target,
-				req.Reason,
+				sanitizeApprovalField(req.Tool),
+				sanitizeApprovalField(target),
+				sanitizeApprovalField(req.Reason),
 			),
 			RequestedSchema: map[string]any{
 				"type":       "object",
@@ -763,4 +770,34 @@ func (s *Server) Approve(ctx context.Context, threadID string, req agent.Approva
 		return false
 	}
 	return result.Action == mcp.ElicitationResponseActionAccept
+}
+
+// approvalFieldLimit is the maximum number of bytes of one untrusted,
+// model-controlled field shown in the approval message before it is truncated
+// with a marker stating the original length.
+const approvalFieldLimit = 512
+
+// sanitizeApprovalField renders a model-controlled value (tool name, command
+// or path, justification) for the approval prompt as a single line.
+// strconv.Quote escapes newlines, carriage returns, control bytes, and ANSI
+// escape sequences, so no field content can forge a header line, fake the
+// layout, or hide the real payload below the fold, while a normal command or
+// path stays readable verbatim inside the quotes. Values longer than
+// approvalFieldLimit bytes are cut on a UTF-8 boundary and get a visible
+// marker stating the original length.
+func sanitizeApprovalField(value string) string {
+	shown := value
+	truncated := len(shown) > approvalFieldLimit
+	if truncated {
+		cut := approvalFieldLimit
+		for cut > 0 && !utf8.RuneStart(shown[cut]) {
+			cut--
+		}
+		shown = shown[:cut]
+	}
+	quoted := strconv.Quote(shown)
+	if truncated {
+		quoted += fmt.Sprintf(" … [truncated: original length %d bytes]", len(value))
+	}
+	return quoted
 }

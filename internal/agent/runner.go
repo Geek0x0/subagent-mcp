@@ -20,6 +20,11 @@ import (
 
 var ErrBusy = errors.New("thread is busy")
 
+// cancelledToolResult is the tool result recorded for calls skipped after the
+// context was cancelled, so every tool call in the history keeps a matching
+// result and providers still accept the history on the next reply.
+const cancelledToolResult = "cancelled: not executed"
+
 type Emitter interface {
 	Emit(ctx context.Context, threadID string, msg map[string]any)
 }
@@ -134,7 +139,9 @@ func (r *Runner) Run(ctx context.Context, s *Session, prompt string) (string, er
 	started := time.Now()
 	s.turnID = uuid.NewString()
 	recordTurnStart(s, prompt, started)
+	entryMessages := len(s.messages)
 	s.messages = append(s.messages, provider.Message{Role: provider.RoleUser, Text: prompt})
+	assistantAppended := false
 
 	for turn := 0; turn < s.maxTurns; turn++ {
 		res, err := s.provider.Turn(ctx, provider.TurnRequest{
@@ -150,6 +157,13 @@ func (r *Runner) Run(ctx context.Context, s *Session, prompt string) (string, er
 			})
 		})
 		if err != nil {
+			if !assistantAppended {
+				// No assistant message was appended during this Run, so the
+				// prompt never produced a reply. Restore the history to its
+				// entry length: a failed or cancelled first model call must
+				// not leave the prompt to be replayed by the next reply.
+				s.messages = s.messages[:entryMessages]
+			}
 			r.Emitter.Emit(ctx, s.ID, map[string]any{
 				"type":    "error",
 				"message": err.Error(),
@@ -178,8 +192,21 @@ func (r *Runner) Run(ctx context.Context, s *Session, prompt string) (string, er
 			recordTaskComplete(s, res.Text, started)
 			return res.Text, nil
 		}
+		assistantAppended = true
 
 		for _, call := range res.ToolCalls {
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				// The context was cancelled: this call must neither execute
+				// nor ask for approval, but it still gets an error tool
+				// result so every tool call keeps a matching result in the
+				// history. The context error is returned after the batch.
+				recordToolCall(s, call)
+				recordToolOutput(s, call, cancelledToolResult)
+				s.messages = append(s.messages, provider.Message{
+					Role: provider.RoleTool, ToolCallID: call.ID, Text: cancelledToolResult, IsError: true,
+				})
+				continue
+			}
 			recordToolCall(s, call)
 			content, isError := r.safeExecToolCall(ctx, s, call)
 			if content == "" {
@@ -189,6 +216,14 @@ func (r *Runner) Run(ctx context.Context, s *Session, prompt string) (string, er
 			s.messages = append(s.messages, provider.Message{
 				Role: provider.RoleTool, ToolCallID: call.ID, Text: content, IsError: isError,
 			})
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			r.Emitter.Emit(ctx, s.ID, map[string]any{
+				"type":    "error",
+				"message": ctxErr.Error(),
+			})
+			recordError(s, ctxErr)
+			return "", ctxErr
 		}
 	}
 
@@ -213,6 +248,9 @@ func (r *Runner) safeExecToolCall(ctx context.Context, s *Session, toolCall prov
 }
 
 func (r *Runner) execToolCall(ctx context.Context, s *Session, toolCall provider.ToolCall) (string, bool) {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return cancelledToolResult, true
+	}
 	var args struct {
 		Command        string `json:"command"`
 		TimeoutSeconds int    `json:"timeout_seconds"`
