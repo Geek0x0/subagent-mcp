@@ -39,6 +39,7 @@ type FakeChat struct {
 	mu           sync.Mutex
 	turns        []FakeTurn
 	requests     []map[string]any
+	headers      []http.Header
 	models       []string
 	modelsStatus int
 }
@@ -102,6 +103,29 @@ func (f *FakeChat) Request(i int) map[string]any {
 	return f.requests[i]
 }
 
+// RequestHeaderCount returns the number of requests received on any endpoint.
+func (f *FakeChat) RequestHeaderCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	return len(f.headers)
+}
+
+// RequestHeaders returns a snapshot of the HTTP headers of the i-th request
+// the server received on any endpoint (turns and model listings alike).
+func (f *FakeChat) RequestHeaders(i int) http.Header {
+	f.t.Helper()
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if i < 0 || i >= len(f.headers) {
+		f.t.Fatalf("request header index %d out of range; recorded %d requests", i, len(f.headers))
+	}
+
+	return f.headers[i]
+}
+
 func (f *FakeChat) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -117,6 +141,7 @@ func (f *FakeChat) handleChatCompletions(w http.ResponseWriter, r *http.Request)
 
 	f.mu.Lock()
 	f.requests = append(f.requests, request)
+	f.headers = append(f.headers, r.Header.Clone())
 	if len(f.turns) == 0 {
 		f.mu.Unlock()
 		f.t.Errorf("unexpected extra request")
@@ -236,6 +261,7 @@ func (f *FakeChat) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 
 	f.mu.Lock()
+	f.headers = append(f.headers, r.Header.Clone())
 	status := f.modelsStatus
 	ids := append([]string(nil), f.models...)
 	f.mu.Unlock()

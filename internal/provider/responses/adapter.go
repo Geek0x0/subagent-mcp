@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/openai/openai-go/v3"
@@ -28,8 +29,45 @@ type Adapter struct {
 
 // New builds a Responses adapter.
 func New(name string, cfg config.Provider, apiKey string) (provider.Provider, error) {
-	client := openai.NewClient(option.WithAPIKey(apiKey), option.WithBaseURL(cfg.BaseURL))
+	// openai-go has no public opt-out for its OPENAI_* environment
+	// defaults, so an allowlist middleware drops every header this adapter
+	// did not configure (OPENAI_ORG_ID, OPENAI_PROJECT_ID,
+	// OPENAI_CUSTOM_HEADERS, ...) immediately before each attempt is sent.
+	client := openai.NewClient(
+		option.WithAPIKey(apiKey),
+		option.WithAdminAPIKey(""), // never fall back to OPENAI_ADMIN_KEY
+		option.WithBaseURL(cfg.BaseURL),
+		option.WithMiddleware(keepAllowedHeaders),
+	)
 	return &Adapter{name: name, client: client}, nil
+}
+
+// keepAllowedHeaders reduces the outbound request to the configured Bearer
+// credential, the SDK's protocol/content headers, its X-Stainless-*
+// telemetry, and the User-Agent; anything else — in particular anything
+// derived from the process environment — is removed before the request
+// leaves, so no present or future SDK environment default can reach a
+// server the user configured for another provider.
+func keepAllowedHeaders(req *http.Request, next option.MiddlewareNext) (*http.Response, error) {
+	var drop []string
+	for name := range req.Header {
+		if !allowedResponseHeader(name) {
+			drop = append(drop, name)
+		}
+	}
+	for _, name := range drop {
+		req.Header.Del(name)
+	}
+	return next(req)
+}
+
+func allowedResponseHeader(name string) bool {
+	canonical := http.CanonicalHeaderKey(name)
+	switch canonical {
+	case "Accept", "Content-Type", "Authorization", "User-Agent":
+		return true
+	}
+	return strings.HasPrefix(canonical, "X-Stainless-")
 }
 
 func (a *Adapter) Name() string { return a.name }
