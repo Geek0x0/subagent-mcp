@@ -1610,7 +1610,7 @@ func TestProgressNotificationsWithToken(t *testing.T) {
 		}
 	}
 
-	wantEvents := []string{"task_started", "exec_command_begin", "exec_command_end", "agent_message", "task_complete"}
+	wantEvents := []string{"task_started", "provider_request", "exec_command_begin", "exec_command_end", "provider_request", "agent_message", "task_complete"}
 	if !reflect.DeepEqual(eventTypes, wantEvents) {
 		t.Fatalf("subagent/event types = %v, want %v", eventTypes, wantEvents)
 	}
@@ -1663,8 +1663,8 @@ func TestNoProgressNotificationsWithoutToken(t *testing.T) {
 	if progressCount != 0 {
 		t.Fatalf("progress notification count = %d, want 0", progressCount)
 	}
-	if eventCount != 5 {
-		t.Fatalf("subagent/event count = %d, want 5", eventCount)
+	if eventCount != 7 {
+		t.Fatalf("subagent/event count = %d, want 7", eventCount)
 	}
 }
 
