@@ -249,7 +249,7 @@ With the default `SUBAGENT_MCP_TOOL_NAME=subagent`, the tools are `subagent` and
 
 ### `chat-completions`
 
-Streams OpenAI Chat Completions with `include_usage` and reassembles tool calls by index. Only stream setup is retried; a mid-stream failure fails the turn, and the thread stays resumable. `reasoning_effort` carries the mapped effort. Assistant `reasoning_content` is stored as the replay payload and sent back on later turns, which DeepSeek thinking mode requires when tools are used. Usage maps prompt, completion, and total tokens plus cached prompt tokens and reasoning completion tokens. Default `base_url`: `https://api.openai.com/v1`; DeepSeek needs `https://api.deepseek.com`.
+Streams OpenAI Chat Completions with `include_usage` and reassembles tool-call fragments into the calls the server sent, keyed by index when the server provides one and by id when it omits indices; a call that ends the stream without an id or name fails the turn instead of being sent onward with an empty `tool_call_id`. A `finish_reason` of `length` or `content_filter`, any unknown finish reason, and a stream that ends without any finish reason fail the turn rather than return truncated or filtered content. Only stream setup is retried; a mid-stream failure fails the turn, and the thread stays resumable. `reasoning_effort` carries the mapped effort. Assistant `reasoning_content` is stored as the replay payload and sent back on later turns, which DeepSeek thinking mode requires when tools are used. Usage maps prompt, completion, and total tokens plus cached prompt tokens and reasoning completion tokens. Default `base_url`: `https://api.openai.com/v1`; DeepSeek needs `https://api.deepseek.com`.
 
 ### `responses`
 
