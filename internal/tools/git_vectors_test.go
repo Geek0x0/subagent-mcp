@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,15 +49,16 @@ func markerExists(t *testing.T, marker string) bool {
 	return err == nil
 }
 
+// dirtyRound gives every re-dirtying of the tracked file its own mtime.
+var dirtyRound atomic.Int32
+
 // runsProgram reports whether the command, run through the wrapper, executed the
 // repository's program (the marker appeared), and whether plain git does.
 func runsProgram(t *testing.T, home, repo, marker, command string) (wrapped, plain bool) {
 	t.Helper()
-	round := 0
 	dirty := func() {
 		// A new mtime each time, or the refreshed index would still match the file.
-		round++
-		old := time.Date(2001+round, 1, 1, 0, 0, 0, 0, time.UTC)
+		old := time.Date(2001+int(dirtyRound.Add(1)), 1, 1, 0, 0, 0, 0, time.UTC)
 		if err := os.Chtimes(filepath.Join(repo, "f.txt"), old, old); err != nil {
 			t.Fatal(err)
 		}
