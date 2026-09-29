@@ -64,16 +64,21 @@ func SharedTransport(kind, baseURL string, responseHeaderTimeout time.Duration) 
 	return transport
 }
 
-// drainLimit bounds how much of an unread response body is discarded on Close.
-const drainLimit = 64 << 10
+// Bounds on the discard of an unread response body on Close: at most drainLimit
+// bytes, and at most drainTimeout of waiting, so a server that sends the final
+// sentinel but keeps the response open cannot stall the caller.
+const (
+	drainLimit   = 64 << 10
+	drainTimeout = 250 * time.Millisecond
+)
 
 // PooledClient returns an HTTP client over SharedTransport(kind, baseURL, ...)
 // whose response bodies are drained on Close. The SSE readers stop at the final
 // sentinel without reading the body to EOF; Go's transport only returns a
 // connection to the pool once the body has hit EOF, so without the drain every
 // streamed turn would close its connection and the pool would never be reused.
-// The drain is bounded (drainLimit) and returns at once when the request was
-// cancelled, because the read then fails.
+// The drain is bounded by size and time (drainLimit, drainTimeout); a cancelled
+// request makes the read fail at once.
 func PooledClient(kind, baseURL string, responseHeaderTimeout time.Duration) *http.Client {
 	return &http.Client{Transport: drainingTransport{SharedTransport(kind, baseURL, responseHeaderTimeout)}}
 }
@@ -91,6 +96,17 @@ func (d drainingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 type drainOnClose struct{ io.ReadCloser }
 
 func (b drainOnClose) Close() error {
-	_, _ = io.CopyN(io.Discard, b.ReadCloser, drainLimit)
+	drained := make(chan struct{})
+	go func() {
+		defer close(drained)
+		_, _ = io.CopyN(io.Discard, b.ReadCloser, drainLimit)
+	}()
+	timer := time.NewTimer(drainTimeout)
+	defer timer.Stop()
+	select {
+	case <-drained:
+	case <-timer.C:
+	}
+	// Closing also unblocks a drain that is still reading.
 	return b.ReadCloser.Close()
 }
