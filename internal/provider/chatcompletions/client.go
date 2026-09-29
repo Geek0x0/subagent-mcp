@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"sort"
 	"strings"
@@ -129,28 +130,29 @@ func (c *Client) ChatTurn(
 	}, nil
 }
 
-// finishReasonError maps the stream's finish_reason to a turn error. Only
-// "stop" and "tool_calls" mean the model finished cleanly; "length" and
-// "content_filter" are truncated or filtered answers, and no finish reason at
-// all means the transport ended mid-stream (go-openai reports both a clean
-// [DONE] and a body that just ends as io.EOF, so the loop alone cannot tell
-// them apart). Any other non-empty reason fails closed as well: an unknown
-// reason may be another truncation or refusal signal, and handing back a
-// partial answer as success is the bug this guards against (the messages
-// adapter likewise errors on max_tokens and refusal instead of returning
-// partial content).
+// finishReasonError maps the stream's finish_reason to a turn error. "stop" and
+// "tool_calls" (and the aliases other OpenAI-compatible servers use for the same
+// thing: "function_call", "eos") mean the model finished cleanly. "length" and
+// "content_filter" are truncated or filtered answers, and no finish reason at all
+// means the transport ended mid-stream (go-openai reports both a clean [DONE] and
+// a body that just ends as io.EOF, so the loop alone cannot tell them apart).
+// A reason this adapter does not know is logged and accepted: the server did say
+// the stream finished, and failing every turn on a compatible server's private
+// vocabulary would make it unusable.
 func finishReasonError(reason string) error {
 	switch reason {
-	case string(openai.FinishReasonStop), string(openai.FinishReasonToolCalls):
+	case string(openai.FinishReasonStop), string(openai.FinishReasonToolCalls),
+		string(openai.FinishReasonFunctionCall), "eos":
 		return nil
-	case string(openai.FinishReasonLength):
+	case string(openai.FinishReasonLength), "model_length":
 		return errors.New(`chat completions: finish_reason "length": response was truncated by the output token limit`)
 	case string(openai.FinishReasonContentFilter):
 		return errors.New(`chat completions: finish_reason "content_filter": response was stopped by the content filter`)
 	case "":
 		return errors.New("chat completions: stream ended without a finish reason (truncated response)")
 	default:
-		return fmt.Errorf("chat completions: unexpected finish_reason %q; failing closed instead of returning a possibly partial answer", reason)
+		log.Printf("chat completions: unrecognised finish_reason %q; treating the turn as finished", reason)
+		return nil
 	}
 }
 
