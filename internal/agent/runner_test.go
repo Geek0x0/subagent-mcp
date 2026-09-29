@@ -1093,8 +1093,8 @@ func TestRunnerClientErrorPreservesSessionAndUnlocks(t *testing.T) {
 	if _, err := runner.Run(context.Background(), session, "first prompt"); err == nil || err.Error() != "upstream failed" {
 		t.Fatalf("first Run() error = %v", err)
 	}
-	if len(session.messages) != 1 || session.messages[0].Role != provider.RoleUser || session.messages[0].Text != "first prompt" {
-		t.Fatalf("messages after client error = %#v", session.messages)
+	if len(session.messages) != 0 {
+		t.Fatalf("messages after client error = %#v, want the failed prompt dropped", session.messages)
 	}
 	if gotTypes := eventTypes(t, emitter.recordedEvents()); !reflect.DeepEqual(gotTypes, []string{"task_started", "provider_request", "error"}) {
 		t.Fatalf("first run event types = %v", gotTypes)
@@ -1104,9 +1104,223 @@ func TestRunnerClientErrorPreservesSessionAndUnlocks(t *testing.T) {
 	if err != nil || got != "recovered" {
 		t.Fatalf("second Run() = (%q, %v)", got, err)
 	}
-	if len(session.messages) != 3 {
-		t.Fatalf("message count after recovery = %d, want 3", len(session.messages))
+	if len(session.messages) != 2 {
+		t.Fatalf("message count after recovery = %d, want 2 (second prompt and its reply)", len(session.messages))
 	}
+}
+
+// TestRunnerFailedModelCallRestoresHistoryToEntryLength pins that a Run whose
+// first model call fails restores s.messages to exactly its length at entry,
+// so the abandoned prompt is never replayed by a later reply.
+func TestRunnerFailedModelCallRestoresHistoryToEntryLength(t *testing.T) {
+	client := &stubProvider{turns: []stubTurn{
+		{result: &provider.TurnResult{Text: "warmup"}},
+		{err: errors.New("upstream failed")},
+		{result: &provider.TurnResult{Text: "recovered"}},
+	}}
+	session := newTestSession(t, Options{Provider: client})
+	runner := &Runner{Emitter: &recEmitter{}, Approver: &stubApprover{}}
+
+	if got, err := runner.Run(context.Background(), session, "first prompt"); err != nil || got != "warmup" {
+		t.Fatalf("first Run() = (%q, %v), want (warmup, nil)", got, err)
+	}
+	entry := len(session.messages)
+	if entry != 2 {
+		t.Fatalf("history after warmup = %d messages, want 2", entry)
+	}
+
+	if _, err := runner.Run(context.Background(), session, "abandoned prompt"); err == nil || err.Error() != "upstream failed" {
+		t.Fatalf("second Run() error = %v, want upstream failed", err)
+	}
+	if len(session.messages) != entry {
+		t.Fatalf("messages after failed Run = %d, want entry length %d", len(session.messages), entry)
+	}
+
+	got, err := runner.Run(context.Background(), session, "third prompt")
+	if err != nil || got != "recovered" {
+		t.Fatalf("third Run() = (%q, %v), want (recovered, nil)", got, err)
+	}
+	requests := client.recordedRequests()
+	if len(requests) != 3 {
+		t.Fatalf("request count = %d, want 3", len(requests))
+	}
+	var userTexts []string
+	for _, message := range requests[2].Messages {
+		if message.Role == provider.RoleUser {
+			userTexts = append(userTexts, message.Text)
+		}
+	}
+	if want := []string{"first prompt", "third prompt"}; !reflect.DeepEqual(userTexts, want) {
+		t.Fatalf("user messages of the following Run = %q, want %q", userTexts, want)
+	}
+}
+
+// TestRunnerCancelledFirstModelCallRestoresHistory pins the cancellation
+// flavor of the history restore: a prompt whose first model call is
+// cancelled is dropped from s.messages, and a later Run never carries it.
+func TestRunnerCancelledFirstModelCallRestoresHistory(t *testing.T) {
+	block := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	client := &stubProvider{
+		turns: []stubTurn{
+			{result: &provider.TurnResult{Text: "never delivered"}},
+			{result: &provider.TurnResult{Text: "recovered"}},
+		},
+		block:   block,
+		entered: entered,
+	}
+	session := newTestSession(t, Options{Provider: client})
+	runner := &Runner{Emitter: &recEmitter{}, Approver: &stubApprover{}}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := runner.Run(ctx, session, "cancelled prompt")
+		result <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not reach the blocked model call")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Run() error = %v, want context.Canceled", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run() did not return after cancellation")
+	}
+	if len(session.messages) != 0 {
+		t.Fatalf("messages after cancelled first model call = %#v, want none", session.messages)
+	}
+
+	close(block)
+	got, err := runner.Run(context.Background(), session, "next prompt")
+	if err != nil || got != "recovered" {
+		t.Fatalf("following Run() = (%q, %v), want (recovered, nil)", got, err)
+	}
+	requests := client.recordedRequests()
+	if len(requests) != 2 {
+		t.Fatalf("request count = %d, want 2", len(requests))
+	}
+	var userTexts []string
+	for _, message := range requests[1].Messages {
+		if message.Role == provider.RoleUser {
+			userTexts = append(userTexts, message.Text)
+		}
+	}
+	if want := []string{"next prompt"}; !reflect.DeepEqual(userTexts, want) {
+		t.Fatalf("user messages of the following Run = %q, want %q (abandoned prompt replayed)", userTexts, want)
+	}
+}
+
+// TestRunnerCancelStopsRemainingToolBatch pins that cancelling the context
+// while a batched shell call runs stops every remaining call of the batch: no
+// further execution, no approval dialog, an error tool result for each
+// skipped call so the history stays well-formed, and Run returns the context
+// error while executed calls keep their real results.
+func TestRunnerCancelStopsRemainingToolBatch(t *testing.T) {
+	cwd := t.TempDir()
+	shellCall := toolCall("call-shell", "shell", `{"command":"sleep 30"}`)
+	writeCall := toolCall("call-write", "write_file", `{"path":"after_cancel.txt","content":"written after cancel"}`)
+	client := &stubProvider{turns: []stubTurn{
+		{result: &provider.TurnResult{ToolCalls: []provider.ToolCall{shellCall, writeCall}}},
+		{result: &provider.TurnResult{Text: "recovered"}},
+	}}
+	emitter := &recEmitter{}
+	approver := &stubApprover{approved: true}
+	shellStarted := make(chan struct{})
+	var shellStartedOnce sync.Once
+	session := newTestSession(t, Options{
+		Provider: client,
+		Cwd:      cwd,
+		Sandbox:  policy.Sandbox("read-only"),
+		Approval: policy.ApprovalPolicy("on-request"),
+	})
+	runner := &Runner{
+		Emitter: emitterFunc(func(ctx context.Context, threadID string, msg map[string]any) {
+			if msg["type"] == "exec_command_begin" && msg["call_id"] == shellCall.ID {
+				shellStartedOnce.Do(func() { close(shellStarted) })
+			}
+			emitter.Emit(ctx, threadID, msg)
+		}),
+		Approver: approver,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		_, err := runner.Run(ctx, session, "run the batch")
+		result <- err
+	}()
+
+	select {
+	case <-shellStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shell call never started")
+	}
+	// Let bash reach `sleep 30` before cancelling, like a user pressing Esc
+	// while the command runs.
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+
+	var runErr error
+	select {
+	case runErr = <-result:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run() did not return after cancellation")
+	}
+
+	// The canonical repro of the bug: on the unfixed code the write still
+	// happens after the cancellation.
+	if _, err := os.Stat(filepath.Join(cwd, "after_cancel.txt")); !os.IsNotExist(err) {
+		t.Fatalf("write_file executed after cancellation; Stat() error = %v", err)
+	}
+
+	messages := session.messages
+	if len(messages) != 4 {
+		t.Fatalf("message count = %d, want 4 (user, assistant, 2 tool results): %#v", len(messages), messages)
+	}
+	if messages[2].Role != provider.RoleTool || messages[2].ToolCallID != shellCall.ID ||
+		!strings.HasPrefix(messages[2].Text, "exit code: ") || messages[2].Text == "cancelled: not executed" {
+		t.Fatalf("executed shell result = %#v, want its real result", messages[2])
+	}
+	if messages[3].Role != provider.RoleTool || messages[3].ToolCallID != writeCall.ID ||
+		messages[3].Text != "cancelled: not executed" || !messages[3].IsError {
+		t.Fatalf("skipped call result = %#v, want error tool result %q", messages[3], "cancelled: not executed")
+	}
+
+	approvalRequests := approver.recordedRequests()
+	if len(approvalRequests) != 1 {
+		t.Fatalf("approval request count = %d, want 1 (the shell call only, nothing skipped)", len(approvalRequests))
+	}
+	if approvalRequests[0].Tool != "shell" {
+		t.Fatalf("approval request = %#v, want the shell call only", approvalRequests[0])
+	}
+	for _, event := range emitter.recordedEvents() {
+		if event["type"] == "exec_command_begin" && event["call_id"] == writeCall.ID {
+			t.Fatalf("skipped call emitted an exec event: %#v", event)
+		}
+	}
+
+	if !errors.Is(runErr, context.Canceled) {
+		t.Fatalf("Run() error = %v, want context.Canceled", runErr)
+	}
+
+	// A following Run must receive a well-formed history in which every tool
+	// call has exactly one result.
+	if got, err := runner.Run(context.Background(), session, "continue"); err != nil || got != "recovered" {
+		t.Fatalf("following Run() = (%q, %v), want (recovered, nil)", got, err)
+	}
+	requests := client.recordedRequests()
+	if len(requests) != 2 {
+		t.Fatalf("request count = %d, want 2", len(requests))
+	}
+	assertCompleteToolHistory(t, requests[1].Messages)
 }
 
 func TestRunnerEmitsDeltasAndUsageInOrder(t *testing.T) {
