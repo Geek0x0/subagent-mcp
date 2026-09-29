@@ -24,6 +24,8 @@ type FakeResponseItem struct {
 	EncryptedContent string
 	// MessageText is an assistant message with one output_text part.
 	MessageText string
+	// MessageRefusal is an assistant message with one refusal part.
+	MessageRefusal string
 	// FunctionCallID, FunctionName and FunctionArguments form a function_call item.
 	FunctionCallID    string
 	FunctionName      string
@@ -321,7 +323,7 @@ func itemGroupCount(item FakeResponseItem) int {
 	if item.ReasoningSummary != "" || item.EncryptedContent != "" {
 		groups++
 	}
-	if item.MessageText != "" {
+	if item.MessageText != "" || item.MessageRefusal != "" {
 		groups++
 	}
 	if item.FunctionCallID != "" || item.FunctionName != "" || item.FunctionArguments != "" {
@@ -342,17 +344,26 @@ func renderFakeResponseItem(item FakeResponseItem, index int) map[string]any {
 			}},
 			"encrypted_content": item.EncryptedContent,
 		}
-	case item.MessageText != "":
-		return map[string]any{
-			"type":   "message",
-			"id":     fmt.Sprintf("msg_%d", index),
-			"role":   "assistant",
-			"status": "completed",
-			"content": []any{map[string]any{
+	case item.MessageText != "" || item.MessageRefusal != "":
+		content := []any{}
+		if item.MessageText != "" {
+			content = append(content, map[string]any{
 				"type":        "output_text",
 				"text":        item.MessageText,
 				"annotations": []any{},
-			}},
+			})
+		} else {
+			content = append(content, map[string]any{
+				"type":    "refusal",
+				"refusal": item.MessageRefusal,
+			})
+		}
+		return map[string]any{
+			"type":    "message",
+			"id":      fmt.Sprintf("msg_%d", index),
+			"role":    "assistant",
+			"status":  "completed",
+			"content": content,
 		}
 	default:
 		return map[string]any{

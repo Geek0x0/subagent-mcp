@@ -177,8 +177,15 @@ func (a *Adapter) Turn(ctx context.Context, req provider.TurnRequest, onDelta fu
 		switch item.Type {
 		case "message":
 			for _, part := range item.Content {
-				if part.Type == "output_text" {
+				switch part.Type {
+				case "output_text":
 					out.Text += part.Text
+				case "refusal":
+					// A refusal part is a completed response with no text and
+					// no tool calls; returning it as an empty success would
+					// finish the session with no answer. Fail like the
+					// Messages adapter does on a refusal stop reason.
+					return nil, fmt.Errorf("responses: model refused: %s", part.AsRefusal().Refusal)
 				}
 			}
 		case "function_call":

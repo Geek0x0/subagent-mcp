@@ -48,6 +48,15 @@ type FakeMessage struct {
 	CacheReadTokens     int
 	CacheCreationTokens int
 	OutputTokens        int
+	// ThinkingTokens is sent as output_tokens_details.thinking_tokens in the
+	// message_delta usage, the way the API reports reasoning output tokens.
+	ThinkingTokens int
+	// TruncateStream, when "block" or "delta", ends the stream at that point
+	// instead of completing it: "block" cuts after the first block's
+	// content_block_start (before any delta), "delta" cuts after the first
+	// block's deltas — both before content_block_stop, message_delta, and
+	// message_stop, the way a connection reset cuts a stream mid-message.
+	TruncateStream string
 }
 
 // FakeMessages is an httptest server speaking the Anthropic Messages SSE
@@ -74,6 +83,9 @@ func NewFakeMessages(t testing.TB, messages []FakeMessage) *FakeMessages {
 			if groups := blockGroupCount(block); groups != 1 {
 				t.Fatalf("FakeMessage %d block %d: exactly one of thinking, text, or tool use must be set, got %d groups", i, j, groups)
 			}
+		}
+		if message.TruncateStream != "" && message.TruncateStream != "block" && message.TruncateStream != "delta" {
+			t.Fatalf("FakeMessage %d: TruncateStream = %q, want \"block\", \"delta\", or empty", i, message.TruncateStream)
 		}
 	}
 
@@ -249,6 +261,9 @@ func (f *FakeMessages) handleMessages(w http.ResponseWriter, r *http.Request) {
 			}) {
 				return
 			}
+			if scripted.TruncateStream == "block" {
+				return
+			}
 			if block.Thinking != "" && !writeEvent("content_block_delta", map[string]any{
 				"index": index,
 				"delta": map[string]any{"type": "thinking_delta", "thinking": block.Thinking},
@@ -266,6 +281,9 @@ func (f *FakeMessages) handleMessages(w http.ResponseWriter, r *http.Request) {
 				"index":         index,
 				"content_block": map[string]any{"type": "text", "text": ""},
 			}) {
+				return
+			}
+			if scripted.TruncateStream == "block" {
 				return
 			}
 			if !writeEvent("content_block_delta", map[string]any{
@@ -287,6 +305,9 @@ func (f *FakeMessages) handleMessages(w http.ResponseWriter, r *http.Request) {
 			}) {
 				return
 			}
+			if scripted.TruncateStream == "block" {
+				return
+			}
 			chunks := block.ToolInputChunks
 			if len(chunks) == 0 && block.ToolInputJSON != "" {
 				chunks = []string{block.ToolInputJSON}
@@ -299,6 +320,10 @@ func (f *FakeMessages) handleMessages(w http.ResponseWriter, r *http.Request) {
 					return
 				}
 			}
+		}
+
+		if scripted.TruncateStream == "delta" {
+			return
 		}
 
 		if !writeEvent("content_block_stop", map[string]any{"index": index}) {
@@ -328,7 +353,10 @@ func (f *FakeMessages) handleMessages(w http.ResponseWriter, r *http.Request) {
 			"stop_sequence": nil,
 			"stop_details":  stopDetails,
 		},
-		"usage": map[string]any{"output_tokens": scripted.OutputTokens},
+		"usage": map[string]any{
+			"output_tokens":         scripted.OutputTokens,
+			"output_tokens_details": map[string]any{"thinking_tokens": scripted.ThinkingTokens},
+		},
 	}) {
 		return
 	}

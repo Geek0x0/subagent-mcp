@@ -47,7 +47,7 @@ func TestMessagesTextTurnRequestShape(t *testing.T) {
 	if res.Text != "hello" || deltas != "hello" || res.Reasoning != "hmm" {
 		t.Fatalf("res = %#v deltas = %q", res, deltas)
 	}
-	if *res.Usage != (provider.Usage{Input: 10, Cached: 5, Output: 3, Total: 20}) {
+	if *res.Usage != (provider.Usage{Input: 17, Cached: 5, Output: 3, Total: 20}) {
 		t.Fatalf("usage = %#v", res.Usage)
 	}
 	req := fake.Request(0)
@@ -148,6 +148,116 @@ func TestMessagesStopReasons(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Fatalf("stop %q: err = %v, want %q", tc.msg.StopReason, err, tc.want)
 		}
+	}
+}
+
+// An Anthropic reply with content: [] and stop_reason end_turn is a legal final
+// answer but never a legal request message: replaying it would 400 every later
+// turn on the session.
+func TestMessagesEmptyEndTurnIsNeverReplayed(t *testing.T) {
+	fake := testutil.NewFakeMessages(t, []testutil.FakeMessage{
+		{}, // no blocks: content: [], stop_reason end_turn
+		{Blocks: []testutil.FakeBlock{{Text: "second answer"}}},
+	})
+	p := newAdapter(t, fake, 1000)
+	history := []provider.Message{{Role: provider.RoleUser, Text: "first"}}
+	res, err := p.Turn(context.Background(), provider.TurnRequest{Model: "claude-x", Messages: history}, nil)
+	if err != nil {
+		t.Fatalf("empty end_turn must be accepted as a final answer: %v", err)
+	}
+	if res.Text != "" || len(res.ToolCalls) != 0 {
+		t.Fatalf("res = %#v, want an empty answer", res)
+	}
+	history = append(history,
+		provider.Message{Role: provider.RoleAssistant, Text: res.Text, Opaque: res.Opaque},
+		provider.Message{Role: provider.RoleUser, Text: "second"},
+	)
+	res2, err := p.Turn(context.Background(), provider.TurnRequest{Model: "claude-x", Messages: history}, nil)
+	if err != nil {
+		t.Fatalf("second turn must still succeed: %v", err)
+	}
+	if res2.Text != "second answer" {
+		t.Fatalf("second turn text = %q", res2.Text)
+	}
+	messages := fake.Request(1)["messages"].([]any)
+	for i, entry := range messages {
+		message := entry.(map[string]any)
+		if message["role"] != "assistant" {
+			continue
+		}
+		content, _ := message["content"].([]any)
+		if len(content) == 0 {
+			t.Fatalf("request 1 message %d replays an empty assistant message: %#v", i, message)
+		}
+		for _, entry := range content {
+			if block := entry.(map[string]any); block["type"] == "text" && block["text"] == "" {
+				t.Fatalf("request 1 message %d replays an empty text block: %#v", i, block)
+			}
+		}
+	}
+}
+
+func TestMessagesContextWindowExceededFails(t *testing.T) {
+	fake := testutil.NewFakeMessages(t, []testutil.FakeMessage{{
+		StopReason: "model_context_window_exceeded",
+		Blocks:     []testutil.FakeBlock{{Text: "overflow"}},
+	}})
+	p := newAdapter(t, fake, 1000)
+	res, err := p.Turn(context.Background(), provider.TurnRequest{Model: "claude-x", Messages: userOnly()}, nil)
+	if err == nil {
+		var text string
+		if res != nil {
+			text = res.Text
+		}
+		t.Fatalf("model_context_window_exceeded must fail the turn, got err = nil and text %q", text)
+	}
+	if !strings.Contains(err.Error(), "context window") {
+		t.Fatalf("err = %v, want a context-window error", err)
+	}
+}
+
+// A stream cut before message_delta/message_stop leaves StopReason empty and
+// the text block's wire JSON unrefreshed; neither may surface as a success —
+// and above all no empty text block may be stored for replay.
+func TestMessagesTruncatedStreamFails(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cut  string
+	}{
+		{name: "cut after text deltas", cut: "delta"},
+		{name: "cut after block start", cut: "block"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := testutil.NewFakeMessages(t, []testutil.FakeMessage{{
+				Blocks:         []testutil.FakeBlock{{Text: "half an answer"}},
+				TruncateStream: tc.cut,
+			}})
+			p := newAdapter(t, fake, 1000)
+			var deltas string
+			res, err := p.Turn(context.Background(), provider.TurnRequest{Model: "claude-x", Messages: userOnly()},
+				func(d string) { deltas += d })
+			if res != nil && strings.Contains(string(res.Opaque), `"text":""`) {
+				t.Fatalf("replay payload contains an empty text block: %s", res.Opaque)
+			}
+			if err == nil {
+				var text string
+				if res != nil {
+					text = res.Text
+				}
+				t.Fatalf("truncated stream must fail the turn, got err = nil and text %q", text)
+			}
+			if !strings.Contains(err.Error(), "stop signal") {
+				t.Fatalf("err = %v, want a missing-stop-signal error", err)
+			}
+			if tc.cut == "delta" {
+				if !strings.Contains(err.Error(), "half an answer") {
+					t.Fatalf("partial text dropped from the error: %v", err)
+				}
+				if deltas != "half an answer" {
+					t.Fatalf("deltas = %q, want the streamed partial text", deltas)
+				}
+			}
+		})
 	}
 }
 
