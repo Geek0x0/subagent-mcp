@@ -133,50 +133,64 @@ __subagent_mcp_safe_git() {
     status|branch|rev-parse|ls-files|diff|show|log|blame) ;;
     *) command git "$@"; return ;;
     esac
-    local filter_keys filter_status
-    local filter_key
-    local -a filter_overrides=()
-    filter_keys=$(
-        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS= \
-        command git --no-pager -c alias.config= config --name-only --get-regexp \
-            '^filter\..*\.(clean|process|smudge|required)$'
-    )
-    filter_status=$?
-    if ((filter_status > 1)); then
-        return "$filter_status"
+    shift
+    # Overrides travel in GIT_CONFIG_KEY_n/VALUE_n (Git 2.31+), which take a key
+    # verbatim: "-c key=value" splits at the first "=", so a filter or diff driver
+    # whose name contains "=" would slip through. Probe support first; without
+    # it the overrides would be silently ignored.
+    if [[ $(GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=subagent.probe GIT_CONFIG_VALUE_0=ok \
+            command git config --get subagent.probe 2>/dev/null) != ok ]]; then
+        echo "subagent-mcp: git 2.31 or newer is required to run git safely" >&2
+        return 126
     fi
-    if ((filter_status == 0)); then
-        while IFS= read -r filter_key; do
-            if [[ -n $filter_key ]]; then
-                case "$filter_key" in
-                *.required) filter_overrides+=(-c "$filter_key=false") ;;
-                *) filter_overrides+=(-c "$filter_key=") ;;
+    local -a fixed=(
+        "alias.$subcommand=" core.fsmonitor=false core.fsmonitorHookPath= diff.external=
+        core.pager=cat core.sshCommand= credential.helper= core.hooksPath=/dev/null
+        log.showSignature=false status.submoduleSummary=false submodule.recurse=false
+        diff.submodule=short interactive.diffFilter=
+        gpg.program=/bin/false gpg.openpgp.program=/bin/false gpg.x509.program=/bin/false
+        gpg.ssh.program=/bin/false
+    )
+    local -a keys=() vals=()
+    local item drivers driver_status driver_key
+    for item in "${fixed[@]}"; do
+        keys+=("${item%%=*}")
+        vals+=("${item#*=}")
+    done
+    # Every program a filter or diff driver could run, whichever config file
+    # (repository, user, or included) defines it, is emptied.
+    drivers=$(
+        GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS= \
+        command git --no-pager -c alias.config= config --name-only --get-regexp \
+            '^(filter\..*\.(clean|smudge|process|required)|diff\..*\.(textconv|command))$'
+    )
+    driver_status=$?
+    if ((driver_status > 1)); then
+        return "$driver_status"
+    fi
+    if ((driver_status == 0)); then
+        while IFS= read -r driver_key; do
+            if [[ -n $driver_key ]]; then
+                keys+=("$driver_key")
+                case "$driver_key" in
+                *.required) vals+=(false) ;;
+                *) vals+=("") ;;
                 esac
             fi
-        done <<< "$filter_keys"
+        done <<< "$drivers"
     fi
     case "$subcommand" in
-    status|branch|rev-parse|ls-files)
-        shift
-        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS= \
-        GIT_EXTERNAL_DIFF= GIT_PAGER=cat PAGER=cat GIT_SSH= GIT_SSH_COMMAND= GIT_ASKPASS= \
-            command git --no-pager -c "alias.$subcommand=" -c core.fsmonitor=false -c core.fsmonitorHookPath= -c diff.external= -c core.pager=cat \
-            -c core.sshCommand= -c credential.helper= \
-            -c log.showSignature=false -c status.submoduleSummary=false -c submodule.recurse=false \
-            "${filter_overrides[@]}" \
-            "$subcommand" "$@"
-        ;;
-    diff|show|log|blame)
-        shift
-        GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_COUNT=0 GIT_CONFIG_PARAMETERS= \
-        GIT_EXTERNAL_DIFF= GIT_PAGER=cat PAGER=cat GIT_SSH= GIT_SSH_COMMAND= GIT_ASKPASS= \
-            command git --no-pager -c "alias.$subcommand=" -c core.fsmonitor=false -c core.fsmonitorHookPath= -c diff.external= -c core.pager=cat \
-            -c core.sshCommand= -c credential.helper= \
-            -c log.showSignature=false -c diff.submodule=short -c interactive.diffFilter= \
-            -c submodule.recurse=false "${filter_overrides[@]}" \
-            "$subcommand" --no-ext-diff --no-textconv "$@"
-        ;;
+    diff|show|log|blame) set -- --no-ext-diff --no-textconv "$@" ;;
     esac
+    (
+        local i
+        export GIT_CONFIG_COUNT=${#keys[@]} GIT_CONFIG_PARAMETERS= GIT_OPTIONAL_LOCKS=0 \
+            GIT_EXTERNAL_DIFF= GIT_PAGER=cat PAGER=cat GIT_SSH= GIT_SSH_COMMAND= GIT_ASKPASS=
+        for ((i = 0; i < ${#keys[@]}; i++)); do
+            export "GIT_CONFIG_KEY_$i=${keys[i]}" "GIT_CONFIG_VALUE_$i=${vals[i]}"
+        done
+        command git --no-pager "$subcommand" "$@"
+    )
 }
 git() {
     __subagent_mcp_safe_git "$@"
@@ -353,6 +367,11 @@ func ReadFileRange(ctx context.Context, cwd, path string, offset, limit int) (st
 			resultCh <- readResult{err: err}
 			return
 		}
+		if isOwnProcessFile(file) {
+			_ = file.Close()
+			resultCh <- readResult{err: errors.New("refusing to read the subagent-mcp process's own /proc entries")}
+			return
+		}
 		select {
 		case fileCh <- file:
 		case <-readCtx.Done():
@@ -467,6 +486,21 @@ func readFileRange(file *os.File, offset, limit int) (string, error) {
 			return string(out), nil
 		}
 	}
+}
+
+// isOwnProcessFile reports whether the opened file is an entry of this
+// process's /proc directory (environ, mem, cmdline, fd/*, ...). PR_SET_DUMPABLE
+// keeps other processes out, but the server itself can always read them, and
+// read_file runs inside the server. The check is made on the opened descriptor,
+// so /proc/self, /proc/thread-self and symlinks to them are all seen by their
+// real name, with no gap between check and open.
+func isOwnProcessFile(file *os.File) bool {
+	target, err := os.Readlink("/proc/self/fd/" + strconv.Itoa(int(file.Fd())))
+	if err != nil {
+		return false
+	}
+	own := "/proc/" + strconv.Itoa(os.Getpid())
+	return target == own || strings.HasPrefix(target, own+"/")
 }
 
 func isProtectedFile(cwd, path string) bool {

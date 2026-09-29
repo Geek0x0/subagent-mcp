@@ -4,16 +4,22 @@ import "strings"
 
 type shellSegment struct {
 	words []string
+	// expands is set when a word contains an unquoted glob, brace or tilde
+	// expansion: the words bash runs then differ from the words written here.
+	expands bool
 }
 
 // lexShell splits a command into the simple-command segments that the shell
 // will execute. It performs the part of shell lexing that is useful to the
 // allowlist: quote removal, backslash handling, and command separators. It
-// deliberately rejects expansions and redirections rather than attempting to
-// model their runtime effects.
+// deliberately rejects redirections and expansions that run code or rewrite
+// words unpredictably. Pathname, brace and tilde expansion only choose file
+// names, so they are reported per segment (shellSegment.expands) and the caller
+// decides which commands may take them.
 func lexShell(command string) ([]shellSegment, bool) {
 	var segments []shellSegment
 	var segment []string
+	segmentExpands := false
 	var word strings.Builder
 	wordStarted := false
 	tildeEligible := true
@@ -35,8 +41,9 @@ func lexShell(command string) ([]shellSegment, bool) {
 		if len(segment) == 0 {
 			return
 		}
-		segments = append(segments, shellSegment{words: segment})
+		segments = append(segments, shellSegment{words: segment, expands: segmentExpands})
 		segment = nil
+		segmentExpands = false
 	}
 
 	for i := 0; i < len(command); {
@@ -182,16 +189,23 @@ func lexShell(command string) ([]shellSegment, bool) {
 			// Expansion can execute code or change the argv seen by the
 			// command, so it is never safe for an auto-allowed command.
 			return nil, false
-		case '*', '?', '[', '{', '}', '(', ')':
-			// Pathname, brace, and tilde expansion can turn a filename into
-			// an option. Parentheses are shell syntax rather than a word.
+		case '*', '?', '[', '{', '}':
+			// Pathname and brace expansion can turn a filename into an option.
+			word.WriteByte(c)
+			wordStarted = true
+			tildeEligible = false
+			needCommand = false
+			segmentExpands = true
+			i++
+		case '(', ')':
+			// Parentheses are shell syntax rather than a word.
 			return nil, false
 		case '~':
 			// Bash performs tilde expansion only at the beginning of a word
 			// and after an unquoted equals sign. A revision such as HEAD~1
 			// is literal data.
 			if tildeEligible {
-				return nil, false
+				segmentExpands = true
 			}
 			word.WriteByte(c)
 			wordStarted = true

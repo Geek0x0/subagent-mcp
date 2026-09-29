@@ -47,6 +47,15 @@ type Request struct {
 	BoundCwd *sandbox.Directory
 }
 
+// expansionAllowed lists the allowlisted commands that may take unquoted glob,
+// brace and tilde words. They only read the files the expansion names and have
+// no option that runs a program or writes; find, rg, grep and git do, so a
+// file named like one of their options must never be produced by a glob.
+var expansionAllowed = map[string]bool{
+	"ls": true, "cat": true, "head": true, "tail": true, "wc": true,
+	"stat": true, "which": true, "echo": true, "pwd": true,
+}
+
 var simpleAllowed = map[string]bool{
 	"ls":    true,
 	"cat":   true,
@@ -131,6 +140,9 @@ func isWhitelistedShell(command string) bool {
 	}
 	for _, segment := range segments {
 		fields := segment.words
+		if segment.expands && !expansionAllowed[fields[0]] {
+			return false
+		}
 		if simpleAllowed[fields[0]] {
 			if hasDangerousShellFlag(fields) {
 				return false
@@ -214,6 +226,19 @@ func hasDangerousShellFlag(fields []string) bool {
 				}
 			}
 			return false
+		}
+		for _, argument := range fields[2:] {
+			// %G placeholders make log/show run the configured gpg program.
+			if strings.Contains(argument, "%G") {
+				return true
+			}
+		}
+		if fields[1] == "blame" {
+			for _, argument := range fields[2:] {
+				if strings.HasPrefix(argument, "--ext-diff") || strings.HasPrefix(argument, "--textconv") {
+					return true
+				}
+			}
 		}
 		if fields[1] == "diff" || fields[1] == "log" || fields[1] == "show" {
 			for _, argument := range fields[2:] {
