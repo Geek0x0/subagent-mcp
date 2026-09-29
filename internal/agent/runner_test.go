@@ -1300,7 +1300,9 @@ func newTestSession(t *testing.T, options Options) *Session {
 	if options.Approval == "" {
 		options.Approval = policy.ApprovalPolicy("never")
 	}
-	return NewManager().Create(options)
+	manager := NewManager()
+	t.Cleanup(manager.Close)
+	return manager.Create(options)
 }
 
 func toolCall(id, name, arguments string) provider.ToolCall {

@@ -71,6 +71,32 @@ func RunShellSandboxed(
 	return runCommand(ctx, cwd, sandbox.Command(self, writableRoots, shellArgv(command)...), timeout)
 }
 
+// RunShellSandboxedBound gives the helper session-held directory handles. The
+// helper starts in the held cwd and grants writes to the held root inodes.
+func RunShellSandboxedBound(
+	ctx context.Context,
+	command string,
+	timeout time.Duration,
+	cwd *sandbox.Directory,
+	writableRoots []*sandbox.Directory,
+) (out string, exitCode int, err error) {
+	if cwd == nil {
+		return "", -1, errors.New("sandbox working directory is not bound")
+	}
+	self, err := os.Executable()
+	if err != nil {
+		return "", -1, fmt.Errorf("locate sandbox helper: %w", err)
+	}
+	files := []*os.File{cwd.File()}
+	rootFDs := make([]int, 0, len(writableRoots))
+	for _, root := range writableRoots {
+		files = append(files, root.File())
+		rootFDs = append(rootFDs, len(files)+2) // ExtraFiles starts at fd 3.
+	}
+	argv := sandbox.CommandFD(self, 3, rootFDs, shellArgv(command)...)
+	return runCommandWithFiles(ctx, "/", argv, timeout, files)
+}
+
 // shellScript removes variables after bash has loaded the user's login profile,
 // then evaluates the caller's command with the profile's other environment
 // changes intact. It also removes profile aliases/functions that could replace
@@ -179,6 +205,10 @@ func shellArgv(command string) []string {
 }
 
 func runCommand(ctx context.Context, cwd string, argv []string, timeout time.Duration) (out string, exitCode int, err error) {
+	return runCommandWithFiles(ctx, cwd, argv, timeout, nil)
+}
+
+func runCommandWithFiles(ctx context.Context, cwd string, argv []string, timeout time.Duration, files []*os.File) (out string, exitCode int, err error) {
 	if timeout <= 0 {
 		timeout = DefaultShellTimeout
 	} else if timeout > MaxShellTimeout {
@@ -191,6 +221,7 @@ func runCommand(ctx context.Context, cwd string, argv []string, timeout time.Dur
 	var buf limitedBuffer
 	cmd := exec.CommandContext(runCtx, argv[0], argv[1:]...)
 	cmd.Dir = cwd
+	cmd.ExtraFiles = files
 	cmd.Env = ScrubbedEnv()
 	// ponytail: Linux process-group signaling kills ordinary descendants, and WaitDelay bounds
 	// inherited-pipe waits. A descendant that escapes the group can survive without being reported.

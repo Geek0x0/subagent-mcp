@@ -1,10 +1,13 @@
 package policy
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Geek0x0/subagent-mcp/internal/sandbox"
 )
 
 // Sandbox controls which operations can run without leaving the configured sandbox.
@@ -37,10 +40,11 @@ const (
 
 // Request describes an operation to evaluate.
 type Request struct {
-	Tool    string
-	Command string
-	Path    string
-	Cwd     string
+	Tool     string
+	Command  string
+	Path     string
+	Cwd      string
+	BoundCwd *sandbox.Directory
 }
 
 var simpleAllowed = map[string]bool{
@@ -225,21 +229,46 @@ func hasDangerousShellFlag(fields []string) bool {
 	return false
 }
 
-func pathInside(cwd, target string) (bool, string) {
+func pathInside(cwd, target string, bound ...*sandbox.Directory) (bool, string) {
+	_, reason := insideRelative(cwd, target, bound...)
+	return reason == "", reason
+}
+
+// BoundPath resolves a checked target beneath the session's held cwd inode.
+func BoundPath(cwd, target string, bound *sandbox.Directory) (string, error) {
+	if bound == nil {
+		return "", errors.New("working directory is not bound")
+	}
+	relative, reason := insideRelative(cwd, target, bound)
+	if reason != "" {
+		return "", errors.New(reason)
+	}
+	return filepath.Join(bound.Path(), relative), nil
+}
+
+func insideRelative(cwd, target string, bound ...*sandbox.Directory) (string, string) {
 	for _, component := range strings.Split(filepath.ToSlash(target), "/") {
 		if component == ".." {
 			// ponytail: Rejecting every parent-directory component is conservative; resolving each component with Lstat would permit legitimate uses without reopening symlink escapes.
-			return false, fmt.Sprintf("target %q contains a parent-directory component", target)
+			return "", fmt.Sprintf("target %q contains a parent-directory component", target)
 		}
 	}
 
 	cwdAbsolute, err := filepath.Abs(cwd)
 	if err != nil {
-		return false, fmt.Sprintf("resolve working directory %q: %v", cwd, err)
+		return "", fmt.Sprintf("resolve working directory %q: %v", cwd, err)
 	}
-	resolvedCwd, err := filepath.EvalSymlinks(cwdAbsolute)
-	if err != nil {
-		return false, fmt.Sprintf("resolve working directory %q: %v", cwd, err)
+	var resolvedCwd string
+	if len(bound) > 0 && bound[0] != nil {
+		if err := bound[0].Check(); err != nil {
+			return "", err.Error()
+		}
+		resolvedCwd = bound[0].ResolvedPath()
+	} else {
+		resolvedCwd, err = filepath.EvalSymlinks(cwdAbsolute)
+		if err != nil {
+			return "", fmt.Sprintf("resolve working directory %q: %v", cwd, err)
+		}
 	}
 
 	if !filepath.IsAbs(target) {
@@ -247,7 +276,7 @@ func pathInside(cwd, target string) (bool, string) {
 	}
 	target, err = filepath.Abs(filepath.Clean(target))
 	if err != nil {
-		return false, fmt.Sprintf("resolve target path %q: %v", target, err)
+		return "", fmt.Sprintf("resolve target path %q: %v", target, err)
 	}
 
 	ancestor := target
@@ -258,12 +287,12 @@ func pathInside(cwd, target string) (bool, string) {
 			break
 		}
 		if !os.IsNotExist(statErr) {
-			return false, fmt.Sprintf("inspect target ancestor %q: %v", ancestor, statErr)
+			return "", fmt.Sprintf("inspect target ancestor %q: %v", ancestor, statErr)
 		}
 
 		parent := filepath.Dir(ancestor)
 		if parent == ancestor {
-			return false, fmt.Sprintf("no existing ancestor for target %q", target)
+			return "", fmt.Sprintf("no existing ancestor for target %q", target)
 		}
 		missingParts = append(missingParts, filepath.Base(ancestor))
 		ancestor = parent
@@ -271,7 +300,7 @@ func pathInside(cwd, target string) (bool, string) {
 
 	resolvedAncestor, err := filepath.EvalSymlinks(ancestor)
 	if err != nil {
-		return false, fmt.Sprintf("resolve target ancestor %q: %v", ancestor, err)
+		return "", fmt.Sprintf("resolve target ancestor %q: %v", ancestor, err)
 	}
 	resolvedTarget := resolvedAncestor
 	for i := len(missingParts) - 1; i >= 0; i-- {
@@ -280,13 +309,17 @@ func pathInside(cwd, target string) (bool, string) {
 
 	relative, err := filepath.Rel(resolvedCwd, resolvedTarget)
 	if err != nil {
-		return false, fmt.Sprintf("compare target %q with working directory %q: %v", resolvedTarget, resolvedCwd, err)
+		return "", fmt.Sprintf("compare target %q with working directory %q: %v", resolvedTarget, resolvedCwd, err)
 	}
 	if relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return false, fmt.Sprintf("target %q resolves outside working directory %q", target, resolvedCwd)
+		return "", fmt.Sprintf("target %q resolves outside working directory %q", target, resolvedCwd)
 	}
-
-	return true, ""
+	if len(bound) > 0 && bound[0] != nil {
+		if err := bound[0].Check(); err != nil {
+			return "", err.Error()
+		}
+	}
+	return relative, ""
 }
 
 func withinSandbox(sb Sandbox, req Request) (bool, string) {
@@ -301,7 +334,7 @@ func withinSandbox(sb Sandbox, req Request) (bool, string) {
 		case "read_file", "shell":
 			return true, ""
 		case "write_file":
-			return pathInside(req.Cwd, req.Path)
+			return pathInside(req.Cwd, req.Path, req.BoundCwd)
 		default:
 			return false, fmt.Sprintf("tool %q is not permitted by the workspace-write sandbox", req.Tool)
 		}

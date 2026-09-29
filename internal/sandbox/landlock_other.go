@@ -10,7 +10,7 @@ var errUnsupported = errors.New("landlock unavailable: kernel sandbox requires L
 func Available() error { return errUnsupported }
 
 func run(args []string) error {
-	if _, _, err := parseArgs(args); err != nil {
+	if _, err := parseArgs(args); err != nil {
 		return err
 	}
 	return errUnsupported

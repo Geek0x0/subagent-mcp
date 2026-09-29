@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"syscall"
 
 	"github.com/landlock-lsm/go-landlock/landlock"
@@ -22,14 +23,23 @@ func Available() error {
 
 // run restricts the current process and execs argv; it only returns on failure.
 func run(args []string) error {
-	roots, argv, err := parseArgs(args)
+	parsed, err := parseArgs(args)
 	if err != nil {
 		return err
+	}
+	if parsed.cwdFD >= 0 {
+		if err := syscall.Fchdir(parsed.cwdFD); err != nil {
+			return fmt.Errorf("sandbox helper: enter bound cwd: %w", err)
+		}
 	}
 	// BestEffort silently becomes a no-op on kernels without Landlock, so require ABI >= 1 first.
 	abi, err := llsyscall.LandlockGetABIVersion()
 	if err != nil {
 		return fmt.Errorf("landlock unavailable: %w", err)
+	}
+	roots := append([]string(nil), parsed.roots...)
+	for _, fd := range parsed.rootFDs {
+		roots = append(roots, filepath.Join("/proc/self/fd", fmt.Sprint(fd)))
 	}
 	writable := landlock.RWDirs(roots...)
 	// "refer" permits rename/link between directories inside the roots. ABI v1 cannot grant it,
@@ -44,9 +54,15 @@ func run(args []string) error {
 	); err != nil {
 		return fmt.Errorf("landlock unavailable: %w", err)
 	}
-	path, err := exec.LookPath(argv[0])
+	path, err := exec.LookPath(parsed.argv[0])
 	if err != nil {
 		return err
 	}
-	return syscall.Exec(path, argv, os.Environ())
+	for _, fd := range parsed.rootFDs {
+		_ = syscall.Close(fd)
+	}
+	if parsed.cwdFD >= 0 {
+		_ = syscall.Close(parsed.cwdFD)
+	}
+	return syscall.Exec(path, parsed.argv, os.Environ())
 }

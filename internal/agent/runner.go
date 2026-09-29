@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -231,8 +232,19 @@ func (r *Runner) execToolCall(ctx context.Context, s *Session, toolCall provider
 	default:
 		return "unknown tool: " + toolCall.Name, true
 	}
+	if s.sandbox == policy.Sandbox("workspace-write") && (toolCall.Name == "write_file" || toolCall.Name == "apply_patch") {
+		if s.bindErr != nil {
+			return "error: " + s.bindErr.Error(), true
+		}
+		if s.boundCwd == nil {
+			return "error: working directory is not bound", true
+		}
+		if err := s.boundCwd.Check(); err != nil {
+			return "error: " + err.Error(), true
+		}
+	}
 
-	requests := []policy.Request{{Tool: toolCall.Name, Command: args.Command, Path: args.Path, Cwd: s.cwd}}
+	requests := []policy.Request{{Tool: toolCall.Name, Command: args.Command, Path: args.Path, Cwd: s.cwd, BoundCwd: s.boundCwd}}
 	var hunks []patch.Hunk
 	var paths []string
 	if toolCall.Name == "apply_patch" {
@@ -244,7 +256,7 @@ func (r *Runner) execToolCall(ctx context.Context, s *Session, toolCall provider
 		paths = patch.Paths(hunks)
 		requests = requests[:0]
 		for _, path := range paths {
-			requests = append(requests, policy.Request{Tool: "write_file", Path: path, Cwd: s.cwd})
+			requests = append(requests, policy.Request{Tool: "write_file", Path: path, Cwd: s.cwd, BoundCwd: s.boundCwd})
 		}
 	}
 	approved, denial := r.authorize(ctx, s, toolCall.Name, args.Command, args.Justification, requests)
@@ -283,8 +295,12 @@ func (r *Runner) execToolCall(ctx context.Context, s *Session, toolCall provider
 		var out string
 		var code int
 		var err error
-		if roots, sandboxed := s.shellWritableRoots(); sandboxed && !approved {
-			out, code, err = tools.RunShellSandboxed(ctx, s.cwd, args.Command, timeout, roots)
+		if _, sandboxed := s.shellWritableRoots(); sandboxed && !approved {
+			if s.bindErr != nil {
+				err, code = s.bindErr, -1
+			} else {
+				out, code, err = tools.RunShellSandboxedBound(ctx, args.Command, timeout, s.boundCwd, s.boundRoots)
+			}
 		} else {
 			// ponytail: A human-approved command runs without the kernel sandbox, matching Codex escalation.
 			out, code, err = tools.RunShell(ctx, s.cwd, args.Command, timeout)
@@ -308,7 +324,16 @@ func (r *Runner) execToolCall(ctx context.Context, s *Session, toolCall provider
 		return content, false
 
 	case "write_file":
-		err := tools.WriteFile(s.cwd, args.Path, args.Content)
+		path := args.Path
+		if s.sandbox == policy.Sandbox("workspace-write") && !approved {
+			var err error
+			path, err = policy.BoundPath(s.cwd, args.Path, s.boundCwd)
+			if err != nil {
+				toolErr = err
+				return "error: " + err.Error(), true
+			}
+		}
+		err := tools.WriteFile(s.cwd, path, args.Content)
 		toolErr = err
 
 		if err != nil {
@@ -317,7 +342,22 @@ func (r *Runner) execToolCall(ctx context.Context, s *Session, toolCall provider
 		return fmt.Sprintf("wrote %d bytes to %s", len(args.Content), args.Path), false
 
 	case "apply_patch":
-		changes, err := patch.Plan(s.cwd, hunks)
+		planned := hunks
+		if s.sandbox == policy.Sandbox("workspace-write") && !approved {
+			planned = append([]patch.Hunk(nil), hunks...)
+			for i := range planned {
+				var err error
+				planned[i].Path, err = policy.BoundPath(s.cwd, hunks[i].Path, s.boundCwd)
+				if err == nil && hunks[i].MoveTo != "" {
+					planned[i].MoveTo, err = policy.BoundPath(s.cwd, hunks[i].MoveTo, s.boundCwd)
+				}
+				if err != nil {
+					toolErr = err
+					return "error: " + err.Error(), true
+				}
+			}
+		}
+		changes, err := patch.Plan(s.cwd, planned)
 		if err == nil {
 			err = patch.Commit(changes)
 		}
@@ -327,12 +367,27 @@ func (r *Runner) execToolCall(ctx context.Context, s *Session, toolCall provider
 			recordPatchApplied(s, toolCall.ID, nil, result, err)
 			return result, true
 		}
+		if planned != nil && len(planned) > 0 && s.sandbox == policy.Sandbox("workspace-write") && !approved {
+			for i := range changes {
+				changes[i].Path = displayPath(s.cwd, hunks[i].Path)
+				if hunks[i].MoveTo != "" {
+					changes[i].MoveTo = displayPath(s.cwd, hunks[i].MoveTo)
+				}
+			}
+		}
 		result := patch.Summary(changes)
 		recordPatchApplied(s, toolCall.ID, changes, result, nil)
 		return result, false
 	}
 
 	return "unknown tool: " + toolCall.Name, true
+}
+
+func displayPath(cwd, path string) string {
+	if filepath.IsAbs(path) {
+		return filepath.Clean(path)
+	}
+	return filepath.Join(cwd, path)
 }
 
 // truncateArguments returns raw limited to max bytes on a UTF-8 boundary,

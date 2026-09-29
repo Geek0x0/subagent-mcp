@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"sort"
 	"sync"
@@ -9,6 +11,7 @@ import (
 	"github.com/Geek0x0/subagent-mcp/internal/policy"
 	"github.com/Geek0x0/subagent-mcp/internal/provider"
 	"github.com/Geek0x0/subagent-mcp/internal/rollout"
+	"github.com/Geek0x0/subagent-mcp/internal/sandbox"
 
 	"github.com/google/uuid"
 )
@@ -48,6 +51,7 @@ type Session struct {
 
 	provider        provider.Provider
 	thread          provider.Thread
+	threadClosed    bool
 	model           string
 	reasoningEffort string
 	effortSent      string
@@ -57,6 +61,10 @@ type Session struct {
 	approval        policy.ApprovalPolicy
 	maxTurns        int
 	writableRoots   []string
+	rootPaths       []string
+	boundCwd        *sandbox.Directory
+	boundRoots      []*sandbox.Directory
+	bindErr         error
 	messages        []provider.Message
 	rollout         *rollout.Recorder
 	turnID          string
@@ -107,6 +115,7 @@ func (m *Manager) Create(o Options) *Session {
 		writableRoots:   append([]string(nil), o.WritableRoots...),
 		lastUsed:        m.now(),
 	}
+	session.bindDirectories()
 
 	m.mu.Lock()
 	evicted := m.evictLocked()
@@ -121,6 +130,105 @@ func (m *Manager) Create(o Options) *Session {
 	return session
 }
 
+func (s *Session) bindDirectories() {
+	if s.thread != nil || s.cwd == "" {
+		return
+	}
+	var err error
+	s.boundCwd, err = sandbox.BindDirectory(s.cwd)
+	if err != nil {
+		s.bindErr = fmt.Errorf("bind working directory %q: %w", s.cwd, err)
+		return
+	}
+	if s.sandbox != policy.Sandbox("workspace-write") {
+		return
+	}
+	paths := []string{s.cwd, "/tmp"}
+	if tmp := os.Getenv("TMPDIR"); tmp != "" {
+		if info, statErr := os.Stat(tmp); statErr == nil && info.IsDir() {
+			paths = append(paths, tmp)
+		}
+	}
+	paths = append(paths, s.writableRoots...)
+	for _, path := range paths {
+		dir := s.boundCwd
+		if path != s.cwd {
+			dir, err = sandbox.BindDirectory(path)
+			if err != nil {
+				s.bindErr = fmt.Errorf("bind writable root %q: %w", path, err)
+				s.closeDirectories()
+				return
+			}
+		}
+		info, err := dir.File().Stat()
+		if err != nil {
+			if dir != s.boundCwd {
+				_ = dir.Close()
+			}
+			s.bindErr = fmt.Errorf("inspect writable root %q: %w", path, err)
+			s.closeDirectories()
+			return
+		}
+		duplicate := false
+		for _, existing := range s.boundRoots {
+			boundInfo, err := existing.File().Stat()
+			if err == nil && os.SameFile(info, boundInfo) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			if dir != s.boundCwd {
+				_ = dir.Close()
+			}
+			continue
+		}
+		s.boundRoots = append(s.boundRoots, dir)
+		s.rootPaths = append(s.rootPaths, path)
+	}
+}
+
+// closeDirectories is called only while the session is unused or s.mu is held.
+func (s *Session) closeDirectories() {
+	for _, dir := range s.boundRoots {
+		if dir != s.boundCwd {
+			_ = dir.Close()
+		}
+	}
+	if s.boundCwd != nil {
+		_ = s.boundCwd.Close()
+	}
+	s.boundCwd = nil
+	s.boundRoots = nil
+}
+
+// Close releases the session's bound directories and provider thread.
+func (s *Session) Close() {
+	s.mu.Lock()
+	s.closeDirectories()
+	s.bindErr = errors.New("session is closed")
+	var thread provider.Thread
+	if s.thread != nil && !s.threadClosed {
+		s.threadClosed = true
+		thread = s.thread
+	}
+	s.mu.Unlock()
+	if thread != nil {
+		thread.Close()
+	}
+}
+
+// Close releases every session retained by the manager.
+func (m *Manager) Close() {
+	m.mu.Lock()
+	sessions := m.sessions
+	m.sessions = make(map[string]*Session)
+	m.mu.Unlock()
+	for _, session := range sessions {
+		session.Close()
+	}
+}
+
 // evictLocked drops idle sessions that have been unused for longer than
 // sessionIdleTTL, then trims the map to leave room for one new session.
 // m.mu must be held. Sessions whose mu is held are busy and never evicted.
@@ -132,14 +240,16 @@ func (m *Manager) evictLocked() []provider.Thread {
 		if !existing.mu.TryLock() {
 			continue
 		}
-		lastUsed := existing.lastUsed
-		existing.mu.Unlock()
-		if now.Sub(lastUsed) > sessionIdleTTL {
+		if now.Sub(existing.lastUsed) > sessionIdleTTL {
 			delete(m.sessions, id)
-			if existing.thread != nil {
+			existing.closeDirectories()
+			existing.bindErr = errors.New("session was evicted")
+			if existing.thread != nil && !existing.threadClosed {
+				existing.threadClosed = true
 				evicted = append(evicted, existing.thread)
 			}
 		}
+		existing.mu.Unlock()
 	}
 
 	if len(m.sessions) < maxSessions {
@@ -170,7 +280,10 @@ func (m *Manager) evictLocked() []provider.Thread {
 			continue
 		}
 		delete(m.sessions, candidate.id)
-		if existing.thread != nil {
+		existing.closeDirectories()
+		existing.bindErr = errors.New("session was evicted")
+		if existing.thread != nil && !existing.threadClosed {
+			existing.threadClosed = true
 			evicted = append(evicted, existing.thread)
 		}
 		existing.mu.Unlock()
@@ -205,13 +318,7 @@ func (s *Session) shellWritableRoots() ([]string, bool) {
 	case policy.Sandbox("read-only"):
 		return []string{}, true
 	case policy.Sandbox("workspace-write"):
-		roots := []string{s.cwd, "/tmp"}
-		if tmp := os.Getenv("TMPDIR"); tmp != "" && tmp != "/tmp" {
-			if info, err := os.Stat(tmp); err == nil && info.IsDir() {
-				roots = append(roots, tmp)
-			}
-		}
-		return append(roots, s.writableRoots...), true
+		return append([]string(nil), s.rootPaths...), true
 	default:
 		return nil, false
 	}

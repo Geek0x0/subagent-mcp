@@ -6,6 +6,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -23,6 +24,14 @@ func TestCommand(t *testing.T) {
 	}
 }
 
+func TestCommandFD(t *testing.T) {
+	got := CommandFD("/bin/subagent-mcp", 3, []int{4, 5}, "bash", "-c", "pwd")
+	want := []string{"/bin/subagent-mcp", HelperArg, "--cwd-fd", "3", "--rw-fd", "4", "--rw-fd", "5", "--", "bash", "-c", "pwd"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("CommandFD() = %v, want %v", got, want)
+	}
+}
+
 func TestParseArgsErrors(t *testing.T) {
 	for _, args := range [][]string{
 		{},
@@ -31,7 +40,41 @@ func TestParseArgsErrors(t *testing.T) {
 		{"--"},
 		{"--bogus", "--", "true"},
 	} {
-		if _, _, err := parseArgs(args); err == nil {
+		if _, err := parseArgs(args); err == nil {
+			t.Errorf("parseArgs(%q) error = nil, want error", args)
+		}
+	}
+}
+
+func TestParseArgsFDs(t *testing.T) {
+	dir, err := os.Open(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dir.Close()
+	file, err := os.CreateTemp(t.TempDir(), "file-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	dirFD := strconv.Itoa(int(dir.Fd()))
+	fileFD := strconv.Itoa(int(file.Fd()))
+	parsed, err := parseArgs([]string{"--cwd-fd", dirFD, "--rw-fd", dirFD, "--rw", "/path", "--", "true"})
+	if err != nil {
+		t.Fatalf("parseArgs(valid fds): %v", err)
+	}
+	if parsed.cwdFD != int(dir.Fd()) || !reflect.DeepEqual(parsed.rootFDs, []int{int(dir.Fd())}) ||
+		!reflect.DeepEqual(parsed.roots, []string{"/path"}) || !reflect.DeepEqual(parsed.argv, []string{"true"}) {
+		t.Fatalf("parseArgs(valid fds) = %+v", parsed)
+	}
+	for _, args := range [][]string{
+		{"--rw-fd", "999999", "--", "true"},
+		{"--cwd-fd", fileFD, "--", "true"},
+		{"--rw-fd", fileFD, "--", "true"},
+		{"--cwd-fd", "bad", "--", "true"},
+		{"--cwd-fd", dirFD, "--cwd-fd", dirFD, "--", "true"},
+	} {
+		if _, err := parseArgs(args); err == nil {
 			t.Errorf("parseArgs(%q) error = nil, want error", args)
 		}
 	}
