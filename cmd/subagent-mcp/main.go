@@ -16,7 +16,7 @@ import (
 	"github.com/Geek0x0/subagent-mcp/internal/tools"
 )
 
-const version = "0.10.0"
+const version = "0.10.1"
 
 var disableProcessDumpingFn = disableProcessDumping
 
