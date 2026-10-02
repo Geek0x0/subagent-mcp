@@ -1753,3 +1753,19 @@ func TestRunnerShellSandboxing(t *testing.T) {
 		}
 	})
 }
+
+// A reply without a tool call ends the run, so a model that narrates its next
+// step and stops (seen with small OpenAI-compatible models) returns early. The
+// default prompt must tell the model that, and what the final reply is for.
+func TestDefaultSystemPromptWarnsThatATextOnlyReplyEndsTheRun(t *testing.T) {
+	for _, want := range []string{
+		"ends your run",
+		"never reply with only a plan or a note about your next step",
+		"make the tool call in the same reply",
+		"Only when the task is completely done, reply WITHOUT any tool call",
+	} {
+		if !strings.Contains(DefaultSystemPrompt, want) {
+			t.Errorf("DefaultSystemPrompt does not contain %q", want)
+		}
+	}
+}
