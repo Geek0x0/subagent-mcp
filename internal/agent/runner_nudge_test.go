@@ -155,9 +155,12 @@ func TestNudgeRepeatsOnEmptyReplies(t *testing.T) {
 	if len(client.requests) != 6 {
 		t.Fatalf("model calls = %d, want 6", len(client.requests))
 	}
+	if role, got := lastRoleText(client.requests[1]); role != provider.RoleUser || got != continuePrompt {
+		t.Fatalf("request after narration ends with %v %q, want the plain continue prompt", role, got)
+	}
 	for _, i := range []int{2, 3} {
-		if role, got := lastRoleText(client.requests[i]); role != provider.RoleUser || got != continuePrompt {
-			t.Fatalf("request %d ends with %v %q, want the continue prompt again", i, role, got)
+		if role, got := lastRoleText(client.requests[i]); role != provider.RoleUser || got != continueAfterEmptyPrompt {
+			t.Fatalf("request %d ends with %v %q, want the empty-reply prompt", i, role, got)
 		}
 	}
 }

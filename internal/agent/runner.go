@@ -33,6 +33,16 @@ const continuePrompt = "You replied without a tool call, which ends the run. " +
 	"If any work remains, continue now by making the tool call. " +
 	"If the task is completely done, repeat your final summary."
 
+// continueAfterEmptyPrompt answers a reply with no text and no tool call. An
+// API can drop a tool call it fails to stream (the reply then arrives empty
+// although the model produced tokens), and asking for the same call again tends
+// to lose it the same way, so the prompt asks for a smaller or different one.
+const continueAfterEmptyPrompt = "Your last reply was empty: it had no text and no tool call, " +
+	"so any tool call you made may not have been delivered. " +
+	"If work remains, make the next tool call now, and keep it small and simple " +
+	"(for example split a large file write into several smaller calls). " +
+	"If the task is completely done, reply with your final summary."
+
 type Emitter interface {
 	Emit(ctx context.Context, threadID string, msg map[string]any)
 }
@@ -238,8 +248,12 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 				nudges++
 				nudgedSinceTool = true
 				assistantAppended = true
-				s.messages = append(s.messages, provider.Message{Role: provider.RoleUser, Text: continuePrompt})
-				r.Emitter.Emit(ctx, s.ID, map[string]any{"type": "agent_nudge", "message": continuePrompt})
+				prompt := continuePrompt
+				if res.Text == "" {
+					prompt = continueAfterEmptyPrompt
+				}
+				s.messages = append(s.messages, provider.Message{Role: provider.RoleUser, Text: prompt})
+				r.Emitter.Emit(ctx, s.ID, map[string]any{"type": "agent_nudge", "message": prompt})
 				continue
 			}
 			text := res.Text
