@@ -229,10 +229,12 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 			if res.Text != "" {
 				lastText = res.Text
 			}
-			if nudges < s.maxNudges && !nudgedSinceTool {
+			if nudges < s.maxNudges && (!nudgedSinceTool || res.Text == "") {
 				// Ask once per stretch without tool calls: a model that was
 				// really finished repeats its summary, and that second reply
-				// is accepted as final.
+				// is accepted as final. An empty reply is never a final answer
+				// (some models end a turn with only hidden reasoning), so it is
+				// asked again while the budget lasts.
 				nudges++
 				nudgedSinceTool = true
 				assistantAppended = true

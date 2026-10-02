@@ -85,12 +85,12 @@ func TestNudgeBudgetIsPerRun(t *testing.T) {
 // An empty reply is nudged too, is not replayed as an empty assistant message,
 // and an earlier non-empty text is returned if the model then stays silent.
 func TestNudgeHandlesEmptyReplies(t *testing.T) {
-	text, err, client, session := runNudge(t, 2,
+	text, err, client, session := runNudge(t, 1,
 		textTurn("Summary of the work."),
 		textTurn(""),
 	)
 	if err != nil || text != "Summary of the work." {
-		t.Fatalf("Run() = (%q, %v), want the earlier summary", text, err)
+		t.Fatalf("Run() = (%q, %v), want the earlier summary once the budget is spent", text, err)
 	}
 	for _, message := range session.messages {
 		if message.Role == provider.RoleAssistant && message.Text == "" && len(message.ToolCalls) == 0 {
@@ -134,5 +134,30 @@ func TestNudgeEmitsAnEvent(t *testing.T) {
 	emitter.mu.Unlock()
 	if nudges != 1 {
 		t.Fatalf("agent_nudge events = %d, want 1", nudges)
+	}
+}
+
+// A model that answers the continue prompt with nothing at all (only hidden
+// reasoning, say) is asked again while the budget lasts, and the run goes on
+// once it makes a tool call.
+func TestNudgeRepeatsOnEmptyReplies(t *testing.T) {
+	text, err, client, _ := runNudge(t, 4,
+		textTurn("Step 2: write the failing test first."),
+		textTurn(""),
+		textTurn(""),
+		toolTurn("c1"),
+		textTurn("Finished."),
+		textTurn("Finished."),
+	)
+	if err != nil || text != "Finished." {
+		t.Fatalf("Run() = (%q, %v), want the final summary", text, err)
+	}
+	if len(client.requests) != 6 {
+		t.Fatalf("model calls = %d, want 6", len(client.requests))
+	}
+	for _, i := range []int{2, 3} {
+		if role, got := lastRoleText(client.requests[i]); role != provider.RoleUser || got != continuePrompt {
+			t.Fatalf("request %d ends with %v %q, want the continue prompt again", i, role, got)
+		}
 	}
 }
