@@ -21,6 +21,8 @@ type TurnResult struct {
 	Reasoning string
 	ToolCalls []openai.ToolCall
 	Usage     *openai.Usage
+	// Upstream is the channel the gateway routed the call to, when it says.
+	Upstream string
 }
 
 type Client struct {
@@ -29,7 +31,12 @@ type Client struct {
 }
 
 // NewClient builds a low-level Chat Completions client.
-func NewClient(apiKey, baseURL string) *Client {
+func NewClient(apiKey, baseURL string) *Client { return NewClientWithBody(apiKey, baseURL, nil) }
+
+// NewClientWithBody is NewClient that also merges extraBody (fields the SDK
+// request type has no place for, such as a gateway's upstream-routing
+// preferences) into every request body.
+func NewClientWithBody(apiKey, baseURL string, extraBody map[string]any) *Client {
 	cfg := openai.DefaultConfig(apiKey)
 	cfg.BaseURL = baseURL
 	// go-openai's DefaultConfig gives every client an &http.Client{} whose
@@ -38,7 +45,7 @@ func NewClient(apiKey, baseURL string) *Client {
 	// instead: sessions against one endpoint reuse its connections without
 	// coupling the endpoint (or other endpoints) to the process-wide default.
 	// The client itself stays per adapter, carrying this session's key.
-	cfg.HTTPClient = provider.PooledClient(provider.KindChatCompletions, baseURL, 0)
+	cfg.HTTPClient = provider.PooledClientWithBody(provider.KindChatCompletions, baseURL, 0, extraBody)
 
 	return &Client{
 		oai:     openai.NewClientWithConfig(cfg),
@@ -58,6 +65,7 @@ func (c *Client) ChatTurn(
 	streamRequest := req
 	streamRequest.Stream = true
 	streamRequest.StreamOptions = &openai.StreamOptions{IncludeUsage: true}
+	ctx, upstream := provider.WithUpstreamRecorder(ctx)
 
 	// ponytail: Retries cover stream setup only. A mid-stream receive error fails
 	// the turn; callers can issue a fresh turn, while resumption would require
@@ -127,6 +135,7 @@ func (c *Client) ChatTurn(
 		Reasoning: reasoning.String(),
 		ToolCalls: toolCalls,
 		Usage:     usage,
+		Upstream:  upstream(),
 	}, nil
 }
 

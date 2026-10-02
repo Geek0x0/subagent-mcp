@@ -97,7 +97,21 @@ models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
 | `models` | provider | yes | Non-empty list of `{ id, description? }` tables; ids must be unique and are advertised in config order. |
 | `effort_map` | provider | no | Maps a caller effort value to the value sent to the API: `effort_map[value]` if present, else the caller's value. Keys and values must be in the effort set below. |
 | `max_output_tokens` | provider | no | Positive integer; defaults to `64000` for every api but is only sent by `messages` as `max_tokens`. |
+| `extra_body` | provider | no | Table merged into the JSON body of every `chat-completions` request, for fields the SDK has no place for. Its main use is choosing the upstream behind an OpenRouter-style gateway, for example `[providers.x.extra_body.provider]` with `ignore = ["relace"]` or `only = ["streamlake"]`. Rejected for other `api` values; `model`, `messages`, `stream`, `stream_options`, `tools` and `tool_choice` cannot be set. See [Choosing the upstream behind a gateway](#choosing-the-upstream-behind-a-gateway). |
 | `max_nudges` | provider | no | Integer from 0 to 10; defaults to `0` (off). See [Models that stop to narrate](#models-that-stop-to-narrate). Ignored by `codex-app-server`. |
+
+### Choosing the upstream behind a gateway
+
+Gateways such as OpenRouter (Cline Pass uses one) serve one model from many upstream channels and may pick a different one for each call. An upstream that fails to stream a tool call produces replies that arrive empty or end after a sentence of narration, even though the model generated tokens. Set `extra_body` on the provider to steer routing:
+
+```toml
+[providers.cline-glm-flash.extra_body.provider]
+ignore = ["relace"]          # never use this upstream
+# only = ["streamlake"]      # or: use only these
+# order = ["streamlake", "deepinfra"]
+```
+
+Names are the gateway's lowercase slugs. An unknown name in `only` is refused with an error that lists the valid ones; asking for a model with `only = ["__probe__"]` is a quick way to see that list. A 200 response does not prove a preference was applied, so check which upstream served a call: when the API names it (the `provider` field of OpenRouter-style streams), the `provider_request` event carries it as `upstream`. Gateways that route through Vercel AI Gateway ignore `provider` and read `providerOptions.gateway.only` instead; both can be set in the same table.
 
 ### Models that stop to narrate
 
@@ -314,6 +328,7 @@ During a running call, the server emits `subagent/event` notifications with `thr
 | `token_count` | Model-turn usage in `prompt_tokens` (the full prompt, cached tokens included), `completion_tokens`, and `total_tokens` (their sum). |
 | `exec_command_begin` | Tool execution began; includes `call_id`, `tool`, and `command` for shell, `paths` (array) for `apply_patch`, or `path` for `read_file` and `write_file`. |
 | `exec_command_end` | Tool execution ended; includes `call_id`, `tool`, `exit_code` for shell, `paths` for `apply_patch`, and `error` when execution failed. |
+| `provider_request` | One model API call finished: `provider`, `model`, `duration_ms`, `ttft_ms` (only when text streamed), `upstream` (when the API names the serving channel) and `error` (only on failure). |
 | `agent_nudge` | A reply without a tool call was answered with a continue prompt (see `max_nudges`); the prompt is in `message`. |
 | `agent_message` | Final assistant text in `message`. |
 | `task_complete` | The call completed successfully. |

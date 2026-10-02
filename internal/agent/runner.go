@@ -200,6 +200,8 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 		}
 		if err != nil {
 			requestEvent["error"] = err.Error()
+		} else if res.Upstream != "" {
+			requestEvent["upstream"] = res.Upstream
 		}
 		recordProviderRequest(s, requestEvent)
 		r.Emitter.Emit(ctx, s.ID, requestEvent)

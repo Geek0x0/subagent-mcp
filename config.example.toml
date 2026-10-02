@@ -15,6 +15,8 @@ models = [
   { id = "deepseek-v4-pro", description = "strongest" },
 ]
 effort_map = { medium = "high", xhigh = "max" }
+# For an OpenRouter-style gateway (such as Cline Pass) that routes each call to some upstream:
+# extra_body = { provider = { ignore = ["relace"] } }   # never use that upstream (or: only = ["streamlake"])
 
 # responses: OpenAI Responses API streaming.
 [providers.openai]

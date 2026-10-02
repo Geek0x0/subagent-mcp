@@ -291,3 +291,38 @@ func TestExampleConfigLoads(t *testing.T) {
 		}
 	}
 }
+
+func TestExtraBodyValidation(t *testing.T) {
+	chat := func(body string) string {
+		return "[providers.gw]\napi = \"chat-completions\"\nenv_key = \"GW_KEY\"\ndefault_model = \"m\"\nmodels = [{ id = \"m\" }]\n" + body
+	}
+	tests := []struct {
+		name, toml, wantErr string
+	}{
+		{"routing object", chat("[providers.gw.extra_body.provider]\nignore = [\"relace\"]\n"), ""},
+		{"reserved field", chat("[providers.gw.extra_body]\nmodel = \"x\"\n"), "providers.gw.extra_body.model"},
+		{"wrong api", strings.Replace(chat("[providers.gw.extra_body]\nseed = 1\n"), `"chat-completions"`, `"responses"`, 1), "extra_body is only supported"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			if err := os.WriteFile(path, []byte(test.toml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(path)
+			if test.wantErr == "" {
+				if err != nil {
+					t.Fatalf("Load() error = %v", err)
+				}
+				ignore := cfg.Providers["gw"].ExtraBody["provider"].(map[string]any)["ignore"].([]any)
+				if len(ignore) != 1 || ignore[0] != "relace" {
+					t.Fatalf("extra_body = %#v", cfg.Providers["gw"].ExtraBody)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("Load() error = %v, want it to contain %q", err, test.wantErr)
+			}
+		})
+	}
+}

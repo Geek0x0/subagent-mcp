@@ -50,6 +50,15 @@ type Provider struct {
 	// MaxNudges is the default number of "continue" prompts a run may send when
 	// the model replies without a tool call; 0 (the default) disables it.
 	MaxNudges int `toml:"max_nudges"`
+	// ExtraBody holds fields merged into the JSON body of every chat-completions
+	// request, for what the SDK request type has no place for, such as an
+	// OpenRouter-style gateway's upstream routing (provider.only / provider.ignore).
+	ExtraBody map[string]any `toml:"extra_body"`
+}
+
+// reservedBodyFields are request fields the server owns; extra_body may not set them.
+var reservedBodyFields = map[string]bool{
+	"model": true, "messages": true, "stream": true, "stream_options": true, "tools": true, "tool_choice": true,
 }
 
 // Config is the root of the configuration file.
@@ -185,6 +194,16 @@ func (p Provider) validate(prefix string) error {
 	}
 	if p.MaxOutputTokens < 0 {
 		return fmt.Errorf("%s.max_output_tokens must be positive", prefix)
+	}
+	if len(p.ExtraBody) > 0 {
+		if p.API != APIChatCompletions {
+			return fmt.Errorf("%s.extra_body is only supported for api = %q", prefix, APIChatCompletions)
+		}
+		for name := range p.ExtraBody {
+			if reservedBodyFields[name] {
+				return fmt.Errorf("%s.extra_body.%s is set by the server and cannot be overridden", prefix, name)
+			}
+		}
 	}
 	if p.MaxNudges < 0 || p.MaxNudges > MaxNudgesLimit {
 		return fmt.Errorf("%s.max_nudges must be between 0 and %d", prefix, MaxNudgesLimit)

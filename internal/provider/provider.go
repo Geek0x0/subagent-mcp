@@ -74,6 +74,10 @@ type TurnResult struct {
 	ToolCalls []ToolCall
 	Usage     *Usage
 	Opaque    json.RawMessage
+	// Upstream names the channel behind the API that actually served the turn,
+	// when the API reports one (gateways such as OpenRouter route each call to
+	// a different upstream). Empty when unknown.
+	Upstream string
 }
 
 // Provider is one configured model API adapter.

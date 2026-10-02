@@ -164,3 +164,27 @@ func TestNudgeRepeatsOnEmptyReplies(t *testing.T) {
 		}
 	}
 }
+
+// The serving upstream, when the provider reports one, rides on provider_request.
+func TestProviderRequestEventCarriesTheUpstream(t *testing.T) {
+	client := &stubProvider{turns: []stubTurn{
+		{result: &provider.TurnResult{Text: "one", Upstream: "relace"}},
+	}}
+	session := newTestSession(t, Options{Provider: client})
+	emitter := &recEmitter{}
+	runner := &Runner{Emitter: emitter, Approver: &stubApprover{}}
+	if _, err := runner.Run(context.Background(), session, "task"); err != nil {
+		t.Fatal(err)
+	}
+	emitter.mu.Lock()
+	defer emitter.mu.Unlock()
+	for _, event := range emitter.events {
+		if event["type"] == "provider_request" {
+			if event["upstream"] != "relace" {
+				t.Fatalf("provider_request = %#v, want upstream relace", event)
+			}
+			return
+		}
+	}
+	t.Fatal("no provider_request event")
+}

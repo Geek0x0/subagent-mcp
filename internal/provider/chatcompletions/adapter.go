@@ -23,7 +23,7 @@ type Adapter struct {
 
 // New builds a chat-completions adapter.
 func New(name string, cfg config.Provider, apiKey string) (provider.Provider, error) {
-	return &Adapter{name: name, client: NewClient(apiKey, cfg.BaseURL)}, nil
+	return &Adapter{name: name, client: NewClientWithBody(apiKey, cfg.BaseURL, cfg.ExtraBody)}, nil
 }
 
 func (a *Adapter) Name() string { return a.name }
@@ -88,7 +88,7 @@ func (a *Adapter) Turn(ctx context.Context, req provider.TurnRequest, onDelta fu
 	if err != nil {
 		return nil, err
 	}
-	out := &provider.TurnResult{Text: res.Content, Reasoning: res.Reasoning}
+	out := &provider.TurnResult{Text: res.Content, Reasoning: res.Reasoning, Upstream: res.Upstream}
 	for _, call := range res.ToolCalls {
 		out.ToolCalls = append(out.ToolCalls, provider.ToolCall{ID: call.ID, Name: call.Function.Name, Arguments: call.Function.Arguments})
 	}
