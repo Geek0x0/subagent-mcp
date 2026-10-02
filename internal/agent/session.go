@@ -43,7 +43,10 @@ type Options struct {
 	Approval        policy.ApprovalPolicy
 	SystemPrompt    string
 	MaxTurns        int
-	WritableRoots   []string
+	// MaxNudges is how many times a run may answer a reply that has no tool call
+	// with a "continue" prompt (0 disables it); see Runner.RunLocked.
+	MaxNudges     int
+	WritableRoots []string
 }
 
 type Session struct {
@@ -60,6 +63,7 @@ type Session struct {
 	sandbox         policy.Sandbox
 	approval        policy.ApprovalPolicy
 	maxTurns        int
+	maxNudges       int
 	writableRoots   []string
 	rootPaths       []string
 	boundCwd        *sandbox.Directory
@@ -117,6 +121,7 @@ func (m *Manager) Create(o Options) *Session {
 		sandbox:         o.Sandbox,
 		approval:        o.Approval,
 		maxTurns:        o.MaxTurns,
+		maxNudges:       o.MaxNudges,
 		writableRoots:   append([]string(nil), o.WritableRoots...),
 		lastUsed:        m.now(),
 	}

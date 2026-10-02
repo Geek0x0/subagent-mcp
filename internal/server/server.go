@@ -388,7 +388,7 @@ func startTool(name string, cfg *config.Config) mcp.Tool {
 		),
 		mcp.WithObject(
 			"config",
-			mcp.Description("loose config map; recognized keys: max_turns (number from 1 to 100000), model_reasoning_effort (same values as reasoning-effort; the top-level argument wins), writable_roots (array of absolute directory paths the shell may also write under workspace-write); other unknown keys are silently ignored"),
+			mcp.Description("loose config map; recognized keys: max_turns (number from 1 to 100000), model_reasoning_effort (same values as reasoning-effort; the top-level argument wins), writable_roots (array of absolute directory paths the shell may also write under workspace-write), max_nudges (integer 0 to 10; how many times a reply without a tool call is answered with a continue prompt, overriding the provider default); other unknown keys are silently ignored"),
 		),
 		mcp.WithOutputSchema[toolOutput](),
 	)
@@ -568,6 +568,11 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		maxTurns = int(value)
 	}
 
+	maxNudges := providerCfg.MaxNudges
+	if value, ok := looseConfig["max_nudges"].(float64); ok && value >= 0 && value <= config.MaxNudgesLimit && value == float64(int(value)) {
+		maxNudges = int(value)
+	}
+
 	writableRoots, err := parseWritableRoots(looseConfig)
 	if err != nil {
 		return mcp.NewToolResultError(err.Error()), nil
@@ -583,6 +588,7 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		EffortSent:      providerCfg.MapEffort(requested),
 		SystemPrompt:    systemPrompt,
 		MaxTurns:        maxTurns,
+		MaxNudges:       maxNudges,
 		WritableRoots:   writableRoots,
 	}
 	if isAgent {

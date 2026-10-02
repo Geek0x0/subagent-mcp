@@ -97,6 +97,11 @@ models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
 | `models` | provider | yes | Non-empty list of `{ id, description? }` tables; ids must be unique and are advertised in config order. |
 | `effort_map` | provider | no | Maps a caller effort value to the value sent to the API: `effort_map[value]` if present, else the caller's value. Keys and values must be in the effort set below. |
 | `max_output_tokens` | provider | no | Positive integer; defaults to `64000` for every api but is only sent by `messages` as `max_tokens`. |
+| `max_nudges` | provider | no | Integer from 0 to 10; defaults to `0` (off). See [Models that stop to narrate](#models-that-stop-to-narrate). Ignored by `codex-app-server`. |
+
+### Models that stop to narrate
+
+The agent loop treats a model reply without a tool call as the final answer. Some small models end a turn that way while work remains ("Now step 2: write the failing test"), so the call returns that sentence as its result. With `max_nudges` above zero, such a reply is answered with a "continue" prompt (an `agent_nudge` event is emitted) and the loop goes on: a model that was really finished repeats its summary, and a second reply without a tool call right after the prompt is accepted as final. Each stretch without tool calls is nudged at most once, and at most `max_nudges` times per run. Empty replies count as replies without a tool call and are not replayed to the API. The cost of the option is one extra model call at the end of a run that finishes normally. Prompting alone did not fix it in testing, so this is a code-level guard; set it on the providers that need it, for example `max_nudges = 3`.
 
 ### Reasoning effort
 
@@ -195,7 +200,7 @@ Starts a new coding-agent thread.
 | `approval-policy` | No | `on-request` | `untrusted`, `on-request`, `on-failure`, or `never`. |
 | `base-instructions` | No | Built-in instructions | Complete replacement for the built-in base system instructions. An empty or omitted value uses the built-in default. |
 | `developer-instructions` | No | None | Additional system instructions appended after the `AGENTS.md` blocks. An empty or omitted value appends nothing. |
-| `config` | No | `{}` | Loose object. Recognized keys: `max_turns` (number from 1 to 100000, default 50, out-of-range or wrong-typed values are silently ignored), `model_reasoning_effort` (same values as `reasoning-effort`; the top-level argument wins), and `writable_roots` (array of absolute paths to existing directories that the shell may also write under `workspace-write`). Invalid `model_reasoning_effort` or `writable_roots` values are errors; other unknown keys are silently ignored. |
+| `config` | No | `{}` | Loose object. Recognized keys: `max_turns` (number from 1 to 100000, default 50, out-of-range or wrong-typed values are silently ignored), `model_reasoning_effort` (same values as `reasoning-effort`; the top-level argument wins), `max_nudges` (integer 0 to 10; overrides the provider's `max_nudges` for this session, other values are ignored), and `writable_roots` (array of absolute paths to existing directories that the shell may also write under `workspace-write`). Invalid `model_reasoning_effort` or `writable_roots` values are errors; other unknown keys are silently ignored. |
 
 When dispatched units run `go test` under `workspace-write`, include the absolute path of the Go build cache in `config.writable_roots` (for example `/home/<user>/.cache/go-build`).
 
@@ -308,6 +313,7 @@ During a running call, the server emits `subagent/event` notifications with `thr
 | `token_count` | Model-turn usage in `prompt_tokens` (the full prompt, cached tokens included), `completion_tokens`, and `total_tokens` (their sum). |
 | `exec_command_begin` | Tool execution began; includes `call_id`, `tool`, and `command` for shell, `paths` (array) for `apply_patch`, or `path` for `read_file` and `write_file`. |
 | `exec_command_end` | Tool execution ended; includes `call_id`, `tool`, `exit_code` for shell, `paths` for `apply_patch`, and `error` when execution failed. |
+| `agent_nudge` | A reply without a tool call was answered with a continue prompt (see `max_nudges`); the prompt is in `message`. |
 | `agent_message` | Final assistant text in `message`. |
 | `task_complete` | The call completed successfully. |
 | `error` | The call failed; `message` contains the error. |

@@ -215,6 +215,8 @@ func TestLoadErrors(t *testing.T) {
 		{"bad effort key", strings.Replace(validTOML, `medium = "high"`, `turbo = "high"`, 1), "providers.deepseek.effort_map"},
 		{"bad effort value", strings.Replace(validTOML, `medium = "high"`, `medium = "turbo"`, 1), "providers.deepseek.effort_map"},
 		{"negative max tokens", strings.Replace(validTOML, `api = "messages"`, "api = \"messages\"\nmax_output_tokens = -1", 1), "providers.anthropic.max_output_tokens"},
+		{"negative max nudges", strings.Replace(validTOML, `api = "messages"`, "api = \"messages\"\nmax_nudges = -1", 1), "providers.anthropic.max_nudges"},
+		{"excessive max nudges", strings.Replace(validTOML, `api = "messages"`, "api = \"messages\"\nmax_nudges = 11", 1), "providers.anthropic.max_nudges"},
 		{"invalid provider name", strings.Replace(validTOML, "[providers.deepseek]", `[providers."bad name!"]`, 1), "not a valid provider name"},
 		{"no providers", "providers = {}\n", "at least one provider"},
 	}

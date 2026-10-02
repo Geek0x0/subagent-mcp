@@ -2033,3 +2033,49 @@ func TestModelParameterUnionAcrossProviders(t *testing.T) {
 		t.Errorf("shared-model appears %d times in the model enum, want exactly 1 (deduplicated)", got)
 	}
 }
+
+// max_nudges comes from the provider's config and the call's loose config
+// overrides it; invalid call values are ignored.
+func TestHandleStartMaxNudges(t *testing.T) {
+	tests := []struct {
+		name         string
+		providerNudg int
+		callConfig   map[string]any
+		wantCalls    int
+		wantText     string
+	}{
+		{"off by default", 0, nil, 1, "Step 2: write the test."},
+		{"provider default", 1, nil, 2, "All done."},
+		{"call enables", 0, map[string]any{"max_nudges": float64(1)}, 2, "All done."},
+		{"call disables", 1, map[string]any{"max_nudges": float64(0)}, 1, "Step 2: write the test."},
+		{"excessive value ignored", 0, map[string]any{"max_nudges": float64(11)}, 1, "Step 2: write the test."},
+		{"fractional value ignored", 0, map[string]any{"max_nudges": 1.5}, 1, "Step 2: write the test."},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			client := &stubProvider{turns: []stubTurn{
+				{result: &provider.TurnResult{Text: "Step 2: write the test."}},
+				{result: &provider.TurnResult{Text: "All done."}},
+			}}
+			cfg := testConfig(t, client)
+			providerCfg := cfg.Providers["deepseek"]
+			providerCfg.MaxNudges = test.providerNudg
+			cfg.Providers["deepseek"] = providerCfg
+			s := New(cfg, "test")
+			args := map[string]any{"prompt": "go", "cwd": t.TempDir()}
+			if test.callConfig != nil {
+				args["config"] = test.callConfig
+			}
+			result, err := s.handleStart(context.Background(), callToolRequest("subagent", args))
+			if err != nil || result.IsError {
+				t.Fatalf("handleStart() = (%#v, %v)", result, err)
+			}
+			if text := toolResultText(t, result); text != test.wantText {
+				t.Errorf("text = %q, want %q", text, test.wantText)
+			}
+			if len(client.requests) != test.wantCalls {
+				t.Errorf("model calls = %d, want %d", len(client.requests), test.wantCalls)
+			}
+		})
+	}
+}

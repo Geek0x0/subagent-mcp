@@ -25,6 +25,14 @@ var ErrBusy = errors.New("thread is busy")
 // result and providers still accept the history on the next reply.
 const cancelledToolResult = "cancelled: not executed"
 
+// continuePrompt answers a reply that has no tool call when nudging is enabled.
+// Some models narrate their next step ("Now step 2: write the failing test")
+// and stop; a reply without a tool call ends the run, so the narration would be
+// returned as the final answer while the work is unfinished.
+const continuePrompt = "You replied without a tool call, which ends the run. " +
+	"If any work remains, continue now by making the tool call. " +
+	"If the task is completely done, repeat your final summary."
+
 type Emitter interface {
 	Emit(ctx context.Context, threadID string, msg map[string]any)
 }
@@ -148,6 +156,9 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 	entryMessages := len(s.messages)
 	s.messages = append(s.messages, provider.Message{Role: provider.RoleUser, Text: prompt})
 	assistantAppended := false
+	nudges := 0
+	nudgedSinceTool := false
+	lastText := ""
 
 	for turn := 0; turn < s.maxTurns; turn++ {
 		requestStarted := time.Now()
@@ -206,19 +217,43 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 			})
 		}
 		recordModelTurn(s, res)
-		s.messages = append(s.messages, provider.Message{
-			Role: provider.RoleAssistant, Text: res.Text, ToolCalls: res.ToolCalls, Opaque: res.Opaque,
-		})
+		if len(res.ToolCalls) == 0 && res.Text == "" {
+			// An empty reply is not replayed: several APIs reject an assistant
+			// message with neither content nor tool calls.
+		} else {
+			s.messages = append(s.messages, provider.Message{
+				Role: provider.RoleAssistant, Text: res.Text, ToolCalls: res.ToolCalls, Opaque: res.Opaque,
+			})
+		}
 		if len(res.ToolCalls) == 0 {
+			if res.Text != "" {
+				lastText = res.Text
+			}
+			if nudges < s.maxNudges && !nudgedSinceTool {
+				// Ask once per stretch without tool calls: a model that was
+				// really finished repeats its summary, and that second reply
+				// is accepted as final.
+				nudges++
+				nudgedSinceTool = true
+				assistantAppended = true
+				s.messages = append(s.messages, provider.Message{Role: provider.RoleUser, Text: continuePrompt})
+				r.Emitter.Emit(ctx, s.ID, map[string]any{"type": "agent_nudge", "message": continuePrompt})
+				continue
+			}
+			text := res.Text
+			if text == "" {
+				text = lastText
+			}
 			r.Emitter.Emit(ctx, s.ID, map[string]any{
 				"type":    "agent_message",
-				"message": res.Text,
+				"message": text,
 			})
 			r.Emitter.Emit(ctx, s.ID, map[string]any{"type": "task_complete"})
-			recordTaskComplete(s, res.Text, started)
-			return res.Text, nil
+			recordTaskComplete(s, text, started)
+			return text, nil
 		}
 		assistantAppended = true
+		nudgedSinceTool = false
 
 		for _, call := range res.ToolCalls {
 			if ctxErr := ctx.Err(); ctxErr != nil {

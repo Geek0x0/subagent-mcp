@@ -29,6 +29,7 @@ api = "messages"
 env_key = "ANTHROPIC_API_KEY"
 default_model = "claude-sonnet-5"
 max_output_tokens = 64000
+# max_nudges = 3   # answer a reply without a tool call with "continue" (small models that stop to narrate)
 models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
 
 # codex-app-server: experimental; uses Codex's own tools, sandbox, and login.

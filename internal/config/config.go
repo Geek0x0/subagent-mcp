@@ -34,6 +34,9 @@ type Model struct {
 	Description string `toml:"description"`
 }
 
+// MaxNudgesLimit is the largest accepted max_nudges.
+const MaxNudgesLimit = 10
+
 // Provider holds the configuration of a single API provider.
 type Provider struct {
 	API             string            `toml:"api"`
@@ -44,6 +47,9 @@ type Provider struct {
 	Models          []Model           `toml:"models"`
 	EffortMap       map[string]string `toml:"effort_map"`
 	MaxOutputTokens int               `toml:"max_output_tokens"`
+	// MaxNudges is the default number of "continue" prompts a run may send when
+	// the model replies without a tool call; 0 (the default) disables it.
+	MaxNudges int `toml:"max_nudges"`
 }
 
 // Config is the root of the configuration file.
@@ -179,6 +185,9 @@ func (p Provider) validate(prefix string) error {
 	}
 	if p.MaxOutputTokens < 0 {
 		return fmt.Errorf("%s.max_output_tokens must be positive", prefix)
+	}
+	if p.MaxNudges < 0 || p.MaxNudges > MaxNudgesLimit {
+		return fmt.Errorf("%s.max_nudges must be between 0 and %d", prefix, MaxNudgesLimit)
 	}
 	return nil
 }
