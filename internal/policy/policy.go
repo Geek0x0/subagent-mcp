@@ -188,6 +188,12 @@ func hasDangerousShellFlag(fields []string) bool {
 				strings.HasPrefix(argument, "--hostname-bin=") {
 				return true
 			}
+			// ripgrep's -z/--search-zip decompresses its inputs by running
+			// gzip, xz or zstd resolved through PATH, which is the program
+			// execution the allowlist exists to exclude.
+			if fields[0] == "rg" && (argument == "--search-zip" || shortOptionClusterHas(argument, 'z')) {
+				return true
+			}
 		}
 	case "git":
 		if len(fields) < 2 {
@@ -252,6 +258,17 @@ func hasDangerousShellFlag(fields []string) bool {
 	}
 
 	return false
+}
+
+// shortOptionClusterHas reports whether one shell word is a cluster of short
+// options containing the given letter, so that "-iz" is treated like "-z". A
+// long option, a bare dash, or any word that is not a short-option cluster is
+// not one.
+func shortOptionClusterHas(word string, flag byte) bool {
+	if len(word) < 2 || word[0] != '-' || word[1] == '-' {
+		return false
+	}
+	return strings.IndexByte(word[1:], flag) >= 0
 }
 
 func pathInside(cwd, target string, bound ...*sandbox.Directory) (bool, string) {
