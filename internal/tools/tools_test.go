@@ -858,3 +858,46 @@ func TestRunShellSandboxedTimeoutKillsCommand(t *testing.T) {
 		t.Fatalf("RunShellSandboxed() = (%d, %v) after %v, want timeout", code, err, elapsed)
 	}
 }
+
+// TestRunShellKillsBackgroundedDescendant pins that a command which backgrounds
+// a descendant with its own redirection cannot leave that descendant running
+// past the call: the direct child exits at once and holds no pipe, so neither
+// the context watcher nor WaitDelay ever sees it.
+func TestRunShellKillsBackgroundedDescendant(t *testing.T) {
+	cwd := t.TempDir()
+	marker := filepath.Join(cwd, "survivor")
+
+	command := fmt.Sprintf("( sleep 1; touch %s ) >/dev/null 2>&1 & echo started", marker)
+	out, code, err := RunShell(context.Background(), cwd, command, 10*time.Second)
+	if err != nil || code != 0 || !strings.Contains(out, "started") {
+		t.Fatalf("RunShell() = (%q, %d, %v), want a clean start", out, code, err)
+	}
+
+	// The descendant touches the marker one second after the call returned.
+	time.Sleep(2 * time.Second)
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatalf("backgrounded descendant survived the call and wrote %s", marker)
+	}
+}
+
+// TestRunShellSandboxedKillsBackgroundedDescendant pins the sweep on the
+// sandboxed path too: there the direct child is the re-exec'd Landlock helper
+// rather than the shell, and the backgrounded descendant is its grandchild.
+func TestRunShellSandboxedKillsBackgroundedDescendant(t *testing.T) {
+	if err := sandbox.Available(); err != nil {
+		testutil.LandlockUnavailable(t, err)
+	}
+	cwd := t.TempDir()
+	marker := filepath.Join(cwd, "survivor")
+
+	command := fmt.Sprintf("( sleep 1; touch %s ) >/dev/null 2>&1 & echo started", marker)
+	out, code, err := RunShellSandboxed(context.Background(), cwd, command, 10*time.Second, []string{cwd})
+	if err != nil || code != 0 || !strings.Contains(out, "started") {
+		t.Fatalf("RunShellSandboxed() = (%q, %d, %v), want a clean start", out, code, err)
+	}
+
+	time.Sleep(2 * time.Second)
+	if _, statErr := os.Stat(marker); statErr == nil {
+		t.Fatalf("backgrounded descendant survived the sandboxed call and wrote %s", marker)
+	}
+}
