@@ -6,7 +6,10 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand/v2"
+	"net"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -45,7 +48,7 @@ func NewClientWithBody(apiKey, baseURL string, extraBody map[string]any) *Client
 	// instead: sessions against one endpoint reuse its connections without
 	// coupling the endpoint (or other endpoints) to the process-wide default.
 	// The client itself stays per adapter, carrying this session's key.
-	cfg.HTTPClient = provider.PooledClientWithBody(provider.KindChatCompletions, baseURL, 0, extraBody)
+	cfg.HTTPClient = provider.PooledClientWithBody(provider.KindChatCompletions, baseURL, extraBody)
 
 	return &Client{
 		oai:     openai.NewClientWithConfig(cfg),
@@ -53,8 +56,14 @@ func NewClientWithBody(apiKey, baseURL string, extraBody map[string]any) *Client
 	}
 }
 
+// defaultBackoff returns 1s, 2s, 4s with half the delay jittered away. The floor
+// keeps a single client from hammering a struggling endpoint and the jitter keeps
+// concurrent sessions that failed together from retrying together, which is the
+// thundering herd a fixed schedule produces against one gateway.
 func defaultBackoff(attempt int) time.Duration {
-	return time.Duration(1<<uint(attempt)) * time.Second
+	base := time.Duration(1<<uint(attempt)) * time.Second
+	half := base / 2
+	return half + time.Duration(rand.Int64N(int64(half)+1))
 }
 
 func (c *Client) ChatTurn(
@@ -189,13 +198,34 @@ func (c *Client) openStreamWithRetry(
 }
 
 func isRetryable(err error) bool {
+	// A cancelled or expired context is the caller's decision, not a transient
+	// failure: retrying it would only delay the error the caller is waiting for.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
 	var apiErr *openai.APIError
-	if errors.As(err, &apiErr) && isRetryableStatus(apiErr.HTTPStatusCode) {
-		return true
+	if errors.As(err, &apiErr) {
+		return isRetryableStatus(apiErr.HTTPStatusCode)
 	}
 
 	var requestErr *openai.RequestError
-	return errors.As(err, &requestErr) && isRetryableStatus(requestErr.HTTPStatusCode)
+	if errors.As(err, &requestErr) {
+		// The SDK builds a RequestError only from a response it received, always
+		// carrying that response's status, so this covers an error body it could
+		// not parse rather than a connection failure.
+		return requestErr.HTTPStatusCode == 0 || isRetryableStatus(requestErr.HTTPStatusCode)
+	}
+
+	// Nothing left can carry a status, which means the request never reached a
+	// server. A refused, reset or timed-out connection at stream setup is what
+	// both SDKs retry for this adapter's siblings, and what this loop missed.
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		return true
+	}
+	var netErr net.Error
+	return errors.As(err, &netErr)
 }
 
 func isRetryableStatus(status int) bool {

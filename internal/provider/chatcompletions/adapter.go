@@ -19,11 +19,18 @@ func init() { provider.Register(config.APIChatCompletions, New) }
 type Adapter struct {
 	name   string
 	client *Client
+	// maxOutputTokens is the configured max_output_tokens, or 0 when the config
+	// does not set one and the API's own default should apply.
+	maxOutputTokens int
 }
 
 // New builds a chat-completions adapter.
 func New(name string, cfg config.Provider, apiKey string) (provider.Provider, error) {
-	return &Adapter{name: name, client: NewClientWithBody(apiKey, cfg.BaseURL, cfg.ExtraBody)}, nil
+	return &Adapter{
+		name:            name,
+		client:          NewClientWithBody(apiKey, cfg.BaseURL, cfg.ExtraBody),
+		maxOutputTokens: cfg.MaxOutputTokens,
+	}, nil
 }
 
 func (a *Adapter) Name() string { return a.name }
@@ -78,12 +85,24 @@ func (a *Adapter) Turn(ctx context.Context, req provider.TurnRequest, onDelta fu
 	}
 	tools := make([]openai.Tool, len(req.Tools))
 	for i, spec := range req.Tools {
+		// Validate the schema the way every other adapter does, then send the
+		// caller's own bytes: re-encoding through a map would rewrite numbers.
+		if _, err := provider.DecodeToolSchema(spec); err != nil {
+			return nil, fmt.Errorf("chat completions: %w", err)
+		}
+		// An absent schema has to go out as an object: the SDK marshals a nil
+		// Parameters as null, and the API requires a schema object.
+		parameters := spec.Parameters
+		if len(parameters) == 0 {
+			parameters = json.RawMessage(`{}`)
+		}
 		tools[i] = openai.Tool{Type: openai.ToolTypeFunction, Function: &openai.FunctionDefinition{
-			Name: spec.Name, Description: spec.Description, Parameters: spec.Parameters,
+			Name: spec.Name, Description: spec.Description, Parameters: parameters,
 		}}
 	}
 	res, err := a.client.ChatTurn(ctx, openai.ChatCompletionRequest{
 		Model: req.Model, Messages: messages, Tools: tools, ReasoningEffort: req.Effort,
+		MaxTokens: a.maxOutputTokens,
 	}, onDelta)
 	if err != nil {
 		return nil, err

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
@@ -39,19 +38,12 @@ func New(name string, cfg config.Provider, apiKey string) (provider.Provider, er
 	// itself stays per adapter, carrying this session's key.
 	client := anthropic.NewClient(
 		option.WithoutEnvironmentDefaults(),
-		option.WithHTTPClient(provider.PooledClient(provider.KindMessages, cfg.BaseURL, responseHeaderTimeout)),
+		option.WithHTTPClient(provider.PooledClient(provider.KindMessages, cfg.BaseURL)),
 		option.WithAPIKey(apiKey),
 		option.WithBaseURL(cfg.BaseURL),
 	)
 	return &Adapter{name: name, client: client, maxTokens: int64(cfg.MaxOutputTokens)}, nil
 }
-
-// responseHeaderTimeout matches the SDK's internal default client, which
-// option.WithoutEnvironmentDefaults skips along with the environment
-// autoload: bound the wait for response headers so a server that accepts
-// the connection but never responds cannot hang a request forever. The
-// timeout does not apply to the response body, so streams are unaffected.
-const responseHeaderTimeout = 10 * time.Minute
 
 func (a *Adapter) Name() string { return a.name }
 
@@ -73,11 +65,15 @@ func (a *Adapter) Turn(ctx context.Context, req provider.TurnRequest, onDelta fu
 	if err != nil {
 		return nil, err
 	}
+	tools, err := buildTools(req.Tools)
+	if err != nil {
+		return nil, err
+	}
 	params := anthropic.MessageNewParams{
 		Model:        anthropic.Model(req.Model),
 		MaxTokens:    a.maxTokens,
 		Messages:     messages,
-		Tools:        buildTools(req.Tools),
+		Tools:        tools,
 		Thinking:     anthropic.ThinkingConfigParamUnion{OfAdaptive: &anthropic.ThinkingConfigAdaptiveParam{Display: anthropic.ThinkingConfigAdaptiveDisplaySummarized}},
 		CacheControl: anthropic.NewCacheControlEphemeralParam(),
 	}
@@ -240,23 +236,63 @@ func truncateRunes(s string, max int) string {
 	return s
 }
 
-func buildTools(specs []provider.ToolSpec) []anthropic.ToolUnionParam {
+func buildTools(specs []provider.ToolSpec) ([]anthropic.ToolUnionParam, error) {
 	tools := make([]anthropic.ToolUnionParam, len(specs))
 	for i, spec := range specs {
-		var schema struct {
-			Properties any      `json:"properties"`
-			Required   []string `json:"required"`
+		schema, err := provider.DecodeToolSchema(spec)
+		if err != nil {
+			return nil, fmt.Errorf("messages: %w", err)
 		}
-		_ = json.Unmarshal(spec.Parameters, &schema)
+		input := anthropic.ToolInputSchemaParam{ExtraFields: map[string]any{}}
+		if properties, present := schema["properties"]; present {
+			input.Properties = properties
+		}
+		required, err := schemaRequired(spec.Name, schema["required"])
+		if err != nil {
+			return nil, err
+		}
+		input.Required = required
+		// Every other keyword — additionalProperties, $defs, oneOf, title — is
+		// forwarded as written. Dropping them would send the model a stricter
+		// schema than the caller declared. "type" is not forwarded because the
+		// SDK always sends "object" for a tool input schema.
+		for key, value := range schema {
+			switch key {
+			case "properties", "required", "type":
+			default:
+				input.ExtraFields[key] = value
+			}
+		}
 		tool := anthropic.ToolParam{
 			Name:                spec.Name,
 			Description:         anthropic.String(spec.Description),
-			InputSchema:         anthropic.ToolInputSchemaParam{Properties: schema.Properties, Required: schema.Required},
+			InputSchema:         input,
 			EagerInputStreaming: anthropic.Bool(true),
 		}
 		tools[i] = anthropic.ToolUnionParam{OfTool: &tool}
 	}
-	return tools
+	return tools, nil
+}
+
+// schemaRequired reads a schema's required list. The Messages API takes it as a
+// list of names, so anything else is reported rather than dropped.
+func schemaRequired(tool string, raw any) ([]string, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	items, ok := raw.([]any)
+	if !ok {
+		return nil, fmt.Errorf("messages: tool %s schema: required must be an array of names", tool)
+	}
+	required := make([]string, 0, len(items))
+	for _, item := range items {
+		name, ok := item.(string)
+		if !ok {
+			return nil, fmt.Errorf("messages: tool %s schema: required must list only names", tool)
+		}
+		required = append(required, name)
+	}
+	return required, nil
 }
 
 func toResult(turn []anthropic.Message, partials []map[int64]string) (*provider.TurnResult, error) {

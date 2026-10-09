@@ -367,3 +367,94 @@ func TestListModelsHTTPError(t *testing.T) {
 		t.Fatalf("ListModels() error = %v, want wrapped \"list models\" context", err)
 	}
 }
+
+// TestBuildToolsForwardsEverySchemaKeyword pins that the Messages adapter sends
+// the schema the caller wrote. It used to decode only properties and required and
+// drop the rest, so the model received a stricter schema than the caller
+// declared — while the responses adapter passed the same schema through intact.
+func TestBuildToolsForwardsEverySchemaKeyword(t *testing.T) {
+	spec := provider.ToolSpec{
+		Name: "shell",
+		Parameters: json.RawMessage(`{
+			"type":"object",
+			"properties":{"command":{"type":"string"}},
+			"required":["command"],
+			"additionalProperties":false,
+			"title":"Shell",
+			"$defs":{"n":{"type":"number"}}
+		}`),
+	}
+
+	tools, err := buildTools([]provider.ToolSpec{spec})
+	if err != nil {
+		t.Fatalf("buildTools() error = %v", err)
+	}
+	if len(tools) != 1 || tools[0].OfTool == nil {
+		t.Fatalf("buildTools() = %#v", tools)
+	}
+	schema := tools[0].OfTool.InputSchema
+
+	encoded, err := json.Marshal(schema)
+	if err != nil {
+		t.Fatalf("marshal schema: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(encoded, &got); err != nil {
+		t.Fatalf("unmarshal schema: %v", err)
+	}
+
+	if got["additionalProperties"] != false {
+		t.Errorf("additionalProperties = %v, want false", got["additionalProperties"])
+	}
+	if got["title"] != "Shell" {
+		t.Errorf("title = %v, want Shell", got["title"])
+	}
+	if _, present := got["$defs"]; !present {
+		t.Error("$defs was dropped from the schema")
+	}
+	if got["type"] != "object" {
+		t.Errorf("type = %v, want object", got["type"])
+	}
+	if props, ok := got["properties"].(map[string]any); !ok || props["command"] == nil {
+		t.Errorf("properties = %v, want the declared command property", got["properties"])
+	}
+	if required, ok := got["required"].([]any); !ok || len(required) != 1 || required[0] != "command" {
+		t.Errorf("required = %v, want [command]", got["required"])
+	}
+}
+
+// TestBuildToolsRejectsMalformedSchemas pins that a schema the adapter cannot
+// read is an error naming the tool, the way the responses adapter already treats
+// it, instead of silently becoming a tool with no parameters.
+func TestBuildToolsRejectsMalformedSchemas(t *testing.T) {
+	tests := []struct {
+		name    string
+		spec    provider.ToolSpec
+		wantErr string
+	}{
+		{
+			name:    "not json",
+			spec:    provider.ToolSpec{Name: "shell", Parameters: json.RawMessage(`{`)},
+			wantErr: "tool shell schema",
+		},
+		{
+			name:    "required is not a list of names",
+			spec:    provider.ToolSpec{Name: "shell", Parameters: json.RawMessage(`{"required":"command"}`)},
+			wantErr: "required must be an array",
+		},
+		{
+			name:    "required entries must be names",
+			spec:    provider.ToolSpec{Name: "shell", Parameters: json.RawMessage(`{"required":[1]}`)},
+			wantErr: "required must list only names",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := buildTools([]provider.ToolSpec{test.spec})
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+				t.Fatalf("buildTools() error = %v, want it to contain %q", err, test.wantErr)
+			}
+		})
+	}
+}

@@ -47,7 +47,7 @@ func TestDebugStreamRecordsTheRawResponseOnly(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "streams")
 	t.Setenv(DebugStreamEnv, dir)
 	server := debugServer(t)
-	get(t, PooledClient("chat-completions", server.URL, 0), server.URL)
+	get(t, PooledClient("chat-completions", server.URL), server.URL)
 
 	files, err := filepath.Glob(filepath.Join(dir, "*-chat-completions-*.sse"))
 	if err != nil || len(files) != 1 {
@@ -80,7 +80,7 @@ func TestDebugStreamIsOffByDefault(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "streams")
 	t.Setenv(DebugStreamEnv, "")
 	server := debugServer(t)
-	get(t, PooledClient("chat-completions", server.URL, 0), server.URL)
+	get(t, PooledClient("chat-completions", server.URL), server.URL)
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("debug directory exists without the variable set (err %v)", err)
 	}
@@ -94,5 +94,5 @@ func TestDebugStreamFailureDoesNotBreakRequests(t *testing.T) {
 	}
 	t.Setenv(DebugStreamEnv, filepath.Join(blocker, "sub"))
 	server := debugServer(t)
-	get(t, PooledClient("chat-completions", server.URL, 0), server.URL)
+	get(t, PooledClient("chat-completions", server.URL), server.URL)
 }

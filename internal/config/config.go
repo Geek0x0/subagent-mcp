@@ -37,6 +37,13 @@ type Model struct {
 // MaxNudgesLimit is the largest accepted max_nudges.
 const MaxNudgesLimit = 10
 
+// DefaultMaxOutputTokens is the max_output_tokens a messages provider gets when
+// the config does not set one. The Anthropic Messages API requires max_tokens,
+// so that api has no "let the server decide" option. The other model APIs do,
+// which is why they get no default: unset means the request carries no output
+// limit and the provider's own default applies.
+const DefaultMaxOutputTokens = 64000
+
 // Provider holds the configuration of a single API provider.
 type Provider struct {
 	API             string            `toml:"api"`
@@ -56,9 +63,15 @@ type Provider struct {
 	ExtraBody map[string]any `toml:"extra_body"`
 }
 
-// reservedBodyFields are request fields the server owns; extra_body may not set them.
+// reservedBodyFields are request fields the server owns; extra_body may not set
+// them. max_tokens belongs here because max_output_tokens now sends it: before
+// that, extra_body was the only way to cap a chat-completions call, so a config
+// may still carry it, and letting an extra field win would silently ignore the
+// configured limit. max_completion_tokens stays free on purpose — OpenAI's
+// reasoning models reject max_tokens and take that field instead.
 var reservedBodyFields = map[string]bool{
 	"model": true, "messages": true, "stream": true, "stream_options": true, "tools": true, "tool_choice": true,
+	"max_tokens": true,
 }
 
 // Config is the root of the configuration file.
@@ -118,8 +131,9 @@ func Load(path string) (*Config, error) {
 				provider.BaseURL = "https://api.openai.com/v1"
 			}
 		}
-		if provider.MaxOutputTokens == 0 {
-			provider.MaxOutputTokens = 64000
+		if provider.MaxOutputTokens == 0 && provider.API == APIMessages {
+			// Only the Messages API has no way to say "the server decides".
+			provider.MaxOutputTokens = DefaultMaxOutputTokens
 		}
 		cfg.Providers[name] = provider
 	}
@@ -163,6 +177,9 @@ func (p Provider) validate(prefix string) error {
 		if p.BaseURL != "" {
 			return fmt.Errorf("%s.base_url is not used by codex-app-server", prefix)
 		}
+		if p.MaxOutputTokens != 0 {
+			return fmt.Errorf("%s.max_output_tokens is not used by codex-app-server: the app-server applies its own limits", prefix)
+		}
 	} else {
 		if p.Command != "" {
 			return fmt.Errorf("%s.command is only valid for codex-app-server", prefix)
@@ -195,14 +212,29 @@ func (p Provider) validate(prefix string) error {
 	if p.MaxOutputTokens < 0 {
 		return fmt.Errorf("%s.max_output_tokens must be positive", prefix)
 	}
+	// The Messages API requires max_tokens, so a provider using it must carry a
+	// positive value. Load() supplies the default; a config built in code does
+	// not, and an unset field there would send an unusable zero.
+	if p.API == APIMessages && p.MaxOutputTokens == 0 {
+		return fmt.Errorf("%s.max_output_tokens must be set for %s (the API requires max_tokens); %d is the usual value", prefix, APIMessages, DefaultMaxOutputTokens)
+	}
 	if len(p.ExtraBody) > 0 {
 		if p.API != APIChatCompletions {
 			return fmt.Errorf("%s.extra_body is only supported for api = %q", prefix, APIChatCompletions)
 		}
 		for name := range p.ExtraBody {
+			if name == "max_tokens" {
+				return fmt.Errorf("%s.extra_body.max_tokens is set by the server from max_output_tokens; set %s.max_output_tokens instead, or use extra_body.max_completion_tokens for a model that requires it", prefix, prefix)
+			}
 			if reservedBodyFields[name] {
 				return fmt.Errorf("%s.extra_body.%s is set by the server and cannot be overridden", prefix, name)
 			}
+		}
+		// max_completion_tokens is the escape hatch for a model that rejects
+		// max_tokens, so it may be set — but not alongside max_output_tokens,
+		// which would send both fields and have the API reject the pair.
+		if _, present := p.ExtraBody["max_completion_tokens"]; present && p.MaxOutputTokens != 0 {
+			return fmt.Errorf("%s sets both max_output_tokens and extra_body.max_completion_tokens, which would send both limits; keep max_completion_tokens and remove max_output_tokens, or the other way round", prefix)
 		}
 	}
 	if p.MaxNudges < 0 || p.MaxNudges > MaxNudgesLimit {

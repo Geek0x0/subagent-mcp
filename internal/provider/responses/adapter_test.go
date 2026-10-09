@@ -207,3 +207,48 @@ func TestListModelsHTTPError(t *testing.T) {
 		t.Fatalf("ListModels() error = %v, want wrapped \"list models\" context", err)
 	}
 }
+
+// TestTurnSendsConfiguredMaxOutputTokens pins that max_output_tokens reaches the
+// wire. The field used to be read by the messages adapter alone, so configuring
+// it on a responses provider silently sent no limit at all.
+func TestTurnSendsConfiguredMaxOutputTokens(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure int
+		want      any // nil means the field must be absent
+	}{
+		{name: "configured limit is sent", configure: 4096, want: float64(4096)},
+		{name: "unset leaves the field out", configure: 0, want: nil},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := testutil.NewFakeResponses(t, []testutil.FakeResponse{{
+				Items: []testutil.FakeResponseItem{{MessageText: "ok"}},
+			}})
+			adapter, err := New("openai", config.Provider{
+				API: config.APIResponses, BaseURL: fake.URL, MaxOutputTokens: test.configure,
+			}, "key")
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			if _, err := adapter.Turn(context.Background(), provider.TurnRequest{
+				Model:    "m",
+				Messages: []provider.Message{{Role: provider.RoleUser, Text: "hi"}},
+			}, nil); err != nil {
+				t.Fatalf("Turn() error = %v", err)
+			}
+
+			got, present := fake.Request(0)["max_output_tokens"]
+			if test.want == nil {
+				if present {
+					t.Errorf("max_output_tokens = %v, want the field absent when the config sets no limit", got)
+				}
+				return
+			}
+			if !present || got != test.want {
+				t.Errorf("max_output_tokens = %v (present %v), want %v", got, present, test.want)
+			}
+		})
+	}
+}

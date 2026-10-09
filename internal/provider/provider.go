@@ -5,6 +5,7 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 )
 
 // Role identifies who produced a Message.
@@ -24,6 +25,27 @@ type ToolSpec struct {
 	Name        string
 	Description string
 	Parameters  json.RawMessage
+}
+
+// DecodeToolSchema returns a tool's parameter schema as a JSON object. Every
+// adapter puts its specs through this, so one contract governs all of them: a
+// schema that is not a JSON object is an error naming the tool, rather than a
+// schema passed on unchecked, silently narrowed, or replaced by an empty one.
+//
+// An absent schema decodes to an empty object, which is a tool the model may
+// call with no arguments.
+func DecodeToolSchema(spec ToolSpec) (map[string]any, error) {
+	if len(spec.Parameters) == 0 {
+		return map[string]any{}, nil
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(spec.Parameters, &schema); err != nil {
+		return nil, fmt.Errorf("tool %s schema: %w", spec.Name, err)
+	}
+	if schema == nil {
+		return nil, fmt.Errorf("tool %s schema: not a JSON object", spec.Name)
+	}
+	return schema, nil
 }
 
 // ToolCall is one tool invocation requested by the model.

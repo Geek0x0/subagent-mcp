@@ -86,8 +86,8 @@ func TestSequentialSessionsShareOneConnection(t *testing.T) {
 		t.Errorf("session 2 sent X-Api-Key = %q, want its own key %q", key, "key-second")
 	}
 	// The pool the adapters created must keep the bounded header wait.
-	if transport := provider.SharedTransport(provider.KindMessages, fake.URL, responseHeaderTimeout); transport.ResponseHeaderTimeout != responseHeaderTimeout {
-		t.Errorf("endpoint transport has ResponseHeaderTimeout = %v, want %v", transport.ResponseHeaderTimeout, responseHeaderTimeout)
+	if transport := provider.SharedTransport(provider.KindMessages, fake.URL); transport.ResponseHeaderTimeout != provider.DefaultResponseHeaderTimeout {
+		t.Errorf("endpoint transport has ResponseHeaderTimeout = %v, want %v", transport.ResponseHeaderTimeout, provider.DefaultResponseHeaderTimeout)
 	}
 }
 
@@ -100,12 +100,12 @@ func TestTransportSharedWithinEndpointScopedToIt(t *testing.T) {
 	fakeA := testutil.NewFakeMessages(t, []testutil.FakeMessage{{Blocks: []testutil.FakeBlock{{Text: "a"}}}})
 	fakeB := testutil.NewFakeMessages(t, []testutil.FakeMessage{{Blocks: []testutil.FakeBlock{{Text: "b"}}}})
 
-	transportA := provider.SharedTransport(provider.KindMessages, fakeA.URL, responseHeaderTimeout)
-	transportB := provider.SharedTransport(provider.KindMessages, fakeB.URL, responseHeaderTimeout)
+	transportA := provider.SharedTransport(provider.KindMessages, fakeA.URL)
+	transportB := provider.SharedTransport(provider.KindMessages, fakeB.URL)
 	if transportA == transportB {
 		t.Fatalf("different base URLs %s and %s share one transport", fakeA.URL, fakeB.URL)
 	}
-	if again := provider.SharedTransport(provider.KindMessages, fakeA.URL, responseHeaderTimeout); again != transportA {
+	if again := provider.SharedTransport(provider.KindMessages, fakeA.URL); again != transportA {
 		t.Fatalf("base URL %s got a different transport on the second lookup", fakeA.URL)
 	}
 	if transportA.Proxy == nil {

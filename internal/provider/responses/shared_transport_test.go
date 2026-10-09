@@ -94,12 +94,12 @@ func TestTransportSharedWithinEndpointScopedToIt(t *testing.T) {
 	fakeA := testutil.NewFakeResponses(t, []testutil.FakeResponse{{Items: []testutil.FakeResponseItem{{MessageText: "a"}}}})
 	fakeB := testutil.NewFakeResponses(t, []testutil.FakeResponse{{Items: []testutil.FakeResponseItem{{MessageText: "b"}}}})
 
-	transportA := provider.SharedTransport(provider.KindResponses, fakeA.URL, 0)
-	transportB := provider.SharedTransport(provider.KindResponses, fakeB.URL, 0)
+	transportA := provider.SharedTransport(provider.KindResponses, fakeA.URL)
+	transportB := provider.SharedTransport(provider.KindResponses, fakeB.URL)
 	if transportA == transportB {
 		t.Fatalf("different base URLs %s and %s share one transport", fakeA.URL, fakeB.URL)
 	}
-	if again := provider.SharedTransport(provider.KindResponses, fakeA.URL, 0); again != transportA {
+	if again := provider.SharedTransport(provider.KindResponses, fakeA.URL); again != transportA {
 		t.Fatalf("base URL %s got a different transport on the second lookup", fakeA.URL)
 	}
 

@@ -119,3 +119,103 @@ func TestListModelsHTTPError(t *testing.T) {
 		t.Fatalf("ListModels() error = %v, want wrapped \"list models\" context", err)
 	}
 }
+
+// TestTurnSendsConfiguredMaxOutputTokens pins that max_output_tokens reaches the
+// wire. The field used to be read by the messages adapter alone, so configuring
+// it on a chat-completions provider silently sent no limit at all.
+func TestTurnSendsConfiguredMaxOutputTokens(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure int
+		want      any // nil means the field must be absent
+	}{
+		{name: "configured limit is sent", configure: 4096, want: float64(4096)},
+		{name: "unset leaves the field out", configure: 0, want: nil},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fake := testutil.NewFakeChat(t, []testutil.FakeTurn{{Text: "ok"}})
+			adapter, err := New("deepseek", config.Provider{
+				API: config.APIChatCompletions, BaseURL: fake.URL, MaxOutputTokens: test.configure,
+			}, "key")
+			if err != nil {
+				t.Fatalf("New() error = %v", err)
+			}
+			if _, err := adapter.Turn(context.Background(), provider.TurnRequest{
+				Model:    "m",
+				Messages: []provider.Message{{Role: provider.RoleUser, Text: "hi"}},
+			}, nil); err != nil {
+				t.Fatalf("Turn() error = %v", err)
+			}
+
+			got, present := fake.Request(0)["max_tokens"]
+			if test.want == nil {
+				if present {
+					t.Errorf("max_tokens = %v, want the field absent when the config sets no limit", got)
+				}
+				return
+			}
+			if !present || got != test.want {
+				t.Errorf("max_tokens = %v (present %v), want %v", got, present, test.want)
+			}
+		})
+	}
+}
+
+// TestTurnRejectsMalformedToolSchema pins that a schema the adapter cannot read
+// fails the turn here too. The three adapters used to disagree: responses
+// rejected it, messages silently turned the tool into one with no parameters,
+// and chat-completions passed it to the API unchecked.
+func TestTurnRejectsMalformedToolSchema(t *testing.T) {
+	fake := testutil.NewFakeChat(t, []testutil.FakeTurn{{Text: "ok"}})
+	adapter, err := New("deepseek", config.Provider{API: config.APIChatCompletions, BaseURL: fake.URL}, "key")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	_, err = adapter.Turn(context.Background(), provider.TurnRequest{
+		Model:    "m",
+		Messages: []provider.Message{{Role: provider.RoleUser, Text: "hi"}},
+		Tools:    []provider.ToolSpec{{Name: "shell", Parameters: json.RawMessage(`{`)}},
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "tool shell schema") {
+		t.Fatalf("Turn() error = %v, want it to name the malformed schema", err)
+	}
+	if got := fake.RequestHeaderCount(); got != 0 {
+		t.Errorf("requests sent = %d, want 0: a malformed schema must not reach the API", got)
+	}
+}
+
+// TestTurnSendsAnObjectForAnAbsentToolSchema pins the shared schema contract on
+// the wire: an absent schema means "no arguments", which has to reach the API as
+// an empty object. The SDK marshals a nil Parameters as null, which the API
+// rejects, while the other two adapters send an object.
+func TestTurnSendsAnObjectForAnAbsentToolSchema(t *testing.T) {
+	fake := testutil.NewFakeChat(t, []testutil.FakeTurn{{Text: "ok"}})
+	adapter, err := New("deepseek", config.Provider{API: config.APIChatCompletions, BaseURL: fake.URL}, "key")
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+
+	if _, err := adapter.Turn(context.Background(), provider.TurnRequest{
+		Model:    "m",
+		Messages: []provider.Message{{Role: provider.RoleUser, Text: "hi"}},
+		Tools:    []provider.ToolSpec{{Name: "ping"}},
+	}, nil); err != nil {
+		t.Fatalf("Turn() error = %v", err)
+	}
+
+	tools, ok := fake.Request(0)["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("tools = %#v, want one entry", fake.Request(0)["tools"])
+	}
+	function := tools[0].(map[string]any)["function"].(map[string]any)
+	parameters, present := function["parameters"]
+	if !present || parameters == nil {
+		t.Fatalf("parameters = %#v (present %v), want an empty object rather than null", parameters, present)
+	}
+	if schema, ok := parameters.(map[string]any); !ok || len(schema) != 0 {
+		t.Errorf("parameters = %#v, want {}", parameters)
+	}
+}

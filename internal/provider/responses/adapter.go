@@ -25,6 +25,9 @@ func init() { provider.Register(config.APIResponses, New) }
 type Adapter struct {
 	name   string
 	client openai.Client
+	// maxOutputTokens is the configured max_output_tokens, or 0 when the config
+	// does not set one and the API's own default should apply.
+	maxOutputTokens int64
 }
 
 // New builds a Responses adapter.
@@ -42,9 +45,9 @@ func New(name string, cfg config.Provider, apiKey string) (provider.Provider, er
 		option.WithAdminAPIKey(""), // never fall back to OPENAI_ADMIN_KEY
 		option.WithBaseURL(cfg.BaseURL),
 		option.WithMiddleware(keepAllowedHeaders),
-		option.WithHTTPClient(provider.PooledClient(provider.KindResponses, cfg.BaseURL, 0)),
+		option.WithHTTPClient(provider.PooledClient(provider.KindResponses, cfg.BaseURL)),
 	)
-	return &Adapter{name: name, client: client}, nil
+	return &Adapter{name: name, client: client, maxOutputTokens: int64(cfg.MaxOutputTokens)}, nil
 }
 
 // keepAllowedHeaders reduces the outbound request to the configured Bearer
@@ -112,9 +115,9 @@ func (a *Adapter) Turn(ctx context.Context, req provider.TurnRequest, onDelta fu
 	}
 	tools := make([]oresponses.ToolUnionParam, len(req.Tools))
 	for i, spec := range req.Tools {
-		var schema map[string]any
-		if err := json.Unmarshal(spec.Parameters, &schema); err != nil {
-			return nil, fmt.Errorf("responses: tool %s schema: %w", spec.Name, err)
+		schema, err := provider.DecodeToolSchema(spec)
+		if err != nil {
+			return nil, fmt.Errorf("responses: %w", err)
 		}
 		tools[i] = oresponses.ToolUnionParam{OfFunction: &oresponses.FunctionToolParam{
 			Name: spec.Name, Description: openai.String(spec.Description), Parameters: schema, Strict: openai.Bool(false),
@@ -132,6 +135,9 @@ func (a *Adapter) Turn(ctx context.Context, req provider.TurnRequest, onDelta fu
 	}
 	if req.Effort != "" {
 		params.Reasoning = shared.ReasoningParam{Effort: shared.ReasoningEffort(req.Effort), Summary: shared.ReasoningSummaryAuto}
+	}
+	if a.maxOutputTokens > 0 {
+		params.MaxOutputTokens = param.NewOpt(a.maxOutputTokens)
 	}
 
 	stream := a.client.Responses.NewStreaming(ctx, params)

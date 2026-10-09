@@ -326,3 +326,170 @@ func TestExtraBodyValidation(t *testing.T) {
 		})
 	}
 }
+
+// TestMaxOutputTokensDefaultIsMessagesOnly pins which providers get a default.
+// The Anthropic Messages API requires max_tokens, so that api needs one; the
+// others can leave the field out and let the provider decide. Applying the
+// default everywhere is what made the field look configured on providers that
+// then sent nothing.
+func TestMaxOutputTokensDefaultIsMessagesOnly(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validTOML))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.Providers["anthropic"].MaxOutputTokens; got != DefaultMaxOutputTokens {
+		t.Errorf("messages provider max_output_tokens = %d, want the default %d", got, DefaultMaxOutputTokens)
+	}
+	if got := cfg.Providers["deepseek"].MaxOutputTokens; got != 0 {
+		t.Errorf("chat-completions provider max_output_tokens = %d, want 0 (unset, so the request carries no limit) when the config does not set one", got)
+	}
+}
+
+// TestMaxOutputTokensConfiguredForEveryHTTPAPI pins that an explicit value
+// survives loading for each api that can send it.
+func TestMaxOutputTokensConfiguredForEveryHTTPAPI(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+[providers.deepseek]
+api = "chat-completions"
+env_key = "DS_TEST_KEY"
+default_model = "m"
+max_output_tokens = 4096
+models = [{ id = "m" }]
+
+[providers.openai]
+api = "responses"
+env_key = "OAI_TEST_KEY"
+default_model = "m"
+max_output_tokens = 8192
+models = [{ id = "m" }]
+`))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got := cfg.Providers["deepseek"].MaxOutputTokens; got != 4096 {
+		t.Errorf("chat-completions max_output_tokens = %d, want 4096", got)
+	}
+	if got := cfg.Providers["openai"].MaxOutputTokens; got != 8192 {
+		t.Errorf("responses max_output_tokens = %d, want 8192", got)
+	}
+}
+
+// TestCodexRejectsMaxOutputTokens pins that a field codex-app-server cannot honor
+// is an error rather than a setting that quietly does nothing.
+func TestCodexRejectsMaxOutputTokens(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+[providers.codex]
+api = "codex-app-server"
+default_model = "m"
+max_output_tokens = 4096
+models = [{ id = "m" }]
+`))
+	if err == nil || !strings.Contains(err.Error(), "max_output_tokens") {
+		t.Fatalf("Load() error = %v, want it to reject max_output_tokens for codex-app-server", err)
+	}
+}
+
+// TestExtraBodyCannotOverrideMaxTokens pins that the limit the server now sends
+// cannot be silently replaced by an extra_body field of the same name. Before
+// max_output_tokens was honoured, extra_body was the only way to cap a
+// chat-completions call, so a config can carry both; letting the extra field win
+// would ignore the configured limit without saying so.
+func TestExtraBodyCannotOverrideMaxTokens(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+[providers.deepseek]
+api = "chat-completions"
+env_key = "DS_TEST_KEY"
+default_model = "m"
+max_output_tokens = 8192
+models = [{ id = "m" }]
+
+[providers.deepseek.extra_body]
+max_tokens = 4096
+`))
+	if err == nil || !strings.Contains(err.Error(), "max_output_tokens") {
+		t.Fatalf("Load() error = %v, want it to reject extra_body.max_tokens and point at max_output_tokens", err)
+	}
+}
+
+// TestExtraBodyStillAllowsMaxCompletionTokens pins the escape hatch the reserved
+// field list deliberately leaves open: OpenAI's reasoning models reject
+// max_tokens and take max_completion_tokens instead.
+func TestExtraBodyStillAllowsMaxCompletionTokens(t *testing.T) {
+	cfg, err := Load(writeConfig(t, `
+[providers.openai]
+api = "chat-completions"
+env_key = "OAI_TEST_KEY"
+default_model = "m"
+models = [{ id = "m" }]
+
+[providers.openai.extra_body]
+max_completion_tokens = 4096
+`))
+	if err != nil {
+		t.Fatalf("Load() error = %v, want extra_body.max_completion_tokens to be accepted", err)
+	}
+	if got := cfg.Providers["openai"].ExtraBody["max_completion_tokens"]; got != int64(4096) && got != 4096 {
+		t.Errorf("extra_body.max_completion_tokens = %v (%T), want 4096", got, got)
+	}
+}
+
+// TestValidateRequiresMaxOutputTokensForMessages pins the invariant Load applies
+// by defaulting: a messages provider built in code must still carry a positive
+// max_tokens, because that API requires the field.
+func TestValidateRequiresMaxOutputTokensForMessages(t *testing.T) {
+	cfg := &Config{Providers: map[string]Provider{
+		"anthropic": {
+			API:          APIMessages,
+			EnvKey:       "ANT_TEST_KEY",
+			DefaultModel: "m",
+			Models:       []Model{{ID: "m"}},
+		},
+	}}
+	err := cfg.Validate()
+	if err == nil || !strings.Contains(err.Error(), "max_output_tokens") {
+		t.Fatalf("Validate() error = %v, want it to require max_output_tokens for messages", err)
+	}
+
+	cfg.Providers["anthropic"] = func() Provider {
+		p := cfg.Providers["anthropic"]
+		p.MaxOutputTokens = DefaultMaxOutputTokens
+		return p
+	}()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v with max_output_tokens set, want nil", err)
+	}
+}
+
+// TestRejectsTwoOutputLimitsAtOnce pins that the escape hatch for models which
+// reject max_tokens cannot be combined with the limit the server sends: both
+// would reach the wire, and the API refuses the pair.
+func TestRejectsTwoOutputLimitsAtOnce(t *testing.T) {
+	_, err := Load(writeConfig(t, `
+[providers.openai]
+api = "chat-completions"
+env_key = "OAI_TEST_KEY"
+default_model = "m"
+max_output_tokens = 8192
+models = [{ id = "m" }]
+
+[providers.openai.extra_body]
+max_completion_tokens = 1024
+`))
+	if err == nil || !strings.Contains(err.Error(), "both") {
+		t.Fatalf("Load() error = %v, want it to reject two output limits at once", err)
+	}
+
+	// The hedge alone is accepted, which is the escape hatch for a reasoning model.
+	if _, err := Load(writeConfig(t, `
+[providers.openai]
+api = "chat-completions"
+env_key = "OAI_TEST_KEY"
+default_model = "m"
+models = [{ id = "m" }]
+
+[providers.openai.extra_body]
+max_completion_tokens = 1024
+`)); err != nil {
+		t.Fatalf("Load() error = %v, want max_completion_tokens alone to be accepted", err)
+	}
+}

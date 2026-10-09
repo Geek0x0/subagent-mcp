@@ -27,6 +27,18 @@ const (
 	KindChatCompletions = "chat-completions"
 )
 
+// DefaultResponseHeaderTimeout bounds how long an adapter waits for the response
+// headers of a model API call. Without a bound, a gateway that accepts the TCP
+// connection and then never answers leaves the turn — and the thread lock behind
+// it — waiting until the caller cancels. It matches the default the Anthropic
+// SDK applies to its own client, so the messages adapter behaves the same either
+// way, and it does not apply to the response body: streams are unaffected.
+//
+// It is one shared constant rather than a per-adapter argument because the
+// transport registry is keyed by (kind, base URL) alone, so the first caller's
+// value would silently win for every later caller of the same endpoint.
+const DefaultResponseHeaderTimeout = 10 * time.Minute
+
 // sharedTransports maps one (kind, base URL) pair to the transport every
 // adapter instance for that pair reuses. The registry never grows past the
 // distinct base URLs in the server's configuration — a small, fixed set, one
@@ -37,21 +49,19 @@ var (
 	sharedTransports   = map[string]*http.Transport{}
 )
 
-// SharedTransport returns the connection pool shared by every adapter built
-// for the same (kind, baseURL): sessions against one endpoint reuse TLS/TCP
+// SharedTransport returns the connection pool shared by every adapter built for
+// the same (kind, baseURL): sessions against one endpoint reuse TLS/TCP
 // connections instead of building a fresh SDK transport — and paying a fresh
 // handshake — for every session. Only the pool is shared. Each adapter still
 // builds its own SDK client carrying its own credential, because the API key
 // differs per session and per provider.
 //
 // The transport is a clone of http.DefaultTransport, so proxy-from-environment
-// and the standard TLS defaults carry over unchanged (no InsecureSkipVerify);
-// responseHeaderTimeout bounds the wait for response headers (0 leaves that
-// unbounded, which is what the responses and chat-completions adapters had).
-// The transport is built once, under the registry lock, on first use: every
-// caller for a kind must pass that kind's timeout, and callers must not mutate
-// the returned transport afterwards.
-func SharedTransport(kind, baseURL string, responseHeaderTimeout time.Duration) *http.Transport {
+// and the standard TLS defaults carry over unchanged (no InsecureSkipVerify),
+// and DefaultResponseHeaderTimeout bounds the wait for response headers. The
+// transport is built once, under the registry lock, on first use, and callers
+// must not mutate the returned transport afterwards.
+func SharedTransport(kind, baseURL string) *http.Transport {
 	key := kind + "\x00" + baseURL
 
 	sharedTransportsMu.Lock()
@@ -69,7 +79,7 @@ func SharedTransport(kind, baseURL string, responseHeaderTimeout time.Duration) 
 		// rather than sharing a pool this registry cannot describe.
 		transport = &http.Transport{Proxy: http.ProxyFromEnvironment}
 	}
-	transport.ResponseHeaderTimeout = responseHeaderTimeout
+	transport.ResponseHeaderTimeout = DefaultResponseHeaderTimeout
 	sharedTransports[key] = transport
 	return transport
 }
@@ -82,24 +92,24 @@ const (
 	drainTimeout = 250 * time.Millisecond
 )
 
-// PooledClient returns an HTTP client over SharedTransport(kind, baseURL, ...)
-// whose response bodies are drained on Close. The SSE readers stop at the final
+// PooledClient returns an HTTP client over SharedTransport(kind, baseURL) whose
+// response bodies are drained on Close. The SSE readers stop at the final
 // sentinel without reading the body to EOF; Go's transport only returns a
 // connection to the pool once the body has hit EOF, so without the drain every
 // streamed turn would close its connection and the pool would never be reused.
 // The drain is bounded by size and time (drainLimit, drainTimeout); a cancelled
 // request makes the read fail at once.
-func PooledClient(kind, baseURL string, responseHeaderTimeout time.Duration) *http.Client {
-	return PooledClientWithBody(kind, baseURL, responseHeaderTimeout, nil)
+func PooledClient(kind, baseURL string) *http.Client {
+	return PooledClientWithBody(kind, baseURL, nil)
 }
 
 // PooledClientWithBody is PooledClient that also merges extraBody into the JSON
 // object of every POST request body, for fields the SDK has no place for (a
 // gateway's upstream-routing preferences, say). The pool stays shared; the extra
 // fields belong to this client only.
-func PooledClientWithBody(kind, baseURL string, responseHeaderTimeout time.Duration, extraBody map[string]any) *http.Client {
+func PooledClientWithBody(kind, baseURL string, extraBody map[string]any) *http.Client {
 	return &http.Client{Transport: drainingTransport{
-		base: SharedTransport(kind, baseURL, responseHeaderTimeout), kind: kind, extra: extraBody,
+		base: SharedTransport(kind, baseURL), kind: kind, extra: extraBody,
 	}}
 }
 
