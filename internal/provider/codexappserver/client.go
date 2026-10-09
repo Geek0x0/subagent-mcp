@@ -126,11 +126,14 @@ func (c *Client) Notify(method string, params any) error {
 	return c.write(Message{Method: method, Params: raw})
 }
 
-// Subscribe returns the existing queue for threadID, or registers a new one.
+// Subscribe returns the existing queue for threadID, or registers a new one. A
+// queue that failed permanently — its backlog outgrew the cap — is replaced, so
+// a thread that recovers its consumer can be served again rather than being
+// poisoned for the life of the process.
 func (c *Client) Subscribe(threadID string) *Subscription {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if sub := c.subscriptions[threadID]; sub != nil {
+	if sub := c.subscriptions[threadID]; sub != nil && !sub.failedPermanently() {
 		return sub
 	}
 	sub := &Subscription{changed: make(chan struct{})}
@@ -253,21 +256,113 @@ func (c *Client) stop(err error) {
 	close(c.done)
 }
 
-// Subscription is an unbounded, in-order queue. A slow consumer never holds up
-// the shared reader. Closing a queue discards events and wakes every waiter.
+// maxQueuedEvents caps one subscription's queue. Streamed text is merged, so
+// reaching this means a consumer that is not draining while the server keeps
+// sending distinct notifications — an approval the model is not answering, say.
+// Failing the turn with a clear error beats growing without bound.
+const maxQueuedEvents = 4096
+
+// deltaMethod is the notification that streams assistant text, one message per
+// token.
+const deltaMethod = "item/agentMessage/delta"
+
+// Subscription is an in-order queue that merges runs of streamed text. A slow
+// consumer never holds up the shared reader. Closing a queue discards events and
+// wakes every waiter.
 type Subscription struct {
 	mu      sync.Mutex
-	queue   []Message
+	queue   []queuedEvent
 	changed chan struct{}
 	err     error
+	// permanent marks an error the queue cannot recover from, which is what
+	// lets Subscribe replace it instead of handing it out forever.
+	permanent bool
+}
+
+// failedPermanently reports whether this queue must not be reused.
+func (s *Subscription) failedPermanently() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.permanent
+}
+
+// queuedEvent is one queued notification. A run of deltas for one item
+// accumulates in text and is materialized as a single notification when it is
+// dequeued, so a turn that streams one notification per token neither grows the
+// queue nor re-encodes the accumulated text once per token.
+type queuedEvent struct {
+	msg  Message
+	item string
+	text []byte
+}
+
+// message returns the notification to hand the consumer, with any merged delta
+// run folded back into the params.
+func (q *queuedEvent) message() Message {
+	if len(q.text) == 0 {
+		return q.msg
+	}
+	var params notificationParams
+	if err := json.Unmarshal(q.msg.Params, &params); err != nil {
+		return q.msg
+	}
+	params.Delta = string(q.text)
+	raw, err := json.Marshal(params)
+	if err != nil {
+		return q.msg
+	}
+	return Message{Method: q.msg.Method, Params: raw}
 }
 
 func (s *Subscription) enqueue(msg Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.queue = append(s.queue, msg)
-	// Broadcast only on the empty-to-nonempty transition. No consumer can be
-	// asleep with a nonempty queue, except one already woken by this signal.
+	if s.err != nil {
+		return
+	}
+
+	if msg.Method == deltaMethod {
+		var params notificationParams
+		if json.Unmarshal(msg.Params, &params) == nil && params.ItemID != "" {
+			if n := len(s.queue); n > 0 && s.queue[n-1].item == params.ItemID {
+				// Continuing the run: the queue was already nonempty, so no
+				// waiter needs waking.
+				s.queue[n-1].text = append(s.queue[n-1].text, params.Delta...)
+				return
+			}
+			s.queue = append(s.queue, queuedEvent{
+				msg:  msg,
+				item: params.ItemID,
+				text: []byte(params.Delta),
+			})
+			s.wakeLocked()
+			s.failOnBacklogLocked()
+			return
+		}
+	}
+
+	s.queue = append(s.queue, queuedEvent{msg: msg})
+	s.wakeLocked()
+	s.failOnBacklogLocked()
+}
+
+// failOnBacklogLocked abandons the turn once the queue outgrows its cap. Merging
+// keeps a streamed turn far below it, so reaching the cap means the consumer is
+// not draining at all; an error it can report beats a queue that grows until the
+// process dies.
+func (s *Subscription) failOnBacklogLocked() {
+	if len(s.queue) <= maxQueuedEvents {
+		return
+	}
+	s.err = fmt.Errorf("codex app-server event backlog exceeded %d notifications: the consumer stopped draining, so this subscription is closed; its events are no longer delivered and the turn cannot continue", maxQueuedEvents)
+	s.permanent = true
+	s.queue = nil
+	close(s.changed)
+}
+
+// wakeLocked broadcasts only on the empty-to-nonempty transition. No consumer
+// can be asleep with a nonempty queue, except one already woken by this signal.
+func (s *Subscription) wakeLocked() {
 	if len(s.queue) == 1 {
 		close(s.changed)
 		s.changed = make(chan struct{})
@@ -281,7 +376,10 @@ func (s *Subscription) close(err error) []Message {
 		return nil
 	}
 	s.err = err
-	queued := s.queue
+	queued := make([]Message, 0, len(s.queue))
+	for i := range s.queue {
+		queued = append(queued, s.queue[i].message())
+	}
 	s.queue = nil
 	close(s.changed)
 	return queued
@@ -300,8 +398,8 @@ func (s *Subscription) Next(ctx context.Context) (Message, error) {
 			return Message{}, err
 		}
 		if len(s.queue) != 0 {
-			msg := s.queue[0]
-			s.queue[0] = Message{} // Do not retain consumed payloads.
+			msg := s.queue[0].message()
+			s.queue[0] = queuedEvent{} // Do not retain consumed payloads.
 			s.queue = s.queue[1:]
 			if len(s.queue) == 0 {
 				s.queue = nil

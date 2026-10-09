@@ -66,6 +66,61 @@ func TestPoolInitializeAndGenerations(t *testing.T) {
 	}
 }
 
+// TestShutdownClosesPooledChild pins the process-exit path: a pooled app-server
+// child outlives the call that dialed it, so the shutdown func the adapter
+// registers must close it instead of leaving it to keep running whatever turn it
+// was handed.
+func TestShutdownClosesPooledChild(t *testing.T) {
+	f := threadFake(t)
+	p := fakePool(t, f)
+	c, err := p.acquire(threadContext(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Register the pool the way poolForCommand does, under a command no other
+	// test uses, so Shutdown reaches exactly this child.
+	const command = "codex-shutdown-test"
+	poolsMu.Lock()
+	pools[command] = p
+	poolsMu.Unlock()
+	t.Cleanup(func() {
+		poolsMu.Lock()
+		delete(pools, command)
+		poolsMu.Unlock()
+	})
+
+	if p.current == nil {
+		t.Fatal("pool has no live connection to close")
+	}
+	Shutdown()
+	if p.current != nil {
+		t.Error("Shutdown left the pooled app-server child connected")
+	}
+	await(t, c.client.Done())
+}
+
+// TestShutdownLeavesIdlePoolAlone pins that Shutdown is safe when the adapter
+// never dialed: the exit path runs whether or not a Codex session was used.
+func TestShutdownLeavesIdlePoolAlone(t *testing.T) {
+	const command = "codex-idle-shutdown-test"
+	p := fakePool(t)
+	poolsMu.Lock()
+	pools[command] = p
+	poolsMu.Unlock()
+	t.Cleanup(func() {
+		poolsMu.Lock()
+		delete(pools, command)
+		poolsMu.Unlock()
+	})
+
+	Shutdown()
+
+	if p.current != nil {
+		t.Error("Shutdown dialed an idle pool")
+	}
+}
+
 func TestPoolAcquireWaitingCallerCanCancel(t *testing.T) {
 	f := threadFake(t)
 	initializing, release := make(chan struct{}), make(chan struct{})

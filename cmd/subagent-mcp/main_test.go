@@ -1,15 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/Geek0x0/subagent-mcp/internal/testutil"
 )
@@ -288,4 +292,92 @@ func writeConfigFile(t *testing.T, contents string) string {
 
 func hasEnvName(entry, name string) bool {
 	return strings.HasPrefix(entry, name+"=")
+}
+
+// TestMainStopsOnSignal pins the shutdown path end to end: a serving process must
+// stop on SIGTERM, release what it holds, and report success rather than the
+// cancellation mcp-go ends its serve loop with.
+//
+// The child is driven through an MCP initialize exchange first, so the signal
+// cannot arrive before the server installed its handler: a fixed sleep would
+// make the test fail with "signal: terminated" whenever a loaded machine needs
+// longer than the sleep to start.
+func TestMainStopsOnSignal(t *testing.T) {
+	if runMainChild(t) {
+		return
+	}
+
+	path := writeConfigFile(t, validTestConfig)
+	cmd := newMainChildCommand(t)
+	cmd.Env = append(cmd.Env, "SUBAGENT_MCP_CONFIG="+path)
+
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatalf("StdinPipe() error = %v", err)
+	}
+	defer stdin.Close()
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatalf("StdoutPipe() error = %v", err)
+	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	select {
+	case err := <-serveUntilInitialized(cmd, stdin, stdout):
+		if err != nil {
+			t.Fatalf("child never answered initialize: %v; stderr = %q", err, stderr.String())
+		}
+	case <-time.After(20 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("child never answered initialize; stderr = %q", stderr.String())
+	}
+
+	// A stdout pipe that stays open keeps the child's writes from failing while
+	// it shuts down; the readiness answer has already been read.
+	start := time.Now()
+	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal child: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("main() exit after SIGTERM = %v, want success; stderr = %q", err, stderr.String())
+		}
+	case <-time.After(20 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatalf("main() did not stop within 20s of SIGTERM; stderr = %q", stderr.String())
+	}
+
+	// Shutdown is expected to be immediate; a run that waits out the ten-second
+	// grace period instead would still pass a bare liveness check.
+	if elapsed := time.Since(start); elapsed > 8*time.Second {
+		t.Errorf("main() took %v to stop, want it to stop without waiting out the grace period", elapsed)
+	}
+}
+
+// serveUntilInitialized writes one MCP initialize request and reports when the
+// server has answered it, which is the first moment the process is certainly
+// serving with its signal handler installed.
+func serveUntilInitialized(cmd *exec.Cmd, stdin io.Writer, stdout io.Reader) <-chan error {
+	result := make(chan error, 1)
+	go func() {
+		request := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"main-test","version":"1"}}}` + "\n"
+		if _, err := io.WriteString(stdin, request); err != nil {
+			result <- err
+			return
+		}
+		reader := bufio.NewReader(stdout)
+		if _, err := reader.ReadString('\n'); err != nil {
+			result <- err
+			return
+		}
+		result <- nil
+	}()
+	return result
 }

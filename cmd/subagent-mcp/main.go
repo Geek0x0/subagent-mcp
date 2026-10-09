@@ -1,12 +1,18 @@
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/Geek0x0/subagent-mcp/internal/config"
+	"github.com/Geek0x0/subagent-mcp/internal/provider"
 	_ "github.com/Geek0x0/subagent-mcp/internal/provider/chatcompletions"
 	_ "github.com/Geek0x0/subagent-mcp/internal/provider/codexappserver"
 	_ "github.com/Geek0x0/subagent-mcp/internal/provider/messages"
@@ -16,7 +22,12 @@ import (
 	"github.com/Geek0x0/subagent-mcp/internal/tools"
 )
 
-const version = "0.10.2"
+const version = "0.11.0"
+
+// shutdownGrace bounds how long the process waits for in-flight runs to unwind
+// and for sessions to be released. Cancellation reaches every blocking step a
+// run makes, so this only elapses when a dependency ignores its context.
+const shutdownGrace = 10 * time.Second
 
 var disableProcessDumpingFn = disableProcessDumping
 
@@ -48,7 +59,11 @@ func main() {
 		configureRuntime(cfg)
 		fmt.Printf("config   %s   OK\n", path)
 		reportSandbox(os.Stdout)
-		os.Exit(runCheck(os.Stdout, cfg, *liveFlag))
+		code := runCheck(os.Stdout, cfg, *liveFlag)
+		// Checking a codex-app-server provider starts its child, so release it
+		// before exiting rather than leaving it to stdin EOF.
+		provider.Shutdown()
+		os.Exit(code)
 	}
 
 	path, err := config.DefaultPath()
@@ -69,9 +84,71 @@ func main() {
 		options = append(options, dsserver.WithToolName(toolName))
 	}
 
-	if err := dsserver.New(cfg, version, options...).ServeStdio(); err != nil {
-		log.Fatal(err)
+	os.Exit(serve(dsserver.New(cfg, version, options...)))
+}
+
+// serve runs the stdio loop until the client closes its end or a signal asks the
+// server to stop, then shuts down within shutdownGrace and reports the exit
+// code. Provider resources are released last: pooled child processes must
+// outlive the sessions that use them.
+func serve(srv *dsserver.Server) int {
+	signals := make(chan os.Signal, 2)
+	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(signals)
+
+	served := make(chan error, 1)
+	go func() { served <- srv.ServeStdio() }()
+
+	serving := true
+	var serveErr error
+	select {
+	case serveErr = <-served:
+		serving = false
+	case sig := <-signals:
+		log.Printf("received %s; shutting down", sig)
+		// A second signal abandons the wait: an operator must always be able to
+		// stop a server parked on a dependency that ignores cancellation.
+		go func() {
+			<-signals
+			log.Printf("received a second signal; exiting immediately")
+			os.Exit(130)
+		}()
 	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
+	defer cancel()
+	srv.Close(ctx)
+
+	if serving {
+		select {
+		case serveErr = <-served:
+		case <-ctx.Done():
+			log.Printf("shutdown: the stdio loop did not stop within %s", shutdownGrace)
+		}
+	}
+	// Provider resources go last, and within the same budget: a pool whose child
+	// is being dialed holds its gate until that dial returns, and shutdown must
+	// not be able to outlast the grace period it promises.
+	released := make(chan struct{})
+	go func() {
+		defer close(released)
+		provider.Shutdown()
+	}()
+	select {
+	case <-released:
+	case <-ctx.Done():
+		log.Printf("shutdown: a provider did not release its resources within %s", shutdownGrace)
+	}
+
+	// Ending the serve loop is how Close stops it, so a shutdown this process
+	// asked for reports a cancellation rather than an error; a client that
+	// simply closes its end reports nil. Both mean the server stopped on
+	// purpose.
+	if serveErr != nil && !errors.Is(serveErr, context.Canceled) {
+		log.Print(serveErr)
+		return 1
+	}
+	return 0
 }
 
 func configureRuntime(cfg *config.Config) {

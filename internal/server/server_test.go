@@ -1,10 +1,13 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -2077,5 +2080,531 @@ func TestHandleStartMaxNudges(t *testing.T) {
 				t.Errorf("model calls = %d, want %d", len(client.requests), test.wantCalls)
 			}
 		})
+	}
+}
+
+// stubbornProvider ignores its context, standing in for a dependency that never
+// observes cancellation.
+type stubbornProvider struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+// finish ends the parked turn exactly once, so a test can release it from both
+// its normal path and a deferred safety net.
+func (p *stubbornProvider) finish() { p.once.Do(func() { close(p.release) }) }
+
+func (p *stubbornProvider) Name() string { return "stubborn" }
+
+func (p *stubbornProvider) Turn(context.Context, provider.TurnRequest, func(string)) (*provider.TurnResult, error) {
+	close(p.entered)
+	<-p.release
+	return &provider.TurnResult{Text: "late"}, nil
+}
+
+// TestCloseCancelsInFlightCallAndReleasesSessions pins the shutdown path: a call
+// parked in a provider that only returns when its context ends must be cancelled
+// by Close, and the session it created must be released rather than abandoned.
+func TestCloseCancelsInFlightCallAndReleasesSessions(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	entered := make(chan struct{}, 1)
+	s := New(testConfig(t, &stubProvider{block: block, entered: entered}), "test")
+
+	type outcome struct {
+		result *mcp.CallToolResult
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+			"prompt": "hi",
+			"cwd":    t.TempDir(),
+		}))
+		done <- outcome{result: result, err: err}
+	}()
+
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run never reached the provider")
+	}
+	if got := managerSessionCount(t, s.mgr); got != 1 {
+		t.Fatalf("sessions before Close = %d, want 1", got)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s.Close(ctx)
+
+	select {
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("handleStart() Go error = %v, want nil", got.err)
+		}
+		if !got.result.IsError {
+			t.Fatalf("handleStart() result = %#v, want a cancelled tool error", got.result)
+		}
+		if text := toolResultText(t, got.result); !strings.Contains(text, "context canceled") {
+			t.Errorf("handleStart() text = %q, want it to report the cancellation", text)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleStart() did not return after Close cancelled it")
+	}
+
+	if got := managerSessionCount(t, s.mgr); got != 0 {
+		t.Errorf("sessions held after Close = %d, want 0", got)
+	}
+}
+
+// TestCloseIsBoundedWhenARunIgnoresCancellation pins that shutdown always
+// terminates: a dependency deaf to cancellation may cost a session at exit, but
+// it must never leave the process unable to stop.
+func TestCloseIsBoundedWhenARunIgnoresCancellation(t *testing.T) {
+	stub := &stubbornProvider{entered: make(chan struct{}), release: make(chan struct{})}
+	defer stub.finish()
+	s := New(testConfig(t, stub), "test")
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+			"prompt": "hi",
+			"cwd":    t.TempDir(),
+		}))
+	}()
+
+	select {
+	case <-stub.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run never reached the provider")
+	}
+
+	const deadline = 250 * time.Millisecond
+	ctx, cancel := context.WithTimeout(context.Background(), deadline)
+	defer cancel()
+	start := time.Now()
+	s.Close(ctx)
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("Close() took %v with a %v deadline, want it bounded", elapsed, deadline)
+	}
+
+	// Let the ignored run finish so the test returns with nothing parked.
+	stub.finish()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run never returned after being released")
+	}
+}
+
+// requestWithID builds a tool request carrying the request key the
+// before-call-tool hook stores, computed the same way the hook computes it, so a
+// cancellation notification can address the call.
+func requestWithID(t *testing.T, name string, arguments map[string]any, id any) mcp.CallToolRequest {
+	t.Helper()
+	key, ok := canonicalRequestID(id)
+	if !ok {
+		t.Fatalf("canonicalRequestID(%v) is not a usable request id", id)
+	}
+	req := callToolRequest(name, arguments)
+	req.Params.Meta = &mcp.Meta{AdditionalFields: map[string]any{requestIDMetaKey: key}}
+	return req
+}
+
+// cancelledNotification builds the notifications/cancelled message a client sends
+// when it abandons a request.
+func cancelledNotification(requestID any) mcp.JSONRPCNotification {
+	return mcp.JSONRPCNotification{
+		JSONRPC: "2.0",
+		Notification: mcp.Notification{
+			Method: cancelledNotificationMethod,
+			Params: mcp.NotificationParams{
+				AdditionalFields: map[string]any{"requestId": requestID},
+			},
+		},
+	}
+}
+
+// TestBeginCallDoesNotOrphanAReusedRequestID pins the identity check on the call
+// registry: a client that reuses a request ID while the first call is still
+// running must not have the second call's registration removed when the first
+// one finishes, or cancelling the ID would silently do nothing.
+func TestBeginCallDoesNotOrphanAReusedRequestID(t *testing.T) {
+	s := New(testConfig(t, &stubProvider{}), "test")
+
+	_, firstEnd := s.beginCall(context.Background(), requestWithID(t, "subagent", nil, 7))
+	secondCtx, secondEnd := s.beginCall(context.Background(), requestWithID(t, "subagent", nil, 7))
+	defer secondEnd()
+
+	// The first call finishes while the second one is still running: its
+	// cleanup must leave the second call's registration in place.
+	firstEnd()
+
+	s.callsMu.Lock()
+	registered := s.calls["int64:7"] != nil
+	s.callsMu.Unlock()
+	if !registered {
+		t.Fatal("the first call's cleanup removed the second call's request ID registration")
+	}
+
+	s.handleCancelledNotification(context.Background(), cancelledNotification(7))
+	if secondCtx.Err() == nil {
+		t.Error("cancelling a reused request ID left the second call running")
+	}
+}
+
+// TestParseBudgets pins the per-call spending limits: an absent key keeps the
+// default, a present one is applied, and an unusable value is an error rather
+// than a ceiling the caller believes is in force.
+func TestParseBudgets(t *testing.T) {
+	tests := []struct {
+		name    string
+		config  map[string]any
+		want    runBudgets
+		wantErr string
+	}{
+		{
+			name:   "absent keys keep the history default",
+			config: nil,
+			want:   runBudgets{historyBytes: agent.DefaultMaxHistoryBytes},
+		},
+		{
+			name: "every limit applied",
+			config: map[string]any{
+				"max_history_bytes":    float64(4096),
+				"max_total_tokens":     float64(5000),
+				"run_deadline_seconds": float64(120),
+			},
+			want: runBudgets{historyBytes: 4096, totalTokens: 5000, runDeadline: 120 * time.Second},
+		},
+		{
+			name:   "zero disables each limit",
+			config: map[string]any{"max_history_bytes": float64(0), "max_total_tokens": float64(0), "run_deadline_seconds": float64(0)},
+			want:   runBudgets{},
+		},
+		{
+			name:    "fractional history limit",
+			config:  map[string]any{"max_history_bytes": 1.5},
+			wantErr: "max_history_bytes",
+		},
+		{
+			name:    "negative token limit",
+			config:  map[string]any{"max_total_tokens": float64(-1)},
+			wantErr: "max_total_tokens",
+		},
+		{
+			name:    "string deadline",
+			config:  map[string]any{"run_deadline_seconds": "soon"},
+			wantErr: "run_deadline_seconds",
+		},
+		{
+			name:    "deadline beyond the ceiling",
+			config:  map[string]any{"run_deadline_seconds": float64(maxRunDeadlineSeconds + 1)},
+			wantErr: "run_deadline_seconds",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := parseBudgets(test.config)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("parseBudgets() error = %v, want it to name %q", err, test.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseBudgets() error = %v", err)
+			}
+			if got != test.want {
+				t.Errorf("parseBudgets() = %+v, want %+v", got, test.want)
+			}
+		})
+	}
+}
+
+// TestHandleStartRejectsInvalidBudget pins that a caller who asks for a ceiling
+// and misspells its value is told so instead of running unbounded.
+func TestHandleStartRejectsInvalidBudget(t *testing.T) {
+	s := New(testConfig(t, &stubProvider{}), "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "hi",
+		"cwd":    t.TempDir(),
+		"config": map[string]any{"max_total_tokens": "lots"},
+	}))
+	if err != nil {
+		t.Fatalf("handleStart() Go error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatalf("handleStart() result = %#v, want a tool error", result)
+	}
+	if text := toolResultText(t, result); !strings.Contains(text, "max_total_tokens") {
+		t.Errorf("handleStart() text = %q, want it to name the unusable limit", text)
+	}
+	if got := managerSessionCount(t, s.mgr); got != 0 {
+		t.Errorf("sessions created for a rejected budget = %d, want 0", got)
+	}
+}
+
+// TestHistoryBudgetStopsTheThreadOnceItIsSpent pins the cumulative ceiling: a
+// thread whose replayed history grows past max_history_bytes is refused at the
+// next turn, so the whole history cannot be re-sent once per turn forever.
+func TestHistoryBudgetStopsTheThreadOnceItIsSpent(t *testing.T) {
+	// Two turns each carry ~4 KiB of tool arguments, so a 5000-byte ceiling is
+	// crossed during the second turn and must refuse the third. The tool name is
+	// unknown on purpose: its result is short and fixed, so the history grows by
+	// the tool arguments alone and the arithmetic stays readable.
+	bigArgs := `{"path":"` + strings.Repeat("a", 4000) + `"}`
+	call := provider.ToolCall{ID: "call-1", Name: "no_such_tool", Arguments: bigArgs}
+	client := &stubProvider{turns: []stubTurn{
+		{result: &provider.TurnResult{ToolCalls: []provider.ToolCall{call}}},
+		{result: &provider.TurnResult{ToolCalls: []provider.ToolCall{call}}},
+	}}
+	s := New(testConfig(t, client), "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "start",
+		"cwd":    t.TempDir(),
+		"config": map[string]any{"max_history_bytes": float64(5000), "max_turns": float64(10)},
+	}))
+	if err != nil {
+		t.Fatalf("handleStart() Go error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatalf("handleStart() result = %#v, want the history limit to stop the run", result)
+	}
+	if text := toolResultText(t, result); !strings.Contains(text, "max_history_bytes") {
+		t.Errorf("handleStart() text = %q, want it to name max_history_bytes", text)
+	}
+	if got := len(client.recordedRequests()); got != 2 {
+		t.Errorf("model calls = %d, want 2 (the third turn must be refused before it is sent)", got)
+	}
+}
+
+// TestTokenBudgetStopsTheThreadOnceItIsSpent pins the cumulative cost ceiling:
+// a thread that has already reported max_total_tokens is refused before the next
+// model call, so a reply loop cannot keep billing past the budget.
+func TestTokenBudgetStopsTheThreadOnceItIsSpent(t *testing.T) {
+	call := provider.ToolCall{ID: "call-1", Name: "read_file", Arguments: `{"path":"missing"}`}
+	client := &stubProvider{repeat: &provider.TurnResult{
+		ToolCalls: []provider.ToolCall{call},
+		Usage:     &provider.Usage{Input: 60, Output: 40, Total: 100},
+	}}
+	s := New(testConfig(t, client), "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "start",
+		"cwd":    t.TempDir(),
+		"config": map[string]any{"max_total_tokens": float64(100), "max_turns": float64(10)},
+	}))
+	if err != nil {
+		t.Fatalf("handleStart() Go error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatalf("handleStart() result = %#v, want the token budget to stop the run", result)
+	}
+	if text := toolResultText(t, result); !strings.Contains(text, "max_total_tokens") {
+		t.Errorf("handleStart() text = %q, want it to name max_total_tokens", text)
+	}
+	if got := len(client.recordedRequests()); got != 1 {
+		t.Errorf("model calls = %d, want 1 (the second turn must be refused before it is sent)", got)
+	}
+}
+
+// TestRunDeadlineBoundsARun pins the wall-clock ceiling: a provider that never
+// returns must not hold the thread past run_deadline_seconds, and the error must
+// name the deadline rather than a bare context error.
+func TestRunDeadlineBoundsARun(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	entered := make(chan struct{}, 1)
+	s := New(testConfig(t, &stubProvider{block: block, entered: entered}), "test")
+
+	start := time.Now()
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "start",
+		"cwd":    t.TempDir(),
+		"config": map[string]any{"run_deadline_seconds": float64(1)},
+	}))
+	elapsed := time.Since(start)
+
+	if err != nil {
+		t.Fatalf("handleStart() Go error = %v, want nil", err)
+	}
+	if !result.IsError {
+		t.Fatalf("handleStart() result = %#v, want the deadline to stop the run", result)
+	}
+	if text := toolResultText(t, result); !strings.Contains(text, "run deadline") {
+		t.Errorf("handleStart() text = %q, want it to name the run deadline", text)
+	}
+	if elapsed > 10*time.Second {
+		t.Errorf("handleStart() took %v with a 1s deadline", elapsed)
+	}
+}
+
+// TestBeginCallAfterCloseIsCancelledAtOnce pins that a call dequeued while the
+// server is closing does not run to completion: mcp-go's workers can still pick
+// up a queued tools/call as the queue drains, and Close's snapshot of in-flight
+// calls is already taken by then.
+func TestBeginCallAfterCloseIsCancelledAtOnce(t *testing.T) {
+	s := New(testConfig(t, &stubProvider{}), "test")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	s.Close(ctx)
+
+	callCtx, endCall := s.beginCall(context.Background(), requestWithID(t, "subagent", nil, 7))
+	defer endCall()
+
+	if callCtx.Err() == nil {
+		t.Error("a call beginning after Close was left running")
+	}
+}
+
+// TestServeStdioCancelsRunsWhenTheClientGoesAway pins the disconnect path: when
+// the client closes its end of the pipe while a run is in flight, that run is
+// cancelled instead of continuing to call providers and run shell commands for a
+// client that can no longer receive the result.
+//
+// The loop returns as soon as the client is gone rather than after mcp-go's
+// worker drain, so the drain is asserted separately: the parked run must be
+// cancelled and unwind, which waitInFlight reports. Without the cancellation the
+// run stays parked in the provider forever.
+func TestServeStdioCancelsRunsWhenTheClientGoesAway(t *testing.T) {
+	block := make(chan struct{})
+	defer close(block)
+	entered := make(chan struct{}, 1)
+	s := New(testConfig(t, &stubProvider{block: block, entered: entered}), "test")
+
+	stdin, feed := io.Pipe()
+	served := make(chan error, 1)
+	go func() { served <- s.serve(context.Background(), stdin, io.Discard) }()
+
+	call := fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subagent","arguments":{"prompt":"hello","cwd":%q,"approval-policy":"never"}}}`+"\n",
+		t.TempDir(),
+	)
+	if _, err := io.WriteString(feed, call); err != nil {
+		t.Fatalf("write call: %v", err)
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run never reached the provider")
+	}
+
+	// The client goes away: its end of the pipe closes and the reader sees EOF.
+	_ = feed.Close()
+
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("serve() = %v after the client left, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the serve loop did not stop after the client went away")
+	}
+
+	waitCtx, cancelWait := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelWait()
+	if !s.waitInFlight(waitCtx) {
+		t.Fatal("the run was still parked after the client went away, so it was not cancelled")
+	}
+}
+
+// TestServeStdioStopsWhenCloseIsCalled pins the other way the loop ends: a
+// signal-driven shutdown must stop reading a client whose pipe is still open.
+func TestServeStdioStopsWhenCloseIsCalled(t *testing.T) {
+	s := New(testConfig(t, &stubProvider{}), "test")
+
+	stdin, feed := io.Pipe()
+	defer feed.Close()
+	served := make(chan error, 1)
+	go func() { served <- s.serve(context.Background(), stdin, io.Discard) }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	s.Close(ctx)
+
+	select {
+	case err := <-served:
+		// Cancelling the loop's context is how Close ends it, and that surfaces
+		// as the serve error main maps to a clean exit.
+		if err != nil && !errors.Is(err, context.Canceled) {
+			t.Fatalf("serve() = %v after Close, want nil or context.Canceled", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the serve loop kept reading after Close")
+	}
+}
+
+// TestServeStdioReturnsEvenWhenARunIgnoresCancellation pins that the loop does
+// not wait for mcp-go's worker drain. A dependency deaf to cancellation parks a
+// worker inside the drain, so a loop that waited for it would keep the process
+// alive indefinitely after the client had already gone.
+func TestServeStdioReturnsEvenWhenARunIgnoresCancellation(t *testing.T) {
+	stub := &stubbornProvider{entered: make(chan struct{}), release: make(chan struct{})}
+	defer stub.finish()
+	s := New(testConfig(t, stub), "test")
+
+	stdin, feed := io.Pipe()
+	served := make(chan error, 1)
+	go func() { served <- s.serve(context.Background(), stdin, io.Discard) }()
+
+	call := fmt.Sprintf(
+		`{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"subagent","arguments":{"prompt":"hello","cwd":%q,"approval-policy":"never"}}}`+"\n",
+		t.TempDir(),
+	)
+	if _, err := io.WriteString(feed, call); err != nil {
+		t.Fatalf("write call: %v", err)
+	}
+	select {
+	case <-stub.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the run never reached the provider")
+	}
+
+	_ = feed.Close()
+
+	select {
+	case err := <-served:
+		if err != nil {
+			t.Fatalf("serve() = %v after the client left, want nil", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the serve loop waited for a drain that the parked run holds open")
+	}
+
+	// Let the ignored run finish so the test leaves nothing behind.
+	stub.finish()
+}
+
+// TestEmitCountsDropsInsteadOfLoggingEach pins the backpressure behaviour: mcp-go
+// drops notifications when the client's bounded channel is full, and Emit runs on
+// the goroutine holding a session lock, so a log line per dropped event would
+// stall the run behind stderr. Every drop is counted; only the first is logged.
+func TestEmitCountsDropsInsteadOfLoggingEach(t *testing.T) {
+	s := New(testConfig(t, &stubProvider{}), "test")
+
+	var logged bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logged)
+	defer log.SetOutput(previous)
+
+	// No session is registered, so every send is refused: the same path a full
+	// channel takes.
+	const attempts = 5
+	for i := 0; i < attempts; i++ {
+		s.Emit(context.Background(), "thread-1", map[string]any{"type": "agent_message_delta", "delta": "x"})
+	}
+
+	if got := s.emitDrops.Load(); got != attempts {
+		t.Errorf("emitDrops = %d, want %d", got, attempts)
+	}
+	if got := strings.Count(logged.String(), "dropped (client cannot keep up)"); got != 1 {
+		t.Errorf("logged %d drop line(s), want exactly 1; log was:\n%s", got, logged.String())
 	}
 }

@@ -99,6 +99,19 @@ func (c *conn) failure(err error) error {
 	return fmt.Errorf("codex app-server exited: %s", tail)
 }
 
+// closeCurrent closes the live connection, if any. The gate serializes access to
+// current, so a concurrent dial cannot have its handshake closed underneath it;
+// a caller already holding the gate finishes first and this closes its result.
+func (p *pool) closeCurrent() {
+	p.gate <- struct{}{}
+	defer func() { <-p.gate }()
+	if p.current == nil {
+		return
+	}
+	_ = p.current.closer.Close()
+	p.current = nil
+}
+
 type onceCloser struct {
 	once   sync.Once
 	closer io.Closer

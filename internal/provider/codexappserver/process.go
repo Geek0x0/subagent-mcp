@@ -32,6 +32,23 @@ func poolForCommand(command string) *pool {
 	return p
 }
 
+// Shutdown closes every pooled app-server child. A child outlives the call that
+// dialed it, so without this it would keep running whatever turn it was given
+// until its stdin closed at process death — and any grandchild it spawned would
+// keep running past that. Registered as a provider shutdown func, so the server
+// runs it once on the way out.
+func Shutdown() {
+	poolsMu.Lock()
+	all := make([]*pool, 0, len(pools))
+	for _, p := range pools {
+		all = append(all, p)
+	}
+	poolsMu.Unlock()
+	for _, p := range all {
+		p.closeCurrent()
+	}
+}
+
 func startProcess(ctx context.Context, command string) (*Client, io.Closer, func() string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, nil, err

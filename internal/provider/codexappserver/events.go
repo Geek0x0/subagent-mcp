@@ -25,6 +25,7 @@ func (i codexItem) paths() []string {
 type notificationParams struct {
 	ThreadID string    `json:"threadId"`
 	TurnID   string    `json:"turnId"`
+	ItemID   string    `json:"itemId"`
 	Delta    string    `json:"delta"`
 	Item     codexItem `json:"item"`
 	Turn     struct {

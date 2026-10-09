@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -27,6 +29,19 @@ import (
 
 const (
 	maxConfiguredTurns = 100000
+
+	// stdioWorkerPool is how many tool calls the stdio server runs at once.
+	// mcp-go's own default is 5; concurrent subagent threads spend most of their
+	// time waiting on a model, so the pool is sized to let a caller dispatch a
+	// useful number of them at once.
+	stdioWorkerPool = 32
+
+	// Ceilings for the per-call spending limits, so a typo cannot configure a
+	// budget so large it never applies. The history ceiling is typed because it
+	// exceeds the int range on a 32-bit build.
+	maxHistoryBytesLimit  int64 = 1 << 40 // 1 TiB
+	maxTotalTokensLimit         = 1_000_000_000
+	maxRunDeadlineSeconds       = 7 * 24 * 60 * 60
 
 	// defaultToolName is the base name of the two MCP tools when no
 	// WithToolName option is supplied.
@@ -175,6 +190,69 @@ func providerDescription(cfg *config.Config) string {
 	)
 }
 
+// runBudgets holds the per-session spending limits parsed from the call's config
+// object. A zero field means no limit, except the history ceiling, which falls
+// back to the default: a budget that only applies when asked for would not be
+// the backstop against runaway growth that it exists to be.
+type runBudgets struct {
+	historyBytes int64
+	totalTokens  int
+	runDeadline  time.Duration
+}
+
+// parseBudgets reads the spending limits from the call's config object. Unlike
+// max_turns and max_nudges, which fall back to their default when the value is
+// out of range, an unusable limit is an error: silently ignoring a ceiling the
+// caller asked for is how a run spends more than it was allowed to.
+func parseBudgets(config map[string]any) (runBudgets, error) {
+	budgets := runBudgets{historyBytes: agent.DefaultMaxHistoryBytes}
+
+	if raw, present := config["max_history_bytes"]; present {
+		value, ok := integerValue(raw)
+		if !ok || value < 0 || int64(value) > maxHistoryBytesLimit {
+			return runBudgets{}, fmt.Errorf(
+				"config.max_history_bytes must be an integer from 1 to %d (0 disables the limit)",
+				maxHistoryBytesLimit,
+			)
+		}
+		budgets.historyBytes = int64(value)
+	}
+
+	if raw, present := config["max_total_tokens"]; present {
+		value, ok := integerValue(raw)
+		if !ok || value < 0 || value > maxTotalTokensLimit {
+			return runBudgets{}, fmt.Errorf(
+				"config.max_total_tokens must be an integer from 1 to %d (0 disables the limit)",
+				maxTotalTokensLimit,
+			)
+		}
+		budgets.totalTokens = int(value)
+	}
+
+	if raw, present := config["run_deadline_seconds"]; present {
+		value, ok := integerValue(raw)
+		if !ok || value < 0 || value > maxRunDeadlineSeconds {
+			return runBudgets{}, fmt.Errorf(
+				"config.run_deadline_seconds must be an integer from 1 to %d (0 disables the deadline)",
+				maxRunDeadlineSeconds,
+			)
+		}
+		budgets.runDeadline = time.Duration(value) * time.Second
+	}
+
+	return budgets, nil
+}
+
+// integerValue reports whether a JSON-decoded config value is a whole number, so
+// a float like 1.5 is rejected rather than silently truncated.
+func integerValue(raw any) (int, bool) {
+	value, ok := raw.(float64)
+	if !ok || value != float64(int(value)) {
+		return 0, false
+	}
+	return int(value), true
+}
+
 func parseWritableRoots(config map[string]any) ([]string, error) {
 	raw, present := config["writable_roots"]
 	if !present {
@@ -199,6 +277,14 @@ func parseWritableRoots(config map[string]any) ([]string, error) {
 	return roots, nil
 }
 
+// callHandle is one in-flight tool call. A handle is a pointer so a call that
+// finishes can tell whether the entry under its request key is still its own:
+// a client that reuses a request ID while the first call runs must not have its
+// second call's registration removed by the first call's cleanup.
+type callHandle struct {
+	cancel context.CancelFunc
+}
+
 type Server struct {
 	mcp      *mcpserver.MCPServer
 	mgr      *agent.Manager
@@ -208,7 +294,39 @@ type Server struct {
 	cfg      *config.Config
 
 	callsMu sync.Mutex
-	calls   map[string]context.CancelFunc
+	// calls maps a JSON-RPC request key to its in-flight call, for
+	// notifications/cancelled. active holds every in-flight call, including the
+	// rare one whose request has no ID, so shutdown can cancel them all.
+	calls  map[string]*callHandle
+	active map[*callHandle]struct{}
+	// closing is set by Close and by the client going away. A call that begins
+	// after that is cancelled at once: mcp-go's workers can still dequeue a
+	// queued tools/call while the queue drains, and such a call must not run past
+	// the end of the client that asked for it.
+	closing bool
+	// idle is non-nil while a call is running and is closed when the last one
+	// returns. A WaitGroup cannot be used instead: a call starting while Close
+	// waits would be an Add concurrent with Wait at counter zero, which
+	// sync.WaitGroup panics on.
+	idle chan struct{}
+
+	// serveMu guards stopServe, the cancel function of the running serve loop.
+	// Close calls it so the loop stops reading a client that is going away, and
+	// serveStopped remembers that Close ran first when it races the loop's start.
+	serveMu      sync.Mutex
+	stopServe    context.CancelFunc
+	serveStopped bool
+
+	// goneCh is closed the first time the client is seen to have gone away. The
+	// serve loop watches it so it can return without waiting for a worker drain
+	// that a dependency ignoring cancellation could hold open indefinitely.
+	goneCh   chan struct{}
+	goneOnce sync.Once
+
+	// emitDrops counts the notifications the client's bounded channel refused,
+	// and emitDropLogged makes the first one the only one that writes a log line.
+	emitDrops      atomic.Uint64
+	emitDropLogged atomic.Bool
 }
 
 // Option configures a Server during construction.
@@ -252,7 +370,9 @@ func New(cfg *config.Config, version string, opts ...Option) *Server {
 		version:  version,
 		toolName: defaultToolName,
 		cfg:      cfg,
-		calls:    make(map[string]context.CancelFunc),
+		calls:    make(map[string]*callHandle),
+		active:   make(map[*callHandle]struct{}),
+		goneCh:   make(chan struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -285,33 +405,237 @@ func New(cfg *config.Config, version string, opts ...Option) *Server {
 	return s
 }
 
+// ServeStdio serves MCP over stdio until the client closes its end of the pipe or
+// Close stops the server. The caller owns signal handling: this ends only when
+// one of those two things happens.
+//
+// The loop is owned here rather than delegated to mcpserver.ServeStdio because a
+// client that goes away has to cancel the work it left behind. mcp-go reports a
+// closed stdin as a clean end of input and then drains its worker pool, so
+// without the reader below a run would keep calling providers and executing shell
+// commands to completion for a client that can no longer receive the result.
+//
+// A Server serves one client. Once the pipe closes, or Close runs, this returns
+// and every later call is cancelled as it begins; a second ServeStdio would
+// serve a client whose work is already refused.
 func (s *Server) ServeStdio() error {
-	return mcpserver.ServeStdio(s.mcp, mcpserver.WithWorkerPoolSize(32))
+	return s.serve(context.Background(), os.Stdin, os.Stdout)
 }
 
-// beginCall derives a cancellable context for an in-flight tool call and
-// registers its cancel function under the JSON-RPC request ID recorded by the
-// before-call-tool hook. The returned stop function unregisters the call and
-// releases the context; when the request has no ID, only cancellation applies.
+// serve is ServeStdio over an explicit transport, so a test can drive the loop
+// without the process's own stdin and stdout.
+func (s *Server) serve(parent context.Context, stdin io.Reader, stdout io.Writer) error {
+	ctx, cancel := context.WithCancel(parent)
+	defer cancel()
+	defer s.setServeStop(nil)
+	s.setServeStop(cancel)
+
+	stdio := mcpserver.NewStdioServer(s.mcp)
+	mcpserver.WithWorkerPoolSize(stdioWorkerPool)(stdio)
+
+	// Listen returns only after it has drained its worker pool, and a run parked
+	// in a dependency that ignores cancellation holds that drain open. The loop
+	// therefore runs in the background and this returns as soon as the client is
+	// gone or the server is closing, leaving the caller's shutdown to bound the
+	// rest rather than waiting on a drain that may never finish.
+	done := make(chan error, 1)
+	go func() { done <- stdio.Listen(ctx, &clientGoneReader{reader: stdin, gone: s.clientGone}, stdout) }()
+
+	select {
+	case err := <-done:
+		return err
+	case <-s.goneCh:
+		return drainResult(done, nil)
+	case <-ctx.Done():
+		return drainResult(done, ctx.Err())
+	}
+}
+
+// drainResult reports the error the serve loop already produced, or fallback
+// while it is still draining.
+func drainResult(done <-chan error, fallback error) error {
+	select {
+	case err := <-done:
+		return err
+	default:
+		return fallback
+	}
+}
+
+// setServeStop records how Close stops the serve loop, or forgets it when the
+// loop returns. A Close that raced the loop's start has already cancelled it, so
+// the loop is stopped here too rather than left reading forever.
+func (s *Server) setServeStop(stop context.CancelFunc) {
+	s.serveMu.Lock()
+	defer s.serveMu.Unlock()
+	if stop == nil {
+		s.stopServe = nil
+		return
+	}
+	s.stopServe = stop
+	if s.serveStopped {
+		stop()
+	}
+}
+
+// stopServing ends the serve loop, if one is running, and remembers the request
+// so a loop that has not started yet is ended as soon as it registers.
+func (s *Server) stopServing() {
+	s.serveMu.Lock()
+	defer s.serveMu.Unlock()
+	s.serveStopped = true
+	if s.stopServe != nil {
+		s.stopServe()
+	}
+}
+
+// clientGone is what a closed stdin means for the work still running: every
+// in-flight call is cancelled, and a call that starts from the queue while it
+// drains is cancelled the moment it begins. It also releases the serve loop,
+// which must not wait for that drain to finish.
+func (s *Server) clientGone() {
+	s.goneOnce.Do(func() { close(s.goneCh) })
+	s.callsMu.Lock()
+	s.closing = true
+	s.callsMu.Unlock()
+	s.cancelCalls()
+}
+
+// clientGoneReader reports the client closing its end of the pipe, and only then:
+// a read error is the whole signal stdio gives for it.
+type clientGoneReader struct {
+	reader io.Reader
+	gone   func()
+	once   sync.Once
+}
+
+func (r *clientGoneReader) Read(p []byte) (int, error) {
+	n, err := r.reader.Read(p)
+	if err != nil {
+		r.once.Do(r.gone)
+	}
+	return n, err
+}
+
+// beginCall derives a cancellable context for an in-flight tool call and records
+// it under the JSON-RPC request ID the before-call-tool hook stored, so a
+// notifications/cancelled message can stop it. The returned stop function
+// unregisters the call and releases the context. A request with no ID is still
+// counted and still cancellable by Close, it just cannot be addressed by a
+// cancellation notification.
 func (s *Server) beginCall(ctx context.Context, req mcp.CallToolRequest) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(ctx)
 	if req.Params.Meta != nil && req.Params.Meta.ProgressToken != nil {
 		ctx = context.WithValue(ctx, progressContextKey{}, &progressState{token: req.Params.Meta.ProgressToken})
 	}
-	key, ok := requestIDFromMeta(req)
-	if !ok {
-		return ctx, cancel
-	}
 
+	handle := &callHandle{cancel: cancel}
 	s.callsMu.Lock()
-	s.calls[key] = cancel
+	if len(s.active) == 0 {
+		s.idle = make(chan struct{})
+	}
+	s.active[handle] = struct{}{}
+	key, hasKey := requestIDFromMeta(req)
+	if hasKey {
+		s.calls[key] = handle
+	}
+	// A call that begins while the server is closing is cancelled here rather
+	// than in Close's snapshot, which has already been taken.
+	closing := s.closing
 	s.callsMu.Unlock()
+	if closing {
+		cancel()
+	}
 
 	return ctx, func() {
 		s.callsMu.Lock()
-		delete(s.calls, key)
+		if hasKey && s.calls[key] == handle {
+			delete(s.calls, key)
+		}
+		delete(s.active, handle)
+		if len(s.active) == 0 && s.idle != nil {
+			close(s.idle)
+			s.idle = nil
+		}
 		s.callsMu.Unlock()
 		cancel()
+	}
+}
+
+// waitInFlight waits until no tool call is running, and reports whether that
+// happened before ctx expired.
+func (s *Server) waitInFlight(ctx context.Context) bool {
+	for {
+		s.callsMu.Lock()
+		idle := s.idle
+		s.callsMu.Unlock()
+		if idle == nil {
+			return true
+		}
+		select {
+		case <-idle:
+		case <-ctx.Done():
+			return false
+		}
+	}
+}
+
+// Close shuts the server down. In-flight calls are cancelled the way a
+// notifications/cancelled message cancels them, their handlers are given until
+// ctx expires to unwind, and every retained session is then released — bound
+// directories closed and provider threads (a Codex turn among them) interrupted.
+//
+// A run that outlives ctx is abandoned rather than waited for, so Close always
+// returns: the sessions are left to the process exit, which is what this whole
+// path exists to make possible. Close also stops the serve loop, so a client
+// whose pipe is still open is no longer read from.
+func (s *Server) Close(ctx context.Context) {
+	// Stop reading input first: the client is going away, so there is no point
+	// accepting more work, and a call already queued must not start.
+	s.stopServing()
+	s.callsMu.Lock()
+	s.closing = true
+	s.callsMu.Unlock()
+	s.cancelCalls()
+	if !s.waitInFlight(ctx) {
+		log.Printf("shutdown: in-flight calls did not finish in time; releasing sessions anyway")
+	}
+	if !closeBounded(ctx, s.mgr.Close) {
+		log.Printf("shutdown: a session is still busy; leaving it to process exit")
+	}
+	if dropped := s.emitDrops.Load(); dropped > 0 {
+		log.Printf("shutdown: the client's notification channel refused %d event(s); the client was not keeping up", dropped)
+	}
+}
+
+// cancelCalls cancels every in-flight tool call, so a run cannot keep calling a
+// provider or running shell commands while the server is going away.
+func (s *Server) cancelCalls() {
+	s.callsMu.Lock()
+	pending := make([]context.CancelFunc, 0, len(s.active))
+	for handle := range s.active {
+		pending = append(pending, handle.cancel)
+	}
+	s.callsMu.Unlock()
+	for _, cancel := range pending {
+		cancel()
+	}
+}
+
+// closeBounded runs release and reports whether it returned before ctx expired.
+// It exists because Manager.Close blocks on the lock of a session whose run is
+// still in flight — exactly the case a shutdown has to survive.
+func closeBounded(ctx context.Context, release func()) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		release()
+	}()
+	select {
+	case <-done:
+		return true
+	case <-ctx.Done():
+		return false
 	}
 }
 
@@ -329,10 +653,10 @@ func (s *Server) handleCancelledNotification(_ context.Context, notification mcp
 	}
 
 	s.callsMu.Lock()
-	cancel := s.calls[key]
+	handle := s.calls[key]
 	s.callsMu.Unlock()
-	if cancel != nil {
-		cancel()
+	if handle != nil {
+		handle.cancel()
 	}
 }
 
@@ -388,7 +712,7 @@ func startTool(name string, cfg *config.Config) mcp.Tool {
 		),
 		mcp.WithObject(
 			"config",
-			mcp.Description("loose config map; recognized keys: max_turns (number from 1 to 100000), model_reasoning_effort (same values as reasoning-effort; the top-level argument wins), writable_roots (array of absolute directory paths the shell may also write under workspace-write), max_nudges (integer 0 to 10; how many times a reply without a tool call is answered with a continue prompt, overriding the provider default); other unknown keys are silently ignored"),
+			mcp.Description("loose config map; recognized keys: max_turns (number from 1 to 100000), model_reasoning_effort (same values as reasoning-effort; the top-level argument wins), writable_roots (array of absolute directory paths the shell may also write under workspace-write), max_nudges (integer 0 to 10; how many times a reply without a tool call is answered with a continue prompt, overriding the provider default), max_history_bytes (integer ceiling on the history the thread replays; default 67108864, 0 disables), max_total_tokens (integer ceiling on the tokens the thread reports across all turns; default 0, off), run_deadline_seconds (integer wall-clock ceiling on one call; default 0, off); an unusable budget value is an error, other unknown keys are silently ignored"),
 		),
 		mcp.WithOutputSchema[toolOutput](),
 	)
@@ -578,6 +902,11 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		return mcp.NewToolResultError(err.Error()), nil
 	}
 
+	budgets, err := parseBudgets(looseConfig)
+	if err != nil {
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
 	options := agent.Options{
 		Provider:        selectedProvider,
 		Model:           model,
@@ -590,6 +919,9 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		MaxTurns:        maxTurns,
 		MaxNudges:       maxNudges,
 		WritableRoots:   writableRoots,
+		MaxHistoryBytes: budgets.historyBytes,
+		MaxTotalTokens:  budgets.totalTokens,
+		RunDeadline:     budgets.runDeadline,
 	}
 	if isAgent {
 		options.Thread, err = agentProvider.StartThread(ctx, provider.ThreadOptions{
@@ -686,7 +1018,7 @@ func (s *Server) Emit(ctx context.Context, threadID string, msg map[string]any) 
 		"threadId": threadID,
 		"msg":      msg,
 	}); err != nil {
-		log.Printf("subagent/event emit failed: %v", err)
+		s.noteEmitDrop("subagent/event", err)
 	}
 
 	state, ok := ctx.Value(progressContextKey{}).(*progressState)
@@ -703,7 +1035,20 @@ func (s *Server) Emit(ctx context.Context, threadID string, msg map[string]any) 
 		"progress":      state.next(),
 		"message":       summary,
 	}); err != nil {
-		log.Printf("notifications/progress emit failed: %v", err)
+		s.noteEmitDrop("notifications/progress", err)
+	}
+}
+
+// noteEmitDrop records a notification the client's channel refused. mcp-go's
+// channel is bounded and drops rather than blocks, so a client that cannot keep
+// up loses events; Emit runs on the goroutine holding a session lock, so only
+// the first drop writes a log line — a `log.Printf` per dropped delta would
+// itself stall the run once stderr fills, which is what makes this worth
+// counting rather than logging.
+func (s *Server) noteEmitDrop(kind string, err error) {
+	total := s.emitDrops.Add(1)
+	if s.emitDropLogged.CompareAndSwap(false, true) {
+		log.Printf("%s dropped (client cannot keep up): %v; %d dropped so far, further drops are counted, not logged", kind, err, total)
 	}
 }
 

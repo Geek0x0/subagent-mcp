@@ -10,7 +10,10 @@ import (
 	"github.com/Geek0x0/subagent-mcp/internal/provider"
 )
 
-func init() { provider.Register(config.APICodexAppServer, New) }
+func init() {
+	provider.Register(config.APICodexAppServer, New)
+	provider.RegisterShutdown(Shutdown)
+}
 
 // Adapter delegates whole threads to a shared Codex app-server child.
 type Adapter struct {
