@@ -59,7 +59,7 @@ func recordModelTurn(s *Session, res *provider.TurnResult) {
 	}
 	if res.Usage != nil {
 		last := *res.Usage
-		s.totalUsage = addUsage(s.totalUsage, last)
+		s.addUsage(last)
 		s.rollout.Event(map[string]any{"type": "token_count", "info": map[string]any{
 			"total_token_usage": usagePayload(s.totalUsage),
 			"last_token_usage":  usagePayload(last),

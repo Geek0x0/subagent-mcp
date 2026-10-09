@@ -18,6 +18,15 @@ import (
 
 const DefaultMaxTurns = 50
 
+// DefaultMaxHistoryBytes is the default ceiling on one thread's replayed
+// history. A thread re-sends its whole history on every turn, so unbounded
+// growth costs memory once and tokens again on every later turn. The default is
+// far above any working thread — a 64k-token reply is roughly 256 KiB — and
+// exists to stop runaway growth, not to bound normal use. The server applies it
+// when the caller does not configure max_history_bytes; a non-positive value in
+// Options means no limit.
+const DefaultMaxHistoryBytes = 64 << 20
+
 const (
 	sessionIdleTTL = 24 * time.Hour
 	maxSessions    = 256
@@ -47,6 +56,13 @@ type Options struct {
 	// with a "continue" prompt (0 disables it); see Runner.RunLocked.
 	MaxNudges     int
 	WritableRoots []string
+	// MaxHistoryBytes caps the replayed history a thread may accumulate; a
+	// non-positive value means no limit. MaxTotalTokens caps the cumulative
+	// tokens every turn of the thread has reported; non-positive means no limit.
+	// RunDeadline bounds one Run; non-positive means no deadline.
+	MaxHistoryBytes int64
+	MaxTotalTokens  int
+	RunDeadline     time.Duration
 }
 
 type Session struct {
@@ -64,6 +80,10 @@ type Session struct {
 	approval        policy.ApprovalPolicy
 	maxTurns        int
 	maxNudges       int
+	maxHistoryBytes int64
+	maxTotalTokens  int
+	runDeadline     time.Duration
+	historyBytes    int64
 	writableRoots   []string
 	rootPaths       []string
 	boundCwd        *sandbox.Directory
@@ -122,6 +142,9 @@ func (m *Manager) Create(o Options) *Session {
 		approval:        o.Approval,
 		maxTurns:        o.MaxTurns,
 		maxNudges:       o.MaxNudges,
+		maxHistoryBytes: o.MaxHistoryBytes,
+		maxTotalTokens:  o.MaxTotalTokens,
+		runDeadline:     o.RunDeadline,
 		writableRoots:   append([]string(nil), o.WritableRoots...),
 		lastUsed:        m.now(),
 	}
@@ -368,4 +391,41 @@ func (s *Session) shellWritableRoots() ([]string, bool) {
 	default:
 		return nil, false
 	}
+}
+
+// messageSize reports how much one history entry costs. Every part the model
+// reads again counts, including the replay payload and the tool-call id the
+// reply refers back to: the point of the counter is what the next turn re-sends,
+// not what the struct header weighs. The system prompt and the tool schemas are
+// re-sent too but are fixed for the thread's life, so they cannot make the
+// history grow, which is what this counter bounds.
+func messageSize(m provider.Message) int64 {
+	size := int64(len(m.Text)) + int64(len(m.Opaque)) + int64(len(m.ToolCallID))
+	for _, call := range m.ToolCalls {
+		size += int64(len(call.ID)) + int64(len(call.Name)) + int64(len(call.Arguments))
+	}
+	return size
+}
+
+// appendMessage adds one entry to the history and keeps the size counter in
+// step. Callers must hold s.mu, as every other history access does.
+func (s *Session) appendMessage(m provider.Message) {
+	s.messages = append(s.messages, m)
+	s.historyBytes += messageSize(m)
+}
+
+// truncateMessages drops every entry from n onwards, the way a run that failed
+// before its first assistant message restores the history it entered with. The
+// size counter follows so a rolled-back prompt cannot count against a later turn.
+func (s *Session) truncateMessages(n int) {
+	for _, m := range s.messages[n:] {
+		s.historyBytes -= messageSize(m)
+	}
+	s.messages = s.messages[:n]
+}
+
+// addUsage records one turn's reported usage against the thread total, which the
+// token budget is checked against.
+func (s *Session) addUsage(u provider.Usage) {
+	s.totalUsage = addUsage(s.totalUsage, u)
 }

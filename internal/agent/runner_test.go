@@ -1344,21 +1344,40 @@ func TestRunnerEmitsDeltasAndUsageInOrder(t *testing.T) {
 		t.Fatalf("Run() error = %v", err)
 	}
 	events := emitter.recordedEvents()
-	if gotTypes := eventTypes(t, events); !reflect.DeepEqual(gotTypes, []string{
-		"task_started",
-		"agent_message_delta",
-		"agent_message_delta",
-		"provider_request",
-		"token_count",
-		"agent_message",
-		"task_complete",
+	var gotTypes []string
+	var streamed strings.Builder
+	for _, event := range events {
+		eventType, _ := event["type"].(string)
+		gotTypes = append(gotTypes, eventType)
+		if eventType == "agent_message_delta" {
+			delta, _ := event["delta"].(string)
+			streamed.WriteString(delta)
+		}
+	}
+	// Consecutive deltas are merged, and how many events that produces depends
+	// on the clock, so the stream is asserted by its concatenation — what a
+	// client that appends every delta it receives renders — and the non-delta
+	// events by their order.
+	if got := streamed.String(); got != "done" {
+		t.Fatalf("streamed text = %q, want the concatenation of the provider's deltas", got)
+	}
+	if got := withoutType(gotTypes, "agent_message_delta"); !reflect.DeepEqual(got, []string{
+		"task_started", "provider_request", "token_count", "agent_message", "task_complete",
 	}) {
 		t.Fatalf("event types = %v", gotTypes)
 	}
-	if events[1]["delta"] != "do" || events[2]["delta"] != "ne" {
-		t.Fatalf("delta events = %#v, %#v", events[1], events[2])
+	// Every delta, not just the first, must land before the turn's summary events:
+	// merging must not defer or reorder the text.
+	requestIndex := indexOfType(gotTypes, "provider_request")
+	for i, eventType := range gotTypes {
+		if eventType == "agent_message_delta" && i > requestIndex {
+			t.Fatalf("event types = %v, want every delta before the provider_request event at %d", gotTypes, requestIndex)
+		}
 	}
-	request := events[3]
+	request, ok := firstEventOfType(events, "provider_request")
+	if !ok {
+		t.Fatalf("no provider_request event in %v", gotTypes)
+	}
 	if request["provider"] != "stub" || request["model"] != session.model {
 		t.Fatalf("provider request event = %#v", request)
 	}
@@ -1371,9 +1390,44 @@ func TestRunnerEmitsDeltasAndUsageInOrder(t *testing.T) {
 	if _, ok := request["error"]; ok {
 		t.Fatalf("successful provider request unexpectedly contains error: %#v", request)
 	}
-	if events[4]["prompt_tokens"] != 7 || events[4]["completion_tokens"] != 5 || events[4]["total_tokens"] != 12 {
-		t.Fatalf("token event = %#v", events[4])
+	tokenEvent, ok := firstEventOfType(events, "token_count")
+	if !ok {
+		t.Fatalf("no token_count event in %v", gotTypes)
 	}
+	if tokenEvent["prompt_tokens"] != 7 || tokenEvent["completion_tokens"] != 5 || tokenEvent["total_tokens"] != 12 {
+		t.Fatalf("token event = %#v", tokenEvent)
+	}
+}
+
+// withoutType returns the event types with every occurrence of one type removed.
+func withoutType(types []string, drop string) []string {
+	kept := make([]string, 0, len(types))
+	for _, eventType := range types {
+		if eventType != drop {
+			kept = append(kept, eventType)
+		}
+	}
+	return kept
+}
+
+// indexOfType returns the position of the first event of one type, or -1.
+func indexOfType(types []string, want string) int {
+	for i, eventType := range types {
+		if eventType == want {
+			return i
+		}
+	}
+	return -1
+}
+
+// firstEventOfType returns the first recorded event of one type.
+func firstEventOfType(events []map[string]any, want string) (map[string]any, bool) {
+	for _, event := range events {
+		if event["type"] == want {
+			return event, true
+		}
+	}
+	return nil, false
 }
 
 func TestRunnerProviderRequestWithoutDeltasOmitsTTFT(t *testing.T) {
@@ -1752,4 +1806,64 @@ func TestRunnerShellSandboxing(t *testing.T) {
 			t.Fatalf("result = %q, want /dev/shm permission denied", result)
 		}
 	})
+}
+
+// TestApprovalPromptNamesTheSandboxEscalation pins that the human deciding on an
+// approval is told what approving bypasses. An approved shell command runs
+// without the kernel sandbox — and, for a git spelled so the wrapper does not see
+// it, without the hardening auto-allowed git gets — so a command that looks
+// allowlisted must not be approved on appearance alone.
+func TestApprovalPromptNamesTheSandboxEscalation(t *testing.T) {
+	tests := []struct {
+		name    string
+		sandbox policy.Sandbox
+		want    string
+	}{
+		{
+			name:    "read-only escalates",
+			sandbox: policy.Sandbox("read-only"),
+			want:    "without the kernel sandbox",
+		},
+		{
+			name:    "workspace-write escalates",
+			sandbox: policy.Sandbox("workspace-write"),
+			want:    "without the kernel sandbox",
+		},
+		{
+			name:    "danger-full-access has nothing to escalate",
+			sandbox: policy.Sandbox("danger-full-access"),
+			want:    "",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			approver := &stubApprover{approved: true}
+			session := newTestSession(t, Options{
+				Provider: &stubProvider{},
+				Sandbox:  test.sandbox,
+				Approval: policy.ApprovalPolicy("untrusted"),
+			})
+			runner := &Runner{Emitter: &recEmitter{}, Approver: approver}
+
+			runner.authorize(context.Background(), session, "shell", "rm -rf /", "because", []policy.Request{
+				{Tool: "shell", Command: "rm -rf /", Cwd: session.cwd},
+			})
+
+			requests := approver.recordedRequests()
+			if len(requests) != 1 {
+				t.Fatalf("approval requests = %d, want 1", len(requests))
+			}
+			reason := requests[0].Reason
+			if test.want == "" {
+				if strings.Contains(reason, "without the kernel sandbox") {
+					t.Errorf("reason = %q, want no escalation note when the sandbox never confined shell calls", reason)
+				}
+				return
+			}
+			if !strings.Contains(reason, test.want) {
+				t.Errorf("reason = %q, want it to contain %q", reason, test.want)
+			}
+		})
+	}
 }

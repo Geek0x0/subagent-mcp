@@ -141,9 +141,26 @@ func (r *Runner) Run(ctx context.Context, s *Session, prompt string) (string, er
 func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (string, error) {
 	defer func() { s.setLastUsed(time.Now()) }()
 
+	// One clock covers every way a run blocks — model request, approval, shell —
+	// so a caller-set deadline cannot be outlasted by a phase that ignores it.
+	if s.runDeadline > 0 {
+		var stop context.CancelFunc
+		ctx, stop = context.WithTimeoutCause(ctx, s.runDeadline, fmt.Errorf("run deadline of %s reached", s.runDeadline))
+		defer stop()
+	}
+
 	if s.thread != nil {
+		// A delegated thread spends the same budget as the built-in loop, so the
+		// check runs before the thread is handed the prompt. Both ceilings are
+		// cumulative, which is why a thread that reaches one stays stopped.
+		if err := s.budgetError(); err != nil {
+			r.Emitter.Emit(ctx, s.ID, map[string]any{"type": "error", "message": err.Error()})
+			recordError(s, err)
+			return "", err
+		}
 		text, err := s.thread.Run(ctx, prompt, s.effortSent, provider.ThreadCallbacks{
 			Emit: func(event map[string]any) {
+				r.recordThreadEvent(s, event)
 				r.Emitter.Emit(ctx, s.ID, event)
 			},
 			Approve: func(approveCtx context.Context, req provider.ApprovalRequest) bool {
@@ -153,6 +170,9 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 			},
 		})
 		if err != nil {
+			if ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+				err = runCause(ctx)
+			}
 			r.Emitter.Emit(ctx, s.ID, map[string]any{"type": "error", "message": err.Error()})
 			return "", err
 		}
@@ -164,15 +184,35 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 	s.turnID = uuid.NewString()
 	recordTurnStart(s, prompt, started)
 	entryMessages := len(s.messages)
-	s.messages = append(s.messages, provider.Message{Role: provider.RoleUser, Text: prompt})
+	s.appendMessage(provider.Message{Role: provider.RoleUser, Text: prompt})
 	assistantAppended := false
 	nudges := 0
 	nudgedSinceTool := false
 	lastText := ""
 
 	for turn := 0; turn < s.maxTurns; turn++ {
+		// No history rollback here: both ceilings are cumulative for the thread's
+		// life, so a thread that reached one cannot run again whatever its
+		// history holds. The loop's provider-failure path rolls back because
+		// that run is resumable; this one is not.
+		if err := s.budgetError(); err != nil {
+			r.Emitter.Emit(ctx, s.ID, map[string]any{"type": "error", "message": err.Error()})
+			recordError(s, err)
+			return "", err
+		}
 		requestStarted := time.Now()
 		var firstDelta time.Time
+		// One notification per streamed token floods the client's bounded
+		// notification channel, and mcp-go drops rather than blocks when it
+		// fills, so most of a long reply would never arrive. Deltas are merged
+		// into one event per interval or size, and the tail is flushed as soon
+		// as the turn returns; the concatenation a client sees is unchanged.
+		deltas := newDeltaCoalescer(func(text string) {
+			r.Emitter.Emit(ctx, s.ID, map[string]any{
+				"type":  "agent_message_delta",
+				"delta": text,
+			})
+		})
 		res, err := s.provider.Turn(ctx, provider.TurnRequest{
 			Model:    s.model,
 			Effort:   s.effortSent,
@@ -183,12 +223,16 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 			if firstDelta.IsZero() {
 				firstDelta = time.Now()
 			}
-			r.Emitter.Emit(ctx, s.ID, map[string]any{
-				"type":  "agent_message_delta",
-				"delta": delta,
-			})
+			deltas.add(delta)
 		})
+		deltas.flush()
 		requestFinished := time.Now()
+		if err != nil && ctx.Err() != nil && errors.Is(err, ctx.Err()) {
+			// A deadline or a cancellation reaches the adapter as its request's
+			// context error; report the cause so a run deadline names itself
+			// rather than surfacing as a bare "context deadline exceeded".
+			err = runCause(ctx)
+		}
 		requestEvent := map[string]any{
 			"type":        "provider_request",
 			"provider":    s.provider.Name(),
@@ -211,7 +255,7 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 				// prompt never produced a reply. Restore the history to its
 				// entry length: a failed or cancelled first model call must
 				// not leave the prompt to be replayed by the next reply.
-				s.messages = s.messages[:entryMessages]
+				s.truncateMessages(entryMessages)
 			}
 			r.Emitter.Emit(ctx, s.ID, map[string]any{
 				"type":    "error",
@@ -233,7 +277,7 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 			// An empty reply is not replayed: several APIs reject an assistant
 			// message with neither content nor tool calls.
 		} else {
-			s.messages = append(s.messages, provider.Message{
+			s.appendMessage(provider.Message{
 				Role: provider.RoleAssistant, Text: res.Text, ToolCalls: res.ToolCalls, Opaque: res.Opaque,
 			})
 		}
@@ -254,7 +298,7 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 				if res.Text == "" {
 					prompt = continueAfterEmptyPrompt
 				}
-				s.messages = append(s.messages, provider.Message{Role: provider.RoleUser, Text: prompt})
+				s.appendMessage(provider.Message{Role: provider.RoleUser, Text: prompt})
 				r.Emitter.Emit(ctx, s.ID, map[string]any{"type": "agent_nudge", "message": prompt})
 				continue
 			}
@@ -281,7 +325,7 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 				// history. The context error is returned after the batch.
 				recordToolCall(s, call)
 				recordToolOutput(s, call, cancelledToolResult)
-				s.messages = append(s.messages, provider.Message{
+				s.appendMessage(provider.Message{
 					Role: provider.RoleTool, ToolCallID: call.ID, Text: cancelledToolResult, IsError: true,
 				})
 				continue
@@ -292,17 +336,20 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 				content = "(empty output)"
 			}
 			recordToolOutput(s, call, content)
-			s.messages = append(s.messages, provider.Message{
+			s.appendMessage(provider.Message{
 				Role: provider.RoleTool, ToolCallID: call.ID, Text: content, IsError: isError,
 			})
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
+			// Report the cause when there is one: a run deadline set here is
+			// more useful to the caller than a bare context error.
+			err := runCause(ctx)
 			r.Emitter.Emit(ctx, s.ID, map[string]any{
 				"type":    "error",
-				"message": ctxErr.Error(),
+				"message": err.Error(),
 			})
-			recordError(s, ctxErr)
-			return "", ctxErr
+			recordError(s, err)
+			return "", err
 		}
 	}
 
@@ -313,6 +360,117 @@ func (r *Runner) RunLocked(ctx context.Context, s *Session, prompt string) (stri
 	})
 	recordError(s, err)
 	return "", err
+}
+
+// Bounds on how long a streamed delta waits for company before it is emitted as
+// one agent_message_delta event.
+const (
+	deltaFlushInterval = 50 * time.Millisecond
+	deltaFlushBytes    = 8 << 10
+)
+
+// deltaCoalescer merges streamed text deltas into fewer events. It is used from
+// the provider's streaming callback and flushed by the caller that owns it, so
+// it needs no locking.
+type deltaCoalescer struct {
+	emit    func(string)
+	pending strings.Builder
+	last    time.Time
+	// interval is how long a delta waits for company before it is emitted on its
+	// own. It is deltaFlushInterval in production, and a test that needs buffering
+	// to be deterministic sets it longer than the test can possibly run.
+	interval time.Duration
+}
+
+func newDeltaCoalescer(emit func(string)) *deltaCoalescer {
+	return &deltaCoalescer{emit: emit, last: time.Now(), interval: deltaFlushInterval}
+}
+
+func (d *deltaCoalescer) add(delta string) {
+	d.pending.WriteString(delta)
+	if d.pending.Len() >= deltaFlushBytes || time.Since(d.last) >= d.interval {
+		d.flush()
+	}
+}
+
+func (d *deltaCoalescer) flush() {
+	if d.pending.Len() == 0 {
+		return
+	}
+	text := d.pending.String()
+	d.pending.Reset()
+	d.last = time.Now()
+	d.emit(text)
+}
+
+// budgetError reports whether the thread has spent its configured budget, so the
+// next model call is refused before it costs anything. Both budgets are checked
+// here rather than at the call site because a turn is the unit that spends.
+func (s *Session) budgetError() error {
+	if s.maxHistoryBytes > 0 && s.historyBytes > s.maxHistoryBytes {
+		return fmt.Errorf(
+			"thread history reached %d bytes (max_history_bytes %d); start a new thread",
+			s.historyBytes, s.maxHistoryBytes,
+		)
+	}
+	if s.maxTotalTokens > 0 && s.totalUsage.Total >= s.maxTotalTokens {
+		return fmt.Errorf(
+			"thread spent %d tokens (max_total_tokens %d)",
+			s.totalUsage.Total, s.maxTotalTokens,
+		)
+	}
+	return nil
+}
+
+// recordThreadEvent accounts the usage a delegated thread reports, so the token
+// budget covers providers that run whole threads and never return a TurnResult.
+//
+// The total is the sum of what the thread reports per turn. A provider that
+// reports the same work twice would make this an over-count, which is the safe
+// direction for a ceiling — the thread stops early rather than late.
+func (r *Runner) recordThreadEvent(s *Session, event map[string]any) {
+	if event["type"] != "token_count" {
+		return
+	}
+	last := provider.Usage{
+		Input:  intField(event, "prompt_tokens"),
+		Output: intField(event, "completion_tokens"),
+		Total:  intField(event, "total_tokens"),
+	}
+	s.addUsage(last)
+	// The rollout line the built-in loop writes from recordModelTurn is written
+	// here instead: a delegated thread reports usage through these events and has
+	// no TurnResult to take it from, so without this its rollout records no
+	// tokens at all.
+	s.rollout.Event(map[string]any{"type": "token_count", "info": map[string]any{
+		"total_token_usage": usagePayload(s.totalUsage),
+		"last_token_usage":  usagePayload(last),
+	}})
+}
+
+// intField reads one numeric field of a token_count event. The events a provider
+// adapter builds in process carry Go ints, while the same event decoded from
+// JSON carries float64, so both have to be accepted.
+func intField(event map[string]any, key string) int {
+	switch value := event[key].(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	default:
+		return 0
+	}
+}
+
+// runCause returns the most informative error for a finished run context: the
+// cause when one was set (a run deadline), else the plain context error.
+func runCause(ctx context.Context) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return ctx.Err()
 }
 
 func (r *Runner) safeExecToolCall(ctx context.Context, s *Session, toolCall provider.ToolCall) (result string, isError bool) {
@@ -563,6 +721,13 @@ func (r *Runner) authorize(
 	if justification != "" {
 		approvalReason = fmt.Sprintf("%s (model justification: %s)", approvalReason, justification)
 	}
+	// Say what approving actually does: an approved shell command skips the
+	// kernel sandbox, which is not visible from the command itself. (A git spelled
+	// around the wrapper also skips the hardening auto-allowed git gets; that is
+	// documented in the README rather than claimed here.)
+	if escalations := s.escalationsFor(tool); escalations != "" {
+		approvalReason = fmt.Sprintf("%s [approving this %s]", approvalReason, escalations)
+	}
 	if !r.Approver.Approve(ctx, s.ID, ApprovalRequest{
 		Tool:    tool,
 		Command: command,
@@ -572,6 +737,19 @@ func (r *Runner) authorize(
 		return false, "operation denied: approval was not granted"
 	}
 	return true, ""
+}
+
+// escalationsFor describes what approving this tool bypasses, so the approval
+// prompt names it. An approved shell command runs without the kernel sandbox in
+// every sandbox except danger-full-access, which was never going to sandbox it.
+func (s *Session) escalationsFor(tool string) string {
+	if tool != "shell" {
+		return ""
+	}
+	if _, sandboxed := s.shellWritableRoots(); !sandboxed {
+		return ""
+	}
+	return "runs the command without the kernel sandbox"
 }
 
 func (r *Runner) emitExecEnd(
