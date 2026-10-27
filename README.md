@@ -119,7 +119,7 @@ The agent loop treats a model reply without a tool call as the final answer. Som
 
 ### Reasoning effort
 
-Accepted caller values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, and `max`; the default is `high`. The value sent to the provider is `effort_map[value]` when the selected provider defines that mapping, otherwise the caller's value. The server validates against the seven values above and does not otherwise check provider-specific support, so an unsupported value surfaces as the provider's API error. `config.model_reasoning_effort` in the `config` object works like `reasoning-effort`, and the top-level argument wins.
+Accepted caller values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; the default is `high`. The value sent to the provider is `effort_map[value]` when the selected provider defines that mapping, otherwise the caller's value. The server validates against the eight values above and does not otherwise check provider-specific support, so an unsupported value surfaces as the provider's API error. `ultra` is the level Codex describes as maximum reasoning with automatic task delegation; the three model API families have no equivalent, so leave it unset for them or map it with `effort_map`. `config.model_reasoning_effort` in the `config` object works like `reasoning-effort`, and the top-level argument wins.
 
 ### API keys
 
@@ -132,7 +132,9 @@ Pass `provider` when starting a session to choose which configured provider it u
 
 ### Codex app-server provider
 
-`codex-app-server` is **experimental**, tested with **codex-cli 0.156.1**. Install Codex, run `codex login` as the user launching the MCP server, and enable the commented `[providers.codex]` block in `config.example.toml`. Set `command` only if the executable is not `codex` on `PATH`; omit `env_key` and `base_url`.
+`codex-app-server` is **experimental**, tested with **codex-cli 0.156.1**; its `auth` and `model/list` calls also work against 0.131.0 and 0.164.0. Install Codex, run `codex login` as the user launching the MCP server, and enable the commented `[providers.codex]` block in `config.example.toml`. Set `command` only if the executable is not `codex` on `PATH`; omit `env_key` and `base_url`.
+
+The model ids a provider block lists are whatever the installed Codex reports, and they change between Codex versions: 0.131.0 lists only `gpt-5.x`, while 0.164.0 lists the `gpt-6.x` family and no `gpt-5.5`, so a block written against one version will not validate against the other. If more than one Codex is installed, point `command` at the one whose models you listed, since an older install earlier on `PATH` wins the plain `codex` lookup. `--check-config` reports the version and model count it found and warns about every configured id that is not in that list.
 
 The session inherits the user's whole Codex environment — auth, config, plugins, hooks, skills, MCP servers, and AGENTS.md — and uses **Codex's own tools and sandbox**, not subagent-mcp's native four-tool runner or Landlock policy. The app-server child still receives an environment scrubbed of configured `env_key` variables and `SUBAGENT_MCP_*` variables. The native tool, prompt-loading, sandbox, and rollout details elsewhere in this README apply to the three model API families; Codex differs as follows:
 
@@ -176,10 +178,10 @@ For a Codex-only config, an illustrative `--check-config` result is:
 config   /home/you/.config/subagent-mcp/config.toml   OK
 provider codex (codex-app-server)
   auth   chatgpt (plus)   OK
-  api    codex-cli 0.156.1   OK (7 models listed)
+  api    codex-cli 0.164.0   OK (8 models listed)
+  model  gpt-6.1-sol     OK
   model  gpt-6-astra     OK
-  model  gpt-6-sol     OK
-  model  gpt-5.5     OK
+  model  gpt-6.1-terra     OK
 result   PASS (1 checked, 0 skipped, 0 failed)
 ```
 
@@ -209,7 +211,7 @@ Starts a new coding-agent thread.
 | `prompt` | Yes | — | String task prompt for the new thread. |
 | `provider` | No (required when 2+ providers are configured) | The sole configured provider | Name of a provider defined under `[providers]`; the tool schema's `enum` lists them. Required when the config defines more than one, otherwise optional. Fixed for the session's lifetime. |
 | `model` | No | Selected provider's `default_model` | A model id from the selected provider's `models` list; the tool schema's `enum` is the union of every configured provider's models, described grouped by provider. An unknown value is a tool error listing the selected provider's available ids. |
-| `reasoning-effort` | No | `high` | One of the seven effort values; mapped through the provider's `effort_map` before it is sent. This argument wins over `config.model_reasoning_effort`, and an invalid value from either source is an error. |
+| `reasoning-effort` | No | `high` | One of the eight effort values; mapped through the provider's `effort_map` before it is sent. This argument wins over `config.model_reasoning_effort`, and an invalid value from either source is an error. |
 | `cwd` | No | Server process working directory | Absolute path to an existing directory. |
 | `sandbox` | No | `read-only` | `read-only`, `workspace-write`, or `danger-full-access`. |
 | `approval-policy` | No | `on-request` | `untrusted`, `on-request`, `on-failure`, or `never`. |

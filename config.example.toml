@@ -36,9 +36,13 @@ models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
 
 # codex-app-server: experimental; uses Codex's own tools, sandbox, and login.
 # Run `codex login` first. Do not set env_key or base_url for this api.
+# The model ids are whatever the installed Codex reports, so they change with its
+# version; `subagent-mcp --check-config` warns about any id that its model/list
+# does not contain. If more than one Codex is installed, point `command` at the
+# one whose models you listed: an older install on PATH will not know newer ids.
 # [providers.codex]
 # api = "codex-app-server"
 # command = "codex"   # optional; default "codex" on PATH
-# default_model = "gpt-6-astra"
-# models = [{ id = "gpt-6-astra" }, { id = "gpt-6-sol" }, { id = "gpt-5.5" }]
+# default_model = "gpt-6.1-sol"
+# models = [{ id = "gpt-6.1-sol" }, { id = "gpt-6-astra" }, { id = "gpt-6.1-terra" }]
 # effort_map = { none = "low", minimal = "low" }
