@@ -667,6 +667,18 @@ type toolOutput struct {
 
 func startTool(name string, cfg *config.Config) mcp.Tool {
 	modelIDs, modelDesc := modelUnionSchema(cfg)
+	// The provider is only genuinely optional when there is exactly one to
+	// choose: with more than one configured, a call that omits it always fails,
+	// so the schema has to say it is required rather than leave it to the
+	// description. Nothing about which calls succeed changes; the tool contract
+	// stops under-declaring what the handler already enforces.
+	providerOptions := []mcp.PropertyOption{
+		mcp.Enum(cfg.ProviderNames()...),
+		mcp.Description(providerDescription(cfg)),
+	}
+	if len(cfg.Providers) > 1 {
+		providerOptions = append(providerOptions, mcp.Required())
+	}
 	return mcp.NewTool(
 		name,
 		mcp.WithDescription("Start a new subagent coding-agent thread."),
@@ -675,11 +687,7 @@ func startTool(name string, cfg *config.Config) mcp.Tool {
 			mcp.Required(),
 			mcp.Description("Task prompt to send to the new subagent thread."),
 		),
-		mcp.WithString(
-			"provider",
-			mcp.Enum(cfg.ProviderNames()...),
-			mcp.Description(providerDescription(cfg)),
-		),
+		mcp.WithString("provider", providerOptions...),
 		mcp.WithString(
 			"model",
 			mcp.Enum(modelIDs...),

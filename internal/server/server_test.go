@@ -976,7 +976,7 @@ func TestHandleStartRejectsInvalidConfigReasoningEffort(t *testing.T) {
 		value    any
 		contains []string
 	}{
-		{name: "unknown value", value: "ultra", contains: []string{"config.model_reasoning_effort", "ultra", "none", "minimal", "xhigh"}},
+		{name: "unknown value", value: "turbo", contains: []string{"config.model_reasoning_effort", "turbo", "none", "minimal", "xhigh", "ultra"}},
 		{name: "non-string", value: 3, contains: []string{"config.model_reasoning_effort", "string"}},
 	}
 
@@ -2606,5 +2606,54 @@ func TestEmitCountsDropsInsteadOfLoggingEach(t *testing.T) {
 	}
 	if got := strings.Count(logged.String(), "dropped (client cannot keep up)"); got != 1 {
 		t.Errorf("logged %d drop line(s), want exactly 1; log was:\n%s", got, logged.String())
+	}
+}
+
+// TestProviderParameterIsRequiredWithMoreThanOneProvider pins the tool schema
+// against what the handler already enforces. With several providers configured a
+// call that omits provider always fails, so the schema has to declare it required
+// instead of leaving the requirement to the description; with exactly one it is
+// genuinely optional and must stay that way. No call changes its outcome — the
+// schema stops under-declaring a parameter that is already mandatory.
+func TestProviderParameterIsRequiredWithMoreThanOneProvider(t *testing.T) {
+	tests := []struct {
+		name     string
+		cfg      *config.Config
+		required bool
+	}{
+		{
+			name:     "one provider keeps it optional",
+			cfg:      testMultiConfig(t, map[string]provider.Provider{"deepseek": &stubProvider{}}),
+			required: false,
+		},
+		{
+			name: "two providers require it",
+			cfg: testMultiConfig(t, map[string]provider.Provider{
+				"deepseek":  &stubProvider{},
+				"secondary": &stubProvider{},
+			}),
+			required: true,
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			s := New(test.cfg, "test")
+
+			var schema struct {
+				Required []string `json:"required"`
+			}
+			if err := json.Unmarshal([]byte(toolInputSchemaJSON(t, s, "subagent")), &schema); err != nil {
+				t.Fatalf("unmarshal tool schema: %v", err)
+			}
+
+			if got := slices.Contains(schema.Required, "provider"); got != test.required {
+				t.Fatalf("schema required = %v, want provider required = %v", schema.Required, test.required)
+			}
+			// The parameters that were already required must still be required.
+			if !slices.Contains(schema.Required, "prompt") {
+				t.Errorf("schema required = %v, want prompt still required", schema.Required)
+			}
+		})
 	}
 }
