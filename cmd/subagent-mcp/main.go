@@ -22,7 +22,7 @@ import (
 	"github.com/Geek0x0/subagent-mcp/internal/tools"
 )
 
-const version = "0.11.0"
+const version = "0.11.1"
 
 // shutdownGrace bounds how long the process waits for in-flight runs to unwind
 // and for sessions to be released. Cancellation reaches every blocking step a
