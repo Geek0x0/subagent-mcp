@@ -23,8 +23,11 @@ const (
 	APICodexAppServer  = "codex-app-server"
 )
 
-// EffortValues lists the reasoning effort values accepted from callers.
-var EffortValues = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"}
+// EffortValues lists the reasoning effort values accepted from callers. The last
+// is what Codex calls maximum reasoning with automatic task delegation; the model
+// API families have no equivalent, so a provider that needs a different value
+// maps it with effort_map.
+var EffortValues = []string{"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 
 var providerNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]+$`)
 

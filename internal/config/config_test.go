@@ -493,3 +493,26 @@ max_completion_tokens = 1024
 		t.Fatalf("Load() error = %v, want max_completion_tokens alone to be accepted", err)
 	}
 }
+
+// TestUltraEffortIsAccepted pins the level Codex adds on top of the vocabulary the
+// model API families use. Both the tool argument and effort_map validate against
+// the same list, so without it a codex provider cannot ask for ultra at all.
+func TestUltraEffortIsAccepted(t *testing.T) {
+	if !ValidEffort("ultra") {
+		t.Fatal("ValidEffort(ultra) = false, want true: codex reports ultra as its top reasoning level")
+	}
+
+	cfg, err := Load(writeConfig(t, `
+[providers.codex]
+api = "codex-app-server"
+default_model = "m"
+models = [{ id = "m" }]
+effort_map = { high = "ultra" }
+`))
+	if err != nil {
+		t.Fatalf("Load() error = %v, want a mapping onto ultra to be accepted", err)
+	}
+	if got := cfg.Providers["codex"].MapEffort("high"); got != "ultra" {
+		t.Errorf("MapEffort(high) = %q, want ultra", got)
+	}
+}
