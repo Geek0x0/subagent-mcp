@@ -506,7 +506,7 @@ func toolInputSchemaJSON(t *testing.T, s *Server, name string) string {
 func TestModelParameterFromConfig(t *testing.T) {
 	s := New(testConfig(t, &stubProvider{}), "test")
 	schema := toolInputSchemaJSON(t, s, "subagent")
-	for _, want := range []string{`"m-fast"`, `"m-pro"`, "deepseek (default m-fast): m-fast", "m-fast (fast)"} {
+	for _, want := range []string{`"m-fast"`, `"m-pro"`, "deepseek: m-fast (fast) (default), m-pro"} {
 		if !strings.Contains(schema, want) {
 			t.Errorf("schema %s lacks %q", schema, want)
 		}
@@ -2025,7 +2025,7 @@ func TestModelParameterUnionAcrossProviders(t *testing.T) {
 	schema := toolInputSchemaJSON(t, s, "subagent")
 	for _, want := range []string{
 		`"a-model"`, `"b-model"`, `"shared-model"`,
-		"a (default a-model): a-model", "b (default b-model): b-model (strong)",
+		"a: a-model (default), shared-model", "b: b-model (strong) (default), shared-model",
 		`"enum":["a","b"]`,
 	} {
 		if !strings.Contains(schema, want) {
@@ -2655,5 +2655,42 @@ func TestProviderParameterIsRequiredWithMoreThanOneProvider(t *testing.T) {
 				t.Errorf("schema required = %v, want prompt still required", schema.Required)
 			}
 		})
+	}
+}
+
+// TestToolSchemaProseMatchesItsEnums pins every description against the enum it
+// describes. They drifted once: ultra was added to the accepted efforts and the
+// description beside it still stopped at max, which is exactly the text a model
+// reads when choosing one.
+func TestToolSchemaProseMatchesItsEnums(t *testing.T) {
+	s := New(testConfig(t, &stubProvider{}), "test")
+
+	var schema struct {
+		Properties map[string]struct {
+			Description string   `json:"description"`
+			Enum        []string `json:"enum"`
+		} `json:"properties"`
+	}
+	if err := json.Unmarshal([]byte(toolInputSchemaJSON(t, s, "subagent")), &schema); err != nil {
+		t.Fatalf("unmarshal tool schema: %v", err)
+	}
+
+	for _, name := range []string{"reasoning-effort", "model", "provider"} {
+		property, ok := schema.Properties[name]
+		if !ok {
+			t.Fatalf("schema has no %q parameter", name)
+		}
+		if len(property.Enum) == 0 {
+			t.Fatalf("%q has no enum to check", name)
+		}
+		for _, value := range property.Enum {
+			if !strings.Contains(property.Description, value) {
+				t.Errorf("%s description %q does not mention the accepted value %q", name, property.Description, value)
+			}
+		}
+	}
+
+	if got := len(schema.Properties["reasoning-effort"].Enum); got != len(config.EffortValues) {
+		t.Errorf("reasoning-effort enum has %d values, want the %d in config.EffortValues", got, len(config.EffortValues))
 	}
 }

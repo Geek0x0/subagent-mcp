@@ -155,6 +155,11 @@ func resolveEffort(arguments map[string]any, configMap map[string]any) (string, 
 // modelUnionSchema returns every configured provider's model ids, deduplicated
 // in provider-name order, and a description grouping them by provider, for
 // the model parameter of the start tool.
+//
+// The default is marked inline, next to the id it applies to, rather than
+// announced before the list: "codex (default gpt-6-luna): gpt-6-luna, ..." read
+// as though the provider had one model, and a model summarising it kept only the
+// default. Marking one entry of the list keeps every id visible.
 func modelUnionSchema(cfg *config.Config) (ids []string, description string) {
 	seen := map[string]bool{}
 	var groups []string
@@ -166,19 +171,38 @@ func modelUnionSchema(cfg *config.Config) (ids []string, description string) {
 				seen[model.ID] = true
 				ids = append(ids, model.ID)
 			}
-			if model.Description == "" {
-				models = append(models, model.ID)
-			} else {
-				models = append(models, fmt.Sprintf("%s (%s)", model.ID, model.Description))
+			rendered := model.ID
+			if model.Description != "" {
+				rendered = fmt.Sprintf("%s (%s)", rendered, model.Description)
 			}
+			if model.ID == p.DefaultModel {
+				rendered += " (default)"
+			}
+			models = append(models, rendered)
 		}
-		groups = append(groups, fmt.Sprintf("%s (default %s): %s", name, p.DefaultModel, strings.Join(models, ", ")))
+		groups = append(groups, fmt.Sprintf("%s: %s", name, strings.Join(models, ", ")))
 	}
 	description = fmt.Sprintf(
 		"Model to use; the available id depends on the chosen provider. By provider: %s",
 		strings.Join(groups, "; "),
 	)
 	return ids, description
+}
+
+// effortDescription describes the accepted reasoning effort values from the one
+// list that defines them, so the prose cannot drift from the enum beside it.
+func effortDescription() string {
+	values := config.EffortValues
+	var listed string
+	switch len(values) {
+	case 0:
+		return "Reasoning effort; defaults to high, or to config.model_reasoning_effort."
+	case 1:
+		listed = values[0]
+	default:
+		listed = strings.Join(values[:len(values)-1], ", ") + ", or " + values[len(values)-1]
+	}
+	return fmt.Sprintf("Reasoning effort: %s; defaults to high, or to config.model_reasoning_effort.", listed)
 }
 
 // providerDescription lists every configured provider name for the provider
@@ -708,7 +732,7 @@ func startTool(name string, cfg *config.Config) mcp.Tool {
 		mcp.WithString(
 			"reasoning-effort",
 			mcp.Enum(config.EffortValues...),
-			mcp.Description("Reasoning effort: none, minimal, low, medium, high, xhigh, or max; defaults to high, or to config.model_reasoning_effort."),
+			mcp.Description(effortDescription()),
 		),
 		mcp.WithString(
 			"base-instructions",
