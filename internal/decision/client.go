@@ -165,6 +165,7 @@ func (c *Client) Choose(ctx context.Context, task, cwd string, candidates []Cand
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("TypeSafe-Danger-Zone-Long-Context", "true")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {

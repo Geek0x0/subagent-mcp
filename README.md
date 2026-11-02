@@ -156,7 +156,7 @@ With an `[auto]` section configured, pass `model: "auto"` and omit `provider` to
 - A Jev error, malformed answer, or unknown choice is a tool error. There is no fallback model and no retry; retry the call or pass an explicit `provider`/`model`.
 - `auto.confidence` is informational. A low-confidence choice is still dispatched, because it is Jev's highest-probability answer.
 - One decision happens at session creation. `subagent-reply` keeps the chosen provider/model for the session's lifetime.
-- Auto mode sends the prompt to the configured `auto.base_url` (TypeSafe by default), and Jev bills per input token.
+- Auto mode sends the prompt to the configured `auto.base_url` (TypeSafe by default) and opts into Jev long context so long prompts are accepted and billed by input tokens.
 - The decision is a label, not generated text: the task prompt can bias which model is chosen, but it cannot make Jev execute tools or return free-form instructions.
 
 ### Codex app-server provider

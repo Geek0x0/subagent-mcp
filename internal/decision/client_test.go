@@ -34,6 +34,9 @@ func TestChooseSendsOneChoiceQuestionAndMapsAnswer(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
 			t.Errorf("Authorization = %q", got)
 		}
+		if got := r.Header.Get("TypeSafe-Danger-Zone-Long-Context"); got != "true" {
+			t.Errorf("TypeSafe-Danger-Zone-Long-Context = %q, want true", got)
+		}
 		_ = json.NewDecoder(r.Body).Decode(&requestBody)
 		_, _ = io.WriteString(w, `{
 			"model":"jev-1.14.0",
