@@ -20,17 +20,25 @@ type autoSelection struct {
 	adapter      provider.Provider
 	model        string
 	selection    decision.Selection
+	skipped      bool
+	omitted      []string
 }
 
 func (a *autoSelection) meta() map[string]any {
-	meta := map[string]any{
-		"judge_model":   a.selection.JudgeModel,
-		"confidence":    a.selection.Confidence,
-		"input_tokens":  a.selection.InputTokens,
-		"output_tokens": a.selection.OutputTokens,
+	meta := map[string]any{}
+	if a.skipped {
+		meta["skipped"] = true
+	} else {
+		meta["judge_model"] = a.selection.JudgeModel
+		meta["confidence"] = a.selection.Confidence
+		meta["input_tokens"] = a.selection.InputTokens
+		meta["output_tokens"] = a.selection.OutputTokens
+		if len(a.selection.Probabilities) > 0 {
+			meta["probabilities"] = a.selection.Probabilities
+		}
 	}
-	if len(a.selection.Probabilities) > 0 {
-		meta["probabilities"] = a.selection.Probabilities
+	if len(a.omitted) > 0 {
+		meta["omitted"] = a.omitted
 	}
 	return meta
 }
@@ -38,11 +46,11 @@ func (a *autoSelection) meta() map[string]any {
 // resolveAuto chooses a configured provider/model with the decision model and
 // builds its adapter. A failed decision is a tool error, never a fallback.
 func (s *Server) resolveAuto(ctx context.Context, prompt, cwd, providerArg string) (*autoSelection, *mcp.CallToolResult) {
-	if providerArg != "" {
-		return nil, mcp.NewToolResultError(`provider must be omitted when model is "auto"`)
-	}
 	if s.cfg.Auto == nil {
 		return nil, mcp.NewToolResultError(fmt.Sprintf("model \"auto\" requires an [auto] section in %s", s.cfg.Path))
+	}
+	if providerArg != "" {
+		return nil, mcp.NewToolResultError(`provider must be omitted when model is "auto"`)
 	}
 
 	candidates, omitted := s.autoCandidates()
@@ -56,9 +64,8 @@ func (s *Server) resolveAuto(ctx context.Context, prompt, cwd, providerArg strin
 	var selection decision.Selection
 	if len(candidates) == 1 {
 		selection = decision.Selection{
-			Provider:   candidates[0].Provider,
-			Model:      candidates[0].Model,
-			Confidence: 1,
+			Provider: candidates[0].Provider,
+			Model:    candidates[0].Model,
 		}
 	} else {
 		key, err := s.cfg.AutoAPIKey()
@@ -98,6 +105,8 @@ func (s *Server) resolveAuto(ctx context.Context, prompt, cwd, providerArg strin
 		adapter:      adapter,
 		model:        selection.Model,
 		selection:    selection,
+		skipped:      len(candidates) == 1,
+		omitted:      omitted,
 	}, nil
 }
 

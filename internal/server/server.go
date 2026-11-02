@@ -697,15 +697,17 @@ type startOutput struct {
 	Content  string      `json:"content" jsonschema_description:"Human-readable report text from the subagent."`
 	Provider string      `json:"provider,omitempty" jsonschema_description:"Configured provider the session uses."`
 	Model    string      `json:"model,omitempty" jsonschema_description:"Model id the session uses."`
-	Auto     *autoOutput `json:"auto,omitempty" jsonschema_description:"Jev decision details, present when the model was selected by auto mode."`
+	Auto     *autoOutput `json:"auto,omitempty" jsonschema_description:"Auto selection details, present when the model was selected by auto mode."`
 }
 
 type autoOutput struct {
-	JudgeModel    string             `json:"judge_model" jsonschema_description:"Model that answered the decision request."`
-	Confidence    float64            `json:"confidence" jsonschema_description:"Jev confidence in the chosen pair, from 0 to 1."`
+	Skipped       bool               `json:"skipped,omitempty" jsonschema_description:"True when Jev was skipped because only one candidate was available."`
+	Omitted       []string           `json:"omitted,omitempty" jsonschema_description:"Reasons providers were omitted from the candidates, when any were omitted."`
+	JudgeModel    *string            `json:"judge_model,omitempty" jsonschema_description:"Model that answered the decision request; absent when Jev was skipped."`
+	Confidence    *float64           `json:"confidence,omitempty" jsonschema_description:"Jev confidence in the chosen pair, from 0 to 1; absent when Jev was skipped."`
 	Probabilities map[string]float64 `json:"probabilities,omitempty" jsonschema_description:"Probability of each candidate, keyed by provider/model."`
-	InputTokens   int                `json:"input_tokens" jsonschema_description:"Jev input tokens billed for this decision."`
-	OutputTokens  int                `json:"output_tokens" jsonschema_description:"Jev output tokens for this decision."`
+	InputTokens   *int               `json:"input_tokens,omitempty" jsonschema_description:"Jev input tokens billed for this decision; absent when Jev was skipped."`
+	OutputTokens  *int               `json:"output_tokens,omitempty" jsonschema_description:"Jev output tokens for this decision; absent when Jev was skipped."`
 }
 
 type replyOutput struct {
@@ -864,6 +866,9 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	var errResult *mcp.CallToolResult
 
 	if autoRequested {
+		if s.cfg.Auto == nil {
+			return mcp.NewToolResultError(fmt.Sprintf("model \"auto\" requires an [auto] section in %s", s.cfg.Path)), nil
+		}
 		if raw, present := arguments["provider"]; present {
 			value, ok := raw.(string)
 			if !ok {
@@ -872,9 +877,6 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 			if value != "" {
 				return mcp.NewToolResultError(`provider must be omitted when model is "auto"`), nil
 			}
-		}
-		if s.cfg.Auto == nil {
-			return mcp.NewToolResultError(fmt.Sprintf("model \"auto\" requires an [auto] section in %s", s.cfg.Path)), nil
 		}
 	} else {
 		providerName, providerCfg, selectedProvider, errResult = s.resolveProvider(arguments)
