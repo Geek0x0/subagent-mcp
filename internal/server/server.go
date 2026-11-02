@@ -713,6 +713,8 @@ type autoOutput struct {
 type replyOutput struct {
 	ThreadID string `json:"threadId" jsonschema_description:"ID of the subagent thread that produced this result."`
 	Content  string `json:"content" jsonschema_description:"Human-readable report text from the subagent."`
+	Provider string `json:"provider,omitempty" jsonschema_description:"Configured provider the session uses."`
+	Model    string `json:"model,omitempty" jsonschema_description:"Model id the session uses."`
 }
 
 func startTool(name string, cfg *config.Config) mcp.Tool {
@@ -1139,7 +1141,7 @@ func (s *Server) handleReply(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	defer s.mgr.Release(sess)
 
 	text, err := s.runner.RunLocked(ctx, sess, prompt)
-	return resultWithThreadID(threadID, text, err), nil
+	return resultWithStart(threadID, text, err, sess.Provider().Name(), sess.Model(), nil), nil
 }
 
 func resultWithStart(threadID, text string, err error, providerName, model string, auto map[string]any) *mcp.CallToolResult {

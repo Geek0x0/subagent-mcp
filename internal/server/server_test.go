@@ -477,10 +477,17 @@ func TestToolOutputSchemas(t *testing.T) {
 					}
 				}
 			} else {
-				for _, absent := range []string{"provider", "model", "auto"} {
-					if _, ok := properties[absent]; ok {
-						t.Errorf("reply output schema properties = %#v, want no property %q", properties, absent)
+				for _, want := range []string{"provider", "model"} {
+					if _, ok := properties[want]; !ok {
+						t.Errorf("reply output schema properties = %#v, want property %q", properties, want)
 					}
+				}
+				if len(properties) != 4 {
+					t.Errorf("reply output schema properties = %#v, want only threadId, content, provider, and model", properties)
+				}
+				required, ok := schema["required"].([]any)
+				if !ok || len(required) != 2 || !slices.Contains(required, any("threadId")) || !slices.Contains(required, any("content")) {
+					t.Errorf("reply output schema required = %#v, want threadId and content", schema["required"])
 				}
 			}
 		})
@@ -885,6 +892,43 @@ func TestHandleStartAndReplyContinueSession(t *testing.T) {
 	}
 	if got := toolResultThreadID(t, reply); got != threadID {
 		t.Fatalf("handleReply() threadId = %q, want %q", got, threadID)
+	}
+}
+
+func TestHandleReplyReportsSessionProviderAndModel(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		turn      stubTurn
+		wantError bool
+	}{
+		{name: "success", turn: stubTurn{result: &provider.TurnResult{Text: "continued"}}},
+		{name: "runner error", turn: stubTurn{err: errors.New("reply failed")}, wantError: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			client := &stubProvider{name: "alpha", turns: []stubTurn{{result: &provider.TurnResult{Text: "started"}}, tc.turn}}
+			cfg := testMultiConfig(t, map[string]provider.Provider{"alpha": client, "bravo": &stubProvider{name: "bravo"}})
+			s := New(cfg, "test")
+			start, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+				"prompt": "start", "cwd": t.TempDir(), "provider": "alpha", "model": "m-pro",
+			}))
+			if err != nil || start.IsError {
+				t.Fatalf("handleStart() = (%#v, %v), want success", start, err)
+			}
+			threadID := toolResultThreadID(t, start)
+			reply, err := s.handleReply(context.Background(), callToolRequest("subagent-reply", map[string]any{
+				"threadId": threadID, "prompt": "continue",
+			}))
+			if err != nil || reply.IsError != tc.wantError {
+				t.Fatalf("handleReply() = (%#v, %v), want error = %v", reply, err, tc.wantError)
+			}
+			structured := startStructured(t, reply)
+			if structured["threadId"] != threadID || structured["provider"] != "alpha" || structured["model"] != "m-pro" {
+				t.Fatalf("reply structured = %#v, want thread ID, provider alpha, and model m-pro", structured)
+			}
+			if _, ok := structured["auto"]; ok {
+				t.Fatalf("reply structured = %#v, want no auto key", structured)
+			}
+		})
 	}
 }
 

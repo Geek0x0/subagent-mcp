@@ -380,6 +380,11 @@ func (s *Session) Provider() provider.Provider {
 	return s.provider
 }
 
+// Model returns the model selected for this session.
+func (s *Session) Model() string {
+	return s.model
+}
+
 // shellWritableRoots returns the Landlock writable roots for shell calls the
 // policy auto-allows, and false when such calls run without the kernel sandbox.
 func (s *Session) shellWritableRoots() ([]string, bool) {
