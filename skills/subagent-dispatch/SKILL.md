@@ -29,6 +29,8 @@ Use the most recent returned ID with `subagent-reply`; the ID remains the same f
 
 `provider` selects which configured provider a new session uses; the tool schema's `enum` lists every name defined under `[providers]`. Omit it only when the config defines exactly one provider — with two or more, omitting it is a tool error listing the available names, so pass the name the user (or the dispatch policy) selected before the first call of a new session. It is fixed for the session's lifetime; `subagent-reply` always continues with the same provider, and `model` must come from that provider's list.
 
+When the config has an `[auto]` section and neither the user nor the dispatch policy requires a particular model, you may pass `model: "auto"` and omit `provider`. The server asks TypeSafe's Jev decision model to choose among the reachable configured provider/models, then starts the session on that pair. A non-empty `provider` with `auto` is an error. Read back `provider`, `model`, and `auto` from the result to know what was dispatched; `auto.judge_model`, `auto.confidence`, `auto.probabilities`, and token counts explain the choice. Do not use `auto` when a specific model/provider is required, and do not change models mid-session. A single-model config with `auto` still works without a Jev key because there is nothing to decide.
+
 Choose the narrowest sandbox that permits the task:
 
 - `read-only` (default) permits `read_file` and the policy's shell-command allowlist. Other operations fall outside the sandbox. Auto-allowed shell commands run with no writable roots.

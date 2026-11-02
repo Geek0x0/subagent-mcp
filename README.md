@@ -83,6 +83,13 @@ env_key = "ANTHROPIC_API_KEY"
 default_model = "claude-sonnet-5"
 max_output_tokens = 64000
 models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
+
+# Optional: let `start` choose a provider/model with TypeSafe's Jev.
+[auto]
+env_key = "TYPESAFE_API_KEY"
+model = "jev-latest"
+# base_url = "https://api.typesafe.ai"
+# timeout_seconds = 20
 ```
 
 ### Fields
@@ -99,6 +106,17 @@ models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
 | `max_output_tokens` | provider | no | Positive integer output limit. `messages` always sends one as `max_tokens` and defaults to `64000`, because that API requires the field. `responses` sends it as `max_output_tokens` and `chat-completions` as `max_tokens` when the config sets it; leaving it unset omits the field, so the provider's own default applies. OpenAI's reasoning models reject `max_tokens`, so leave this unset for one on the `chat-completions` api and set `extra_body.max_completion_tokens` instead, or use the `responses` api, which takes `max_output_tokens`. Rejected for `codex-app-server`, which applies its own limits. |
 | `extra_body` | provider | no | Table merged into the JSON body of every `chat-completions` request, for fields the SDK has no place for. Its main use is choosing the upstream behind an OpenRouter-style gateway, for example `[providers.x.extra_body.provider]` with `ignore = ["relace"]` or `only = ["streamlake"]`. Rejected for other `api` values; `model`, `messages`, `stream`, `stream_options`, `tools`, `tool_choice` and `max_tokens` cannot be set (the last one is what `max_output_tokens` sends). `max_completion_tokens` stays available, for a model that requires it. See [Choosing the upstream behind a gateway](#choosing-the-upstream-behind-a-gateway). |
 | `max_nudges` | provider | no | Integer from 0 to 10; defaults to `0` (off). See [Models that stop to narrate](#models-that-stop-to-narrate). Ignored by `codex-app-server`. |
+
+The optional `[auto]` table configures the decision model used by `model: "auto"`:
+
+| Field | Required | Rules |
+|---|---|---|
+| `env_key` | yes | Name of the environment variable holding the TypeSafe API key. A missing value fails only calls that need a decision, naming the variable and `auto.env_key`. |
+| `model` | yes | TypeSafe model name or alias, for example `jev-latest` or `jev-1.14.0`. |
+| `base_url` | no | Defaults to `https://api.typesafe.ai`. The System One path `/v1/systemone` is appended. A same-protocol proxy can be used by pointing here. |
+| `timeout_seconds` | no | Bound on one decision request; `0` (or omitted) uses the default `20`, otherwise valid values are 1 to 600. The caller's own deadline still wins when shorter. |
+
+`auto` is a reserved pseudo-model id: a `providers.*.models[].id` equal to `auto` is a config error, whether or not `[auto]` is configured. Without `[auto]`, `model: "auto"` is a tool error naming the missing section.
 
 ### Choosing the upstream behind a gateway
 
@@ -123,12 +141,23 @@ Accepted caller values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, 
 
 ### API keys
 
-Keys are never stored in the config file. For the three model API families, when a session is created, the server reads the selected provider's `env_key` variable from its own environment; every provider's `env_key` variable is also removed from shell commands run by the agent (see [Environment](#environment)). Keep the variable in the environment that launches the MCP server, for example in an MCP client's `env` block. Do not rely on a shell profile to provide the key to the agent: login profiles are loaded for shell commands, but configured keys are removed again before the command runs. Codex uses its own login instead.
+Keys are never stored in the config file. For the three model API families, when a session is created, the server reads the selected provider's `env_key` variable from its own environment; every provider's `env_key` variable is also removed from shell commands run by the agent (see [Environment](#environment)). `auto.env_key` is scrubbed the same way. Keep the variable in the environment that launches the MCP server, for example in an MCP client's `env` block. Do not rely on a shell profile to provide the key to the agent: login profiles are loaded for shell commands, but configured keys are removed again before the command runs. Codex uses its own login instead.
 Requests to a provider's `base_url` carry only that provider's configured key and the SDK's standard protocol headers: the SDKs' own credential environments (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`, `OPENAI_CUSTOM_HEADERS`, and the `*_BASE_URL`/`*_API_KEY` variables) are ignored, so gateway tokens and headers from the server's environment are never forwarded to a configured endpoint.
 
 ### Selecting a provider
 
 Pass `provider` when starting a session to choose which configured provider it uses; the tool schema's `enum` lists every name defined under `[providers]`. Omitting `provider` works only when the config defines exactly one provider — with two or more, omitting it is a tool error listing the available names. The chosen provider is fixed for the session's lifetime: `subagent-reply` always continues with the same one, and each call's `model` must come from that provider's list.
+
+### Auto model selection
+
+With an `[auto]` section configured, pass `model: "auto"` and omit `provider` to let the server choose the provider/model for that session. The server sends the task prompt and validated `cwd` to TypeSafe's Jev decision model (`POST /v1/systemone`) with one `choice` question whose criteria are every reachable configured provider/model pair and its configured `description`. Providers whose API key is not set are omitted; `codex-app-server` providers are included without a login preflight. The highest-probability choice is dispatched, and the start result reports it.
+
+- A single reachable candidate skips Jev entirely and does not require `auto.env_key`.
+- A Jev error, malformed answer, or unknown choice is a tool error. There is no fallback model and no retry; retry the call or pass an explicit `provider`/`model`.
+- `auto.confidence` is informational. A low-confidence choice is still dispatched, because it is Jev's highest-probability answer.
+- One decision happens at session creation. `subagent-reply` keeps the chosen provider/model for the session's lifetime.
+- Auto mode sends the prompt to the configured `auto.base_url` (TypeSafe by default), and Jev bills per input token.
+- The decision is a label, not generated text: the task prompt can bias which model is chosen, but it cannot make Jev execute tools or return free-form instructions.
 
 ### Codex app-server provider
 
@@ -167,8 +196,13 @@ provider deepseek (chat-completions)
   api    https://api.deepseek.com   OK (2 models listed)
   model  deepseek-flash     OK
   model  deepseek-v4-pro     WARN: not in the provider's current model list
+auto     typesafe (jev-latest)
+  api    https://api.typesafe.ai
+  key    TYPESAFE_API_KEY   set
 result   PASS (1 checked, 1 skipped, 0 failed)
 ```
+
+When `[auto]` exists, `--check-config` adds the `auto` block shown above and reports whether its key is set; it does not call Jev. A missing auto key warns (`not set, auto calls will fail`) and only disables `model: "auto"` calls; it does not change the exit code.
 
 If no configured provider has a key set or passes Codex auth, and none failed, the result line instead reads `result   FAIL (0 checked, N skipped, 0 failed) — no configured provider has its key set`.
 
@@ -209,8 +243,8 @@ Starts a new coding-agent thread.
 | Parameter | Required | Default | Description |
 |---|---:|---|---|
 | `prompt` | Yes | — | String task prompt for the new thread. |
-| `provider` | No (required when 2+ providers are configured) | The sole configured provider | Name of a provider defined under `[providers]`; the tool schema's `enum` lists them. Required when the config defines more than one, otherwise optional. Fixed for the session's lifetime. |
-| `model` | No | Selected provider's `default_model` | A model id from the selected provider's `models` list; the tool schema's `enum` is the union of every configured provider's models, described grouped by provider. An unknown value is a tool error listing the selected provider's available ids. |
+| `provider` | No (required when 2+ providers are configured and `model` is explicit) | The sole configured provider | Name of a provider defined under `[providers]`; the tool schema's `enum` lists them. Required at call time when the config defines more than one provider and `model` is not `auto`, otherwise optional. Fixed for the session's lifetime. |
+| `model` | No | Selected provider's `default_model` | A model id from the selected provider's `models` list; the tool schema's `enum` is the union of every configured provider's models, described grouped by provider. When `[auto]` is configured, `auto` is also accepted: it lets Jev choose the provider/model, so `provider` must be omitted. An unknown value is a tool error listing the selected provider's available ids. |
 | `reasoning-effort` | No | `high` | One of the eight effort values; mapped through the provider's `effort_map` before it is sent. This argument wins over `config.model_reasoning_effort`, and an invalid value from either source is an error. |
 | `cwd` | No | Server process working directory | Absolute path to an existing directory. |
 | `sandbox` | No | `read-only` | `read-only`, `workspace-write`, or `danger-full-access`. |
@@ -231,7 +265,7 @@ A run stopped by a budget returns an error naming the limit it reached and stays
 
 When dispatched units run `go test` under `workspace-write`, include the absolute path of the Go build cache in `config.writable_roots` (for example `/home/<user>/.cache/go-build`).
 
-The response includes `structuredContent.threadId`. Retain it to continue the session. Once a session is created, execution errors also return its `threadId`, so the session remains resumable.
+The response includes `structuredContent.threadId`. Retain it to continue the session. Once a session is created, execution errors also return its `threadId`, so the session remains resumable. It also includes `provider` and `model`, the pair the session actually uses. When the model was selected by auto mode, `auto` carries `judge_model`, `confidence`, `probabilities` (keyed by provider/model), `input_tokens`, and `output_tokens`. The `subagent-reply` output keeps only `threadId` and `content`.
 
 The system prompt is assembled as base instructions, then `AGENTS.md` blocks, then developer instructions. At session creation the server resolves `cwd` (after symlink evaluation), walks up to the nearest ancestor containing a `.git` entry, and collects `AGENTS.md` from that root down to `cwd`; without a repository root only `cwd` is read. Each file is wrapped in an `<agents_md path="...">` block, and the combined content is capped at 32 KiB with a truncation marker. A missing file is skipped, but any other read error fails the call.
 
@@ -377,6 +411,7 @@ The rollout records the prompt, the composed system prompt, tool arguments, tool
 ## Non-goals
 
 - Switching provider mid-thread or per call.
+- Auto mode selecting a model per turn; it selects once per session.
 - Third-party hosting of Anthropic or OpenAI models (Bedrock, Vertex, Foundry, Azure OpenAI).
 - Image input, provider server-side tools (web search, code execution), and context compaction.
 - Network or read sandboxing, and sandboxing on non-Linux platforms.
