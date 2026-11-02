@@ -13,6 +13,10 @@ subagent-mcp is one MCP server binary that exposes a coding agent — real shell
 
 1. Install the binary:
 
+   Download a prebuilt binary for Linux, macOS, or Windows (amd64/arm64) from a [GitHub release](https://github.com/Geek0x0/subagent-mcp/releases). On Windows, the shell tool needs `bash` on `PATH` (e.g. Git Bash); the Landlock sandbox is Linux-only.
+
+   Or install with Go:
+
    ```bash
    go install github.com/Geek0x0/subagent-mcp/cmd/subagent-mcp@latest
    ```

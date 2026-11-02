@@ -1,0 +1,86 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check version
+        run: |
+          version=$(sed -n 's/^const version = "\([^"]*\)"$/\1/p' cmd/subagent-mcp/main.go)
+          test -n "$version" && test "${GITHUB_REF_NAME#v}" = "$version" || {
+            echo "Tag $GITHUB_REF_NAME does not match version $version" >&2
+            exit 1
+          }
+          echo "Tag $GITHUB_REF_NAME matches version $version"
+      - run: go vet ./...
+      - run: go test ./...
+
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [linux, darwin, windows]
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Build and package
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          CGO_ENABLED: 0
+        run: |
+          version=${GITHUB_REF_NAME#v}
+          name="subagent-mcp_${version}_${GOOS}_${GOARCH}"
+          binary=subagent-mcp
+          if [ "$GOOS" = windows ]; then binary+=.exe; fi
+          mkdir -p dist/package
+          go build -trimpath -ldflags "-s -w" -o "dist/package/$binary" ./cmd/subagent-mcp
+          cp README.md config.example.toml dist/package/
+          if [ "$GOOS" = windows ]; then
+            (cd dist/package && zip "../$name.zip" "$binary" README.md config.example.toml)
+          else
+            tar -C dist/package -czf "dist/$name.tar.gz" "$binary" README.md config.example.toml
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: subagent-mcp-${{ matrix.os }}-${{ matrix.arch }}
+          path: dist/subagent-mcp_*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          cd dist
+          sha256sum subagent-mcp_* > checksums.txt
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" --clobber subagent-mcp_* checksums.txt
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes subagent-mcp_* checksums.txt
+          fi
