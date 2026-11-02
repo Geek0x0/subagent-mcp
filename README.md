@@ -153,6 +153,7 @@ Pass `provider` when starting a session to choose which configured provider it u
 
 With an `[auto]` section configured, pass `model: "auto"` and omit `provider` to let the server choose the provider/model for that session. The server sends the task prompt and validated `cwd` to the configured decision model (TypeSafe Jev by default, using `POST /v1/systemone`) with one `choice` question whose criteria are every reachable configured provider/model pair and its configured `description`. Providers whose API key is not set are omitted; `codex-app-server` providers are included without a login preflight. The highest-probability choice is dispatched, and the start result reports it.
 
+- Well-known model IDs get a built-in default description when none is configured; a configured description overrides it.
 - A single reachable candidate skips the decision model entirely and does not require `auto.env_key`.
 - A decision model error, malformed answer, or unknown choice is a tool error. There is no fallback model and no retry; retry the call or pass an explicit `provider`/`model`.
 - `auto.confidence` is informational. A low-confidence choice is still dispatched, because it is the decision model's highest-probability answer.

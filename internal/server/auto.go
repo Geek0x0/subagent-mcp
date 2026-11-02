@@ -129,7 +129,7 @@ func (s *Server) autoCandidates() ([]decision.Candidate, []string) {
 				Provider:    name,
 				Model:       model.ID,
 				API:         p.API,
-				Description: model.Description,
+				Description: decision.Description(model.ID, model.Description),
 			})
 		}
 	}

@@ -247,6 +247,44 @@ func TestResolveAutoRejectsUnknownChoice(t *testing.T) {
 	}
 }
 
+func TestAutoCandidatesDefaultDescriptions(t *testing.T) {
+	models := []config.Model{
+		{ID: "claude-opus-5"}, {ID: "claude-opus-5-5"},
+		{ID: "claude-sonnet-5"}, {ID: "claude-sonnet-5-5"}, {ID: "claude-haiku-5-5"},
+		{ID: "gpt-6-astra"}, {ID: "gpt-6.1-sol"}, {ID: "gpt-6.1-terra"}, {ID: "gpt-6-luna"},
+		{ID: "deepseek-v4.1-flash"}, {ID: "deepseek-v4-flash"}, {ID: "gemini-3.6-flash"},
+		{ID: "gateway/anthropic/claude-opus-5"},
+		{ID: "anthropic/claude-sonnet-5", Description: "my configured description"},
+		{ID: "unknown/model"},
+		{ID: "glm-5.1"}, {ID: "glm-5.3"}, {ID: "glm-5.3-flash"},
+		{ID: "kimi-k3"}, {ID: "kimi-k2.7-code"}, {ID: "kimi-k2.7-code-highspeed"}, {ID: "kimi-k2.6"},
+		{ID: "mimo-v2.6-pro"}, {ID: "mimo-v2.6-flash"},
+	}
+	s := New(&config.Config{Providers: map[string]config.Provider{
+		"codex": {API: config.APICodexAppServer, Models: models},
+	}}, "test")
+	candidates, _ := s.autoCandidates()
+	for i := 0; i < 12; i++ {
+		if candidates[i].Description == "" {
+			t.Errorf("model %q has no default description", candidates[i].Model)
+		}
+	}
+	if candidates[12].Description != candidates[0].Description {
+		t.Errorf("prefixed description = %q, want %q", candidates[12].Description, candidates[0].Description)
+	}
+	if candidates[13].Description != "my configured description" {
+		t.Errorf("configured description = %q", candidates[13].Description)
+	}
+	if candidates[14].Description != "" {
+		t.Errorf("unknown description = %q, want empty", candidates[14].Description)
+	}
+	for _, candidate := range candidates[15:] {
+		if candidate.Description == "" {
+			t.Errorf("model %q has no default description", candidate.Model)
+		}
+	}
+}
+
 func TestAutoCandidatesIncludesCodexWithoutKeyCheck(t *testing.T) {
 	t.Setenv("TEST_STUB_KEY_API", "key")
 	cfg := &config.Config{Providers: map[string]config.Provider{
