@@ -504,3 +504,32 @@ func TestHandleStartAutoWritesModelSelectionToRollout(t *testing.T) {
 		t.Fatalf("model_selection = %#v", selection)
 	}
 }
+
+func TestHandleStartAutoMissingSectionBeforeSandbox(t *testing.T) {
+	cfg := testConfig(t, &stubProvider{})
+	s := New(cfg, "test")
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "task", "cwd": t.TempDir(), "model": "auto", "sandbox": "bogus",
+	}))
+	if err != nil || !result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want a tool error", result, err)
+	}
+	if text := toolResultText(t, result); !strings.Contains(text, "[auto]") {
+		t.Fatalf("error = %q, want the missing [auto] section first", text)
+	}
+}
+
+func TestHandleStartExplicitModelStillNeedsProviderUnderAuto(t *testing.T) {
+	cfg := testMultiConfig(t, map[string]provider.Provider{"alpha": &stubProvider{}, "bravo": &stubProvider{}})
+	cfg.Auto = &config.Auto{BaseURL: "https://api.typesafe.ai", EnvKey: "TEST_AUTO_KEY", Model: "jev-latest", TimeoutSeconds: 5}
+	s := New(cfg, "test")
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "task", "cwd": t.TempDir(), "model": "m-pro",
+	}))
+	if err != nil || !result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want a tool error", result, err)
+	}
+	if text := toolResultText(t, result); !strings.Contains(text, "provider is required") {
+		t.Fatalf("error = %q, want provider required", text)
+	}
+}

@@ -210,3 +210,13 @@ func chooseAgainst(t *testing.T, response string) (Selection, error) {
 	c := New(config.Auto{BaseURL: server.URL, Model: "jev-latest", TimeoutSeconds: 5}, "test-key")
 	return c.Choose(context.Background(), "task", "/repo", []Candidate{{Provider: "a", Model: "m"}})
 }
+
+func TestNewAppliesDefaults(t *testing.T) {
+	c := New(config.Auto{Model: "jev-latest"}, "key")
+	if c.baseURL != config.DefaultAutoBaseURL {
+		t.Fatalf("baseURL = %q, want %q", c.baseURL, config.DefaultAutoBaseURL)
+	}
+	if c.timeout != config.DefaultAutoTimeoutSeconds*time.Second {
+		t.Fatalf("timeout = %v, want %v", c.timeout, config.DefaultAutoTimeoutSeconds*time.Second)
+	}
+}

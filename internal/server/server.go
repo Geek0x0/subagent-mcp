@@ -873,6 +873,9 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 				return mcp.NewToolResultError(`provider must be omitted when model is "auto"`), nil
 			}
 		}
+		if s.cfg.Auto == nil {
+			return mcp.NewToolResultError(fmt.Sprintf("model \"auto\" requires an [auto] section in %s", s.cfg.Path)), nil
+		}
 	} else {
 		providerName, providerCfg, selectedProvider, errResult = s.resolveProvider(arguments)
 		if errResult != nil {

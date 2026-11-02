@@ -1,6 +1,6 @@
 # subagent-mcp
 
-subagent-mcp is one MCP server binary that exposes a coding agent — real shell and file-tool execution, a Landlock write sandbox, approvals, rollout files, cancellation, and progress notifications — driven by any of three model API families, or delegates whole sessions to Codex through its app-server. The MCP caller selects which configured provider a session uses via the `provider` argument.
+subagent-mcp is one MCP server binary that exposes a coding agent — real shell and file-tool execution, a Landlock write sandbox, approvals, rollout files, cancellation, and progress notifications — driven by any of three model API families, or delegates whole sessions to Codex through its app-server. The MCP caller selects which configured provider a session uses via the `provider` argument, or lets TypeSafe's Jev decision model choose with `model: "auto"` (see [Auto model selection](#auto-model-selection)).
 
 | `api` value | Wire protocol | Example providers |
 |---|---|---|
