@@ -136,6 +136,16 @@ func runCheck(w io.Writer, cfg *config.Config, live bool) int {
 			p.DefaultModel, time.Since(start).Round(time.Millisecond))
 	}
 
+	if cfg.Auto != nil {
+		fmt.Fprintf(w, "auto     typesafe (%s)\n", cfg.Auto.Model)
+		fmt.Fprintf(w, "  api    %s\n", cfg.Auto.BaseURL)
+		if os.Getenv(cfg.Auto.EnvKey) == "" {
+			fmt.Fprintf(w, "  key    %s   not set, auto calls will fail\n", cfg.Auto.EnvKey)
+		} else {
+			fmt.Fprintf(w, "  key    %s   set\n", cfg.Auto.EnvKey)
+		}
+	}
+
 	status := "PASS"
 	reason := ""
 	switch {

@@ -44,7 +44,10 @@ Run these checks with Bash:
    The output also has a `sandbox  Landlock` line. `OK` means auto-allowed shell
    calls run under the kernel sandbox; `WARN` (macOS or Linux below 5.13) means
    the native file tools work but every auto-allowed `shell` call exits with
-   code 126. It does not affect the exit code, but report it.
+   code 126. It does not affect the exit code, but report it. An optional
+   `[auto]` section is reported as `auto typesafe (...)`; a missing auto key is
+   a warning that only disables `model: "auto"` calls and does not change the
+   exit code.
 
    Do not add `--live` here: it makes real, billed API calls. Mention it only if
    the user asks how to verify a provider end to end.
@@ -60,6 +63,9 @@ Then report:
 - sandbox: <the `sandbox  Landlock` line: OK, or the WARN with its consequence>
 - providers: <for each provider in the check-config output: name, key name set
   or skipped, api OK or FAIL; never key values>
+- auto: <when `[auto]` is configured: the `auto typesafe (...)` line and whether
+  its key is set; a missing key only disables `model: "auto"` calls and does not
+  change the exit code>
 - ready: <when the binary, the config, and at least one provider's key all
   pass: the MCP tools are available once the server is connected — `subagent`
   and `subagent-reply` by default, or the names set by SUBAGENT_MCP_TOOL_NAME.

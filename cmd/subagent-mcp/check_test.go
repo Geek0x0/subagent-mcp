@@ -705,3 +705,60 @@ func TestReportSandbox(t *testing.T) {
 		t.Errorf("reportSandbox() wrote %q, want one line", out.String())
 	}
 }
+
+func autoCheckConfig(t *testing.T) *config.Config {
+	t.Helper()
+	t.Setenv(checkKeyA, checkKeyValueA)
+	chat := testutil.NewFakeChat(t, nil)
+	chat.SetModels([]string{"deepseek-flash"})
+	return &config.Config{
+		Providers: map[string]config.Provider{
+			"deepseek": chatProvider(chat.URL, checkKeyA, "deepseek-flash", "deepseek-flash"),
+		},
+		Auto: &config.Auto{
+			BaseURL: "https://api.typesafe.ai",
+			EnvKey:  "TYPESAFE_TEST_KEY",
+			Model:   "jev-latest",
+		},
+	}
+}
+
+func TestRunCheckReportsAutoSection(t *testing.T) {
+	cfg := autoCheckConfig(t)
+	t.Setenv("TYPESAFE_TEST_KEY", "jev-secret-value")
+
+	var out bytes.Buffer
+	if code := runCheck(&out, cfg, false); code != 0 {
+		t.Fatalf("runCheck() = %d, want 0; output:\n%s", code, out.String())
+	}
+	got := out.String()
+	for _, want := range []string{
+		"auto     typesafe (jev-latest)",
+		"  api    https://api.typesafe.ai",
+		"  key    TYPESAFE_TEST_KEY   set",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("runCheck() output missing %q:\n%s", want, got)
+		}
+	}
+	if strings.Contains(got, "jev-secret-value") {
+		t.Errorf("runCheck() printed the auto key value:\n%s", got)
+	}
+}
+
+func TestRunCheckWarnsWhenAutoKeyUnset(t *testing.T) {
+	cfg := autoCheckConfig(t)
+	t.Setenv("TYPESAFE_TEST_KEY", "")
+
+	var out bytes.Buffer
+	if code := runCheck(&out, cfg, false); code != 0 {
+		t.Fatalf("runCheck() = %d, want 0; output:\n%s", code, out.String())
+	}
+	got := out.String()
+	if !strings.Contains(got, "TYPESAFE_TEST_KEY") || !strings.Contains(got, "not set") {
+		t.Fatalf("runCheck() output missing the auto key warning:\n%s", got)
+	}
+	if strings.Contains(got, "FAIL") {
+		t.Fatalf("runCheck() reported FAIL for a missing optional auto key:\n%s", got)
+	}
+}
