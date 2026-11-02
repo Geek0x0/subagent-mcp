@@ -494,6 +494,87 @@ max_completion_tokens = 1024
 	}
 }
 
+const autoProviderTOML = `
+
+[providers.deepseek]
+api = "chat-completions"
+env_key = "DS_TEST_KEY"
+default_model = "deepseek-flash"
+models = [{ id = "deepseek-flash" }]
+`
+
+const autoTOML = autoProviderTOML + `
+
+[auto]
+env_key = "AUTO_TEST_KEY"
+model = "jev-latest"
+`
+
+func TestLoadAutoDefaults(t *testing.T) {
+	cfg, err := Load(writeConfig(t, autoTOML))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.Auto == nil {
+		t.Fatal("Auto is nil")
+	}
+	if cfg.Auto.BaseURL != DefaultAutoBaseURL || cfg.Auto.TimeoutSeconds != DefaultAutoTimeoutSeconds {
+		t.Fatalf("Auto = %#v, want defaults", *cfg.Auto)
+	}
+	if got := cfg.EnvKeys(); !reflect.DeepEqual(got, []string{"AUTO_TEST_KEY", "DS_TEST_KEY"}) {
+		t.Fatalf("EnvKeys() = %v, want auto key included and sorted", got)
+	}
+	t.Setenv("AUTO_TEST_KEY", "jev-key")
+	if key, err := cfg.AutoAPIKey(); err != nil || key != "jev-key" {
+		t.Fatalf("AutoAPIKey() = %q, %v", key, err)
+	}
+}
+
+func TestAutoValidation(t *testing.T) {
+	tests := []struct{ name, block, want string }{
+		{name: "missing env_key", block: "[auto]\nmodel = \"jev-latest\"\n", want: "auto.env_key"},
+		{name: "missing model", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\n", want: "auto.model"},
+		{name: "bad base_url", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\nbase_url = \"ftp://typesafe\"\n", want: "auto.base_url"},
+		{name: "negative timeout", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\ntimeout_seconds = -1\n", want: "auto.timeout_seconds"},
+		{name: "too long timeout", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\ntimeout_seconds = 601\n", want: "auto.timeout_seconds"},
+		{name: "unknown key", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\nbogus = 1\n", want: "unknown keys"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, autoProviderTOML+test.block))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error = %v, want it to contain %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestModelIDAutoIsReserved(t *testing.T) {
+	toml := `
+
+[providers.deepseek]
+api = "chat-completions"
+env_key = "DS_TEST_KEY"
+default_model = "auto"
+models = [{ id = "auto" }]
+`
+	if _, err := Load(writeConfig(t, toml)); err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("Load() error = %v, want reserved-id error", err)
+	}
+}
+
+func TestAutoAPIKeyMissing(t *testing.T) {
+	cfg, err := Load(writeConfig(t, autoTOML))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AUTO_TEST_KEY", "")
+	_, err = cfg.AutoAPIKey()
+	if err == nil || !strings.Contains(err.Error(), "AUTO_TEST_KEY") || !strings.Contains(err.Error(), "auto.env_key") {
+		t.Fatalf("AutoAPIKey() error = %v, want the variable and field path", err)
+	}
+}
+
 // TestUltraEffortIsAccepted pins the level Codex adds on top of the vocabulary the
 // model API families use. Both the tool argument and effort_map validate against
 // the same list, so without it a codex provider cannot ask for ultra at all.

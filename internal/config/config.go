@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -77,10 +78,26 @@ var reservedBodyFields = map[string]bool{
 	"max_tokens": true,
 }
 
+// Auto configures the optional TypeSafe Jev decision model used by the start
+// tool's "auto" model value.
+type Auto struct {
+	BaseURL        string `toml:"base_url"`
+	EnvKey         string `toml:"env_key"`
+	Model          string `toml:"model"`
+	TimeoutSeconds int    `toml:"timeout_seconds"`
+}
+
+const (
+	DefaultAutoBaseURL        = "https://api.typesafe.ai"
+	DefaultAutoTimeoutSeconds = 20
+	MaxAutoTimeoutSeconds     = 600
+)
+
 // Config is the root of the configuration file.
 type Config struct {
 	Path      string              `toml:"-"`
 	Providers map[string]Provider `toml:"providers"`
+	Auto      *Auto               `toml:"auto"`
 }
 
 // DefaultPath returns $SUBAGENT_MCP_CONFIG or ~/.config/subagent-mcp/config.toml.
@@ -140,6 +157,14 @@ func Load(path string) (*Config, error) {
 		}
 		cfg.Providers[name] = provider
 	}
+	if cfg.Auto != nil {
+		if cfg.Auto.BaseURL == "" {
+			cfg.Auto.BaseURL = DefaultAutoBaseURL
+		}
+		if cfg.Auto.TimeoutSeconds == 0 {
+			cfg.Auto.TimeoutSeconds = DefaultAutoTimeoutSeconds
+		}
+	}
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("config file %s: %w", path, err)
 	}
@@ -162,6 +187,21 @@ func (c *Config) Validate() error {
 		}
 		if err := c.Providers[name].validate("providers." + name); err != nil {
 			return err
+		}
+	}
+	if c.Auto != nil {
+		if c.Auto.EnvKey == "" {
+			return errors.New("auto.env_key is required")
+		}
+		if c.Auto.Model == "" {
+			return errors.New("auto.model is required")
+		}
+		u, err := url.Parse(c.Auto.BaseURL)
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("auto.base_url %q must be an absolute http or https URL", c.Auto.BaseURL)
+		}
+		if c.Auto.TimeoutSeconds < 0 || c.Auto.TimeoutSeconds > MaxAutoTimeoutSeconds {
+			return fmt.Errorf("auto.timeout_seconds must be 0 (default) or between 1 and %d", MaxAutoTimeoutSeconds)
 		}
 	}
 	return nil
@@ -198,6 +238,9 @@ func (p Provider) validate(prefix string) error {
 	for i, model := range p.Models {
 		if model.ID == "" {
 			return fmt.Errorf("%s.models[%d].id is required", prefix, i)
+		}
+		if model.ID == "auto" {
+			return fmt.Errorf("%s.models[%d].id %q is reserved for the start tool's auto model selection; rename it", prefix, i, model.ID)
 		}
 		if seen[model.ID] {
 			return fmt.Errorf("%s.models has duplicate id %q", prefix, model.ID)
@@ -283,7 +326,8 @@ func (c *Config) ProviderNames() []string {
 	return names
 }
 
-// EnvKeys returns every non-empty provider env_key, sorted and deduplicated.
+// EnvKeys returns every non-empty provider and auto env_key, sorted and
+// deduplicated.
 func (c *Config) EnvKeys() []string {
 	set := map[string]bool{}
 	for _, p := range c.Providers {
@@ -291,12 +335,27 @@ func (c *Config) EnvKeys() []string {
 			set[p.EnvKey] = true
 		}
 	}
+	if c.Auto != nil && c.Auto.EnvKey != "" {
+		set[c.Auto.EnvKey] = true
+	}
 	keys := make([]string, 0, len(set))
 	for key := range set {
 		keys = append(keys, key)
 	}
 	sort.Strings(keys)
 	return keys
+}
+
+// AutoAPIKey returns the Jev key from auto.env_key.
+func (c *Config) AutoAPIKey() (string, error) {
+	if c.Auto == nil {
+		return "", errors.New("auto model selection is not configured")
+	}
+	key := os.Getenv(c.Auto.EnvKey)
+	if key == "" {
+		return "", fmt.Errorf("environment variable %s (auto.env_key) must be set to the Jev API key", c.Auto.EnvKey)
+	}
+	return key, nil
 }
 
 // HasModel reports whether id is one of the provider's models.

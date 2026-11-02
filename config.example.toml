@@ -46,3 +46,11 @@ models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
 # default_model = "gpt-6.1-sol"
 # models = [{ id = "gpt-6.1-sol" }, { id = "gpt-6-astra" }, { id = "gpt-6.1-terra" }]
 # effort_map = { none = "low", minimal = "low" }
+
+# Optional: let `start` choose a provider/model with TypeSafe's Jev decision model.
+# Pass model = "auto" to use it. "auto" is reserved and cannot be a model id above.
+# [auto]
+# env_key = "TYPESAFE_API_KEY"
+# model = "jev-latest"
+# base_url = "https://api.typesafe.ai"   # optional; same System One protocol only
+# timeout_seconds = 20                    # optional; 0 means the default
