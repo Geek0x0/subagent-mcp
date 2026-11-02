@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -27,7 +28,8 @@ func TestNewSharesHTTPClient(t *testing.T) {
 
 func TestChooseSendsOneChoiceQuestionAndMapsAnswer(t *testing.T) {
 	var requestBody map[string]any
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c := New(config.Auto{BaseURL: "https://example.com", Model: "jev-latest", TimeoutSeconds: 5}, "test-key")
+	c.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 		if r.URL.Path != "/v1/systemone" || r.Method != http.MethodPost {
 			t.Errorf("request = %s %s, want POST /v1/systemone", r.Method, r.URL.Path)
 		}
@@ -38,15 +40,13 @@ func TestChooseSendsOneChoiceQuestionAndMapsAnswer(t *testing.T) {
 			t.Errorf("TypeSafe-Danger-Zone-Long-Context = %q, want true", got)
 		}
 		_ = json.NewDecoder(r.Body).Decode(&requestBody)
-		_, _ = io.WriteString(w, `{
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(`{
 			"model":"jev-1.14.0",
-			"answers":{"model":{"type":"choice","choice":"bravo/org/model","confidence":0.71,
-				"probabilities":{"alpha/m-fast":0.29,"bravo/org/model":0.71}}},
-			"usage":{"input_tokens":500,"output_tokens":7}}`)
-	}))
-	defer server.Close()
+			"answers":{"model":{"type":"choice","choice":"c2","confidence":0.71,
+				"probabilities":{"c1":0.29,"c2":0.71,"unknown":0.5}}},
+			"usage":{"input_tokens":500,"output_tokens":7}}`))}, nil
+	})}
 
-	c := New(config.Auto{BaseURL: server.URL, Model: "jev-latest", TimeoutSeconds: 5}, "test-key")
 	got, err := c.Choose(context.Background(), "fix the parser", "/repo",
 		[]Candidate{
 			{Provider: "alpha", Model: "m-fast", API: "chat-completions", Description: "fast, cheap"},
@@ -58,6 +58,9 @@ func TestChooseSendsOneChoiceQuestionAndMapsAnswer(t *testing.T) {
 	if got.Provider != "bravo" || got.Model != "org/model" || got.JudgeModel != "jev-1.14.0" || got.Confidence != 0.71 || got.Probabilities["bravo/org/model"] != 0.71 || got.InputTokens != 500 {
 		t.Fatalf("Selection = %#v", got)
 	}
+	if want := map[string]float64{"alpha/m-fast": 0.29, "bravo/org/model": 0.71}; !reflect.DeepEqual(got.Probabilities, want) {
+		t.Fatalf("probabilities = %#v, want %#v", got.Probabilities, want)
+	}
 	state := requestBody["state"].(map[string]any)
 	if state["task"] != "fix the parser" || state["cwd"] != "/repo" {
 		t.Fatalf("state = %#v", state)
@@ -68,10 +71,10 @@ func TestChooseSendsOneChoiceQuestionAndMapsAnswer(t *testing.T) {
 		t.Fatalf("question = %#v", q)
 	}
 	criteria := q["criteria"].(map[string]any)
-	if got := criteria["alpha/m-fast"]; got != "provider alpha (api chat-completions); model m-fast; fast, cheap" {
+	if got := criteria["c1"]; got != "provider alpha (api chat-completions); model m-fast; fast, cheap" {
 		t.Fatalf("criteria alpha = %#v", got)
 	}
-	if got := criteria["bravo/org/model"]; got != "provider bravo (api codex-app-server); model org/model" {
+	if got := criteria["c2"]; got != "provider bravo (api codex-app-server); model org/model" {
 		t.Fatalf("criteria bravo = %#v", got)
 	}
 	if requestBody["model"] != "jev-latest" {
@@ -102,7 +105,7 @@ func TestChooseClefEndpointAndEnvelope(t *testing.T) {
 		if r.Header.Get("Authorization") != "Bearer key" {
 			t.Error("missing authorization")
 		}
-		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"result":{"model":"clef","answers":{"model":{"type":"choice","choice":"a/m"}},"usage":{"input_tokens":12}},"success":true}`))}, nil
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"result":{"model":"clef","answers":{"model":{"type":"choice","choice":"c1"}},"usage":{"input_tokens":12}},"success":true}`))}, nil
 	})}
 	got, err := c.Choose(context.Background(), "task", "/repo", []Candidate{{Provider: "a", Model: "m"}})
 	if err != nil || got.Model != "m" || got.JudgeModel != "clef" || got.InputTokens != 12 {
@@ -212,7 +215,7 @@ func TestChooseHandlesTrailingSlash(t *testing.T) {
 		path = r.URL.Path
 		_, _ = io.WriteString(w, `{
 			"model":"jev-1.14.0",
-			"answers":{"model":{"type":"choice","choice":"a/m","confidence":1,"probabilities":{"a/m":1}}},
+			"answers":{"model":{"type":"choice","choice":"c1","confidence":1,"probabilities":{"c1":1}}},
 			"usage":{"input_tokens":1,"output_tokens":1}}`)
 	}))
 	defer server.Close()
@@ -249,11 +252,10 @@ func TestChooseRejectsNoCandidates(t *testing.T) {
 
 func chooseAgainst(t *testing.T, response string) (Selection, error) {
 	t.Helper()
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, response)
-	}))
-	t.Cleanup(server.Close)
-	c := New(config.Auto{BaseURL: server.URL, Model: "jev-latest", TimeoutSeconds: 5}, "test-key")
+	c := New(config.Auto{BaseURL: "https://example.com", Model: "jev-latest", TimeoutSeconds: 5}, "test-key")
+	c.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(response))}, nil
+	})}
 	return c.Choose(context.Background(), "task", "/repo", []Candidate{{Provider: "a", Model: "m"}})
 }
 

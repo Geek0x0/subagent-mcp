@@ -61,7 +61,7 @@ func autoConfig(t *testing.T, baseURL string) *config.Config {
 
 func TestResolveAutoSelectsProviderFromJev(t *testing.T) {
 	t.Setenv("TEST_AUTO_KEY", "jev-key")
-	jev, requests := newAutoStub(t, autoResponse("bravo/m-pro", 0.9), http.StatusOK)
+	jev, requests := newAutoStub(t, autoResponse("c4", 0.9), http.StatusOK)
 	cfg := autoConfig(t, jev.URL)
 	s := New(cfg, "test")
 
@@ -80,7 +80,7 @@ func TestResolveAutoSelectsProviderFromJev(t *testing.T) {
 	}
 	questions := (*requests)[0]["questions"].(map[string]any)
 	criteria := questions["model"].(map[string]any)["criteria"].(map[string]any)
-	for _, key := range []string{"alpha/m-fast", "alpha/m-pro", "bravo/m-fast", "bravo/m-pro"} {
+	for _, key := range []string{"c1", "c2", "c3", "c4"} {
 		if _, ok := criteria[key]; !ok {
 			t.Errorf("criteria missing %q: %#v", key, criteria)
 		}
@@ -93,7 +93,7 @@ func TestResolveAutoSingleCandidateSkipsJev(t *testing.T) {
 	p.Models = []config.Model{{ID: "m-fast"}}
 	p.DefaultModel = "m-fast"
 	cfg.Providers["alpha"] = p
-	jev, requests := newAutoStub(t, autoResponse("alpha/m-fast", 0.9), http.StatusOK)
+	jev, requests := newAutoStub(t, autoResponse("c1", 0.9), http.StatusOK)
 	cfg.Auto = &config.Auto{
 		BaseURL:        jev.URL,
 		EnvKey:         "TEST_AUTO_KEY",
@@ -119,7 +119,7 @@ func TestResolveAutoSingleCandidateSkipsJev(t *testing.T) {
 
 func TestResolveAutoOmitsProviderWithoutKey(t *testing.T) {
 	t.Setenv("TEST_AUTO_KEY", "jev-key")
-	jev, requests := newAutoStub(t, autoResponse("alpha/m-fast", 0.8), http.StatusOK)
+	jev, requests := newAutoStub(t, autoResponse("c1", 0.8), http.StatusOK)
 	cfg := autoConfig(t, jev.URL)
 	t.Setenv("TEST_STUB_KEY_BRAVO", "")
 	s := New(cfg, "test")
@@ -132,15 +132,15 @@ func TestResolveAutoOmitsProviderWithoutKey(t *testing.T) {
 	}
 	questions := (*requests)[0]["questions"].(map[string]any)
 	criteria := questions["model"].(map[string]any)["criteria"].(map[string]any)
-	for key := range criteria {
-		if strings.HasPrefix(key, "bravo/") {
-			t.Errorf("criteria offered an unavailable provider: %q", key)
+	for _, description := range criteria {
+		if strings.Contains(description.(string), "provider bravo ") {
+			t.Errorf("criteria offered an unavailable provider: %q", description)
 		}
 	}
 }
 
 func TestResolveAutoNoReachableProviderFails(t *testing.T) {
-	jev, requests := newAutoStub(t, autoResponse("alpha/m-fast", 0.8), http.StatusOK)
+	jev, requests := newAutoStub(t, autoResponse("c1", 0.8), http.StatusOK)
 	cfg := autoConfig(t, jev.URL)
 	t.Setenv("TEST_STUB_KEY_ALPHA", "")
 	t.Setenv("TEST_STUB_KEY_BRAVO", "")
@@ -163,7 +163,7 @@ func TestResolveAutoNoReachableProviderFails(t *testing.T) {
 
 func TestResolveAutoRejectsProviderArgument(t *testing.T) {
 	t.Setenv("TEST_AUTO_KEY", "jev-key")
-	jev, requests := newAutoStub(t, autoResponse("alpha/m-fast", 0.8), http.StatusOK)
+	jev, requests := newAutoStub(t, autoResponse("c1", 0.8), http.StatusOK)
 	cfg := autoConfig(t, jev.URL)
 	s := New(cfg, "test")
 
@@ -186,7 +186,7 @@ func TestResolveAutoRequiresAutoSection(t *testing.T) {
 
 func TestResolveAutoRequiresJevKeyWhenChoosing(t *testing.T) {
 	t.Setenv("TEST_AUTO_KEY", "")
-	jev, requests := newAutoStub(t, autoResponse("alpha/m-fast", 0.8), http.StatusOK)
+	jev, requests := newAutoStub(t, autoResponse("c1", 0.8), http.StatusOK)
 	cfg := autoConfig(t, jev.URL)
 	s := New(cfg, "test")
 
@@ -338,7 +338,7 @@ func TestHandleStartAutoDispatchesChosenModel(t *testing.T) {
 		p.DefaultModel = model
 		cfg.Providers[name] = p
 	}
-	jev, _ := newAutoStub(t, `{"model":"jev-1.14.0","answers":{"model":{"type":"choice","choice":"bravo/m-pro","confidence":0.9,"probabilities":{"alpha/m-fast":0.1,"bravo/m-pro":0.9}}},"usage":{"input_tokens":42,"output_tokens":3}}`, http.StatusOK)
+	jev, _ := newAutoStub(t, `{"model":"jev-1.14.0","answers":{"model":{"type":"choice","choice":"c2","confidence":0.9,"probabilities":{"c1":0.1,"c2":0.9}}},"usage":{"input_tokens":42,"output_tokens":3}}`, http.StatusOK)
 	cfg.Auto = &config.Auto{BaseURL: jev.URL, EnvKey: "TEST_AUTO_KEY", Model: "jev-latest", TimeoutSeconds: 5}
 	s := New(cfg, "test")
 
@@ -499,7 +499,7 @@ func TestHandleStartAutoExecutionErrorKeepsMetadata(t *testing.T) {
 	t.Setenv("TEST_AUTO_KEY", "jev-key")
 	bravo := &stubProvider{name: "bravo", turns: []stubTurn{{err: errors.New("boom")}}}
 	cfg := testMultiConfig(t, map[string]provider.Provider{"alpha": &stubProvider{name: "alpha"}, "bravo": bravo})
-	jev, _ := newAutoStub(t, autoResponse("bravo/m-pro", 0.9), http.StatusOK)
+	jev, _ := newAutoStub(t, autoResponse("c4", 0.9), http.StatusOK)
 	cfg.Auto = &config.Auto{BaseURL: jev.URL, EnvKey: "TEST_AUTO_KEY", Model: "jev-latest", TimeoutSeconds: 5}
 	s := New(cfg, "test")
 
@@ -521,7 +521,7 @@ func TestHandleStartAutoExecutionErrorKeepsMetadata(t *testing.T) {
 func TestHandleStartAutoDoesNotCallJevOnInvalidArgs(t *testing.T) {
 	t.Setenv("TEST_AUTO_KEY", "jev-key")
 	cfg := testConfig(t, &stubProvider{})
-	jev, requests := newAutoStub(t, autoResponse("deepseek/m-fast", 0.9), http.StatusOK)
+	jev, requests := newAutoStub(t, autoResponse("c1", 0.9), http.StatusOK)
 	cfg.Auto = &config.Auto{BaseURL: jev.URL, EnvKey: "TEST_AUTO_KEY", Model: "jev-latest", TimeoutSeconds: 5}
 	s := New(cfg, "test")
 
@@ -541,7 +541,7 @@ func TestHandleStartAutoDoesNotCallJevOnInvalidArgs(t *testing.T) {
 
 func TestHandleStartAutoValidatesWritableRootsBeforeJev(t *testing.T) {
 	t.Setenv("TEST_AUTO_KEY", "jev-key")
-	jev, requests := newAutoStub(t, autoResponse("alpha/m-fast", 0.9), http.StatusOK)
+	jev, requests := newAutoStub(t, autoResponse("c1", 0.9), http.StatusOK)
 	cfg := autoConfig(t, jev.URL)
 	s := New(cfg, "test")
 
@@ -569,7 +569,7 @@ func TestHandleStartAutoHonorsRunDeadlineDuringJevSelection(t *testing.T) {
 	jev := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		close(requestStarted)
 		time.Sleep(1100 * time.Millisecond)
-		_, _ = io.WriteString(w, autoResponse("alpha/m-fast", 0.9))
+		_, _ = io.WriteString(w, autoResponse("c1", 0.9))
 	}))
 	t.Cleanup(jev.Close)
 	cfg := autoConfig(t, jev.URL)
@@ -641,7 +641,7 @@ func TestHandleStartAutoWritesModelSelectionToRollout(t *testing.T) {
 	t.Setenv("SUBAGENT_MCP_ROLLOUT", "")
 	t.Setenv("TEST_AUTO_KEY", "jev-key")
 	cfg := testConfig(t, &stubProvider{turns: []stubTurn{{result: &provider.TurnResult{Text: "ok"}}}})
-	jev, _ := newAutoStub(t, autoResponse("deepseek/m-pro", 0.9), http.StatusOK)
+	jev, _ := newAutoStub(t, autoResponse("c2", 0.9), http.StatusOK)
 	cfg.Auto = &config.Auto{BaseURL: jev.URL, EnvKey: "TEST_AUTO_KEY", Model: "jev-latest", TimeoutSeconds: 5}
 	s := New(cfg, "test")
 

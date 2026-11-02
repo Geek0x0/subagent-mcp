@@ -134,8 +134,8 @@ func (c *Client) Choose(ctx context.Context, task, cwd string, candidates []Cand
 
 	criteria := make(map[string]string, len(candidates))
 	choices := make(map[string]Candidate, len(candidates))
-	for _, candidate := range candidates {
-		key := candidateKey(candidate)
+	for i, candidate := range candidates {
+		key := fmt.Sprintf("c%d", i+1)
 		criteria[key] = candidateDescription(candidate)
 		choices[key] = candidate
 	}
@@ -223,13 +223,22 @@ func (c *Client) Choose(ctx context.Context, task, cwd string, candidates []Cand
 	if !ok {
 		return Selection{}, fmt.Errorf("systemone: model %q chose unknown choice %q", answer.Model, choice.Choice)
 	}
+	var probabilities map[string]float64
+	if choice.Probabilities != nil {
+		probabilities = make(map[string]float64, len(choice.Probabilities))
+		for id, probability := range choice.Probabilities {
+			if offered, ok := choices[id]; ok {
+				probabilities[candidateKey(offered)] = probability
+			}
+		}
+	}
 
 	return Selection{
 		Provider:      candidate.Provider,
 		Model:         candidate.Model,
 		JudgeModel:    answer.Model,
 		Confidence:    choice.Confidence,
-		Probabilities: choice.Probabilities,
+		Probabilities: probabilities,
 		InputTokens:   answer.Usage.InputTokens,
 		OutputTokens:  answer.Usage.OutputTokens,
 	}, nil
