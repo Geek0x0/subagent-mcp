@@ -120,8 +120,8 @@ func TestRunShell(t *testing.T) {
 		if elapsed >= 2*time.Second {
 			t.Errorf("RunShell() elapsed = %v, want less than 2s", elapsed)
 		}
-		if killErr := syscall.Kill(childPID, 0); killErr != nil {
-			t.Errorf("background process %d did not outlive bash: %v", childPID, killErr)
+		if !waitForProcessExit(childPID, time.Second) {
+			t.Errorf("background process %d is still alive", childPID)
 		}
 	})
 
@@ -538,6 +538,11 @@ func waitForProcessExit(pid int, timeout time.Duration) bool {
 		err := syscall.Kill(pid, 0)
 		if errors.Is(err, syscall.ESRCH) {
 			return true
+		}
+		if stat, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
+			if end := strings.LastIndexByte(string(stat), ')'); end >= 0 && strings.HasPrefix(string(stat[end+1:]), " Z ") {
+				return true
+			}
 		}
 		if time.Now().After(deadline) {
 			return false
