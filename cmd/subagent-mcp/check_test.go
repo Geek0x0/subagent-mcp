@@ -733,7 +733,7 @@ func TestRunCheckReportsAutoSection(t *testing.T) {
 	}
 	got := out.String()
 	for _, want := range []string{
-		"auto     typesafe (jev-latest)",
+		"auto     decision model (jev-latest)",
 		"  api    https://api.typesafe.ai",
 		"  key    TYPESAFE_TEST_KEY   set",
 	} {
@@ -746,6 +746,18 @@ func TestRunCheckReportsAutoSection(t *testing.T) {
 	}
 }
 
+func TestRunCheckReportsAutoURL(t *testing.T) {
+	t.Setenv("TYPESAFE_TEST_KEY", "")
+	cfg := &config.Config{Auto: &config.Auto{URL: "https://example.com/ai/run/clef", EnvKey: "TYPESAFE_TEST_KEY", Model: "clef"}}
+	var out bytes.Buffer
+	runCheck(&out, cfg, false)
+	for _, want := range []string{"auto     decision model (clef)", "  api    https://example.com/ai/run/clef", "not set, decision model selection calls will fail"} {
+		if !strings.Contains(out.String(), want) {
+			t.Fatalf("output = %s, missing %q", out.String(), want)
+		}
+	}
+}
+
 func TestRunCheckWarnsWhenAutoKeyUnset(t *testing.T) {
 	cfg := autoCheckConfig(t)
 	t.Setenv("TYPESAFE_TEST_KEY", "")
@@ -755,7 +767,7 @@ func TestRunCheckWarnsWhenAutoKeyUnset(t *testing.T) {
 		t.Fatalf("runCheck() = %d, want 0; output:\n%s", code, out.String())
 	}
 	got := out.String()
-	if !strings.Contains(got, "TYPESAFE_TEST_KEY") || !strings.Contains(got, "Jev selection calls will fail") {
+	if !strings.Contains(got, "TYPESAFE_TEST_KEY") || !strings.Contains(got, "decision model selection calls will fail") {
 		t.Fatalf("runCheck() output missing the auto key warning:\n%s", got)
 	}
 	if strings.Contains(got, "auto calls will fail") || strings.Contains(got, "FAIL") {

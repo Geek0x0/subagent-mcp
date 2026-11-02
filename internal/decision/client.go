@@ -55,6 +55,7 @@ type Selection struct {
 // so callers cannot mutate the HTTP behavior after construction.
 type Client struct {
 	baseURL    string
+	url        string
 	apiKey     string
 	model      string
 	timeout    time.Duration
@@ -112,6 +113,7 @@ func New(cfg config.Auto, apiKey string) *Client {
 
 	return &Client{
 		baseURL:    cfg.BaseURL,
+		url:        cfg.URL,
 		apiKey:     apiKey,
 		model:      cfg.Model,
 		timeout:    time.Duration(cfg.TimeoutSeconds) * time.Second,
@@ -159,7 +161,11 @@ func (c *Client) Choose(ctx context.Context, task, cwd string, candidates []Cand
 		defer cancel()
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(c.baseURL, "/")+"/v1/systemone", bytes.NewReader(body))
+	endpoint := c.url
+	if endpoint == "" {
+		endpoint = strings.TrimRight(c.baseURL, "/") + "/v1/systemone"
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
 		return Selection{}, fmt.Errorf("systemone: build request: %w", err)
 	}
@@ -182,9 +188,25 @@ func (c *Client) Choose(ctx context.Context, task, cwd string, candidates []Cand
 	}
 
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return Selection{}, fmt.Errorf("systemone: status %d: %s", resp.StatusCode, errorDetail(responseBody, resp.StatusCode))
+		detail := errorDetail(responseBody, resp.StatusCode)
+		for _, secret := range []string{c.apiKey, task} {
+			if secret != "" {
+				detail = strings.ReplaceAll(detail, secret, "[redacted]")
+			}
+		}
+		return Selection{}, fmt.Errorf("systemone: status %d: %s", resp.StatusCode, truncate(detail, maxErrorDetailRunes))
 	}
 
+	var envelope struct {
+		Answers json.RawMessage `json:"answers"`
+		Result  json.RawMessage `json:"result"`
+	}
+	if err := json.Unmarshal(responseBody, &envelope); err != nil {
+		return Selection{}, fmt.Errorf("systemone: decode response: %w", err)
+	}
+	if len(envelope.Answers) == 0 && len(envelope.Result) > 0 && string(envelope.Result) != "null" {
+		responseBody = envelope.Result
+	}
 	var answer systemOneResponse
 	if err := json.Unmarshal(responseBody, &answer); err != nil {
 		return Selection{}, fmt.Errorf("systemone: decode response: %w", err)
@@ -230,21 +252,36 @@ func candidateDescription(candidate Candidate) string {
 func errorDetail(body []byte, status int) string {
 	var payload struct {
 		Detail json.RawMessage `json:"detail"`
+		Errors []struct {
+			Message string `json:"message"`
+		} `json:"errors"`
 	}
-	if err := json.Unmarshal(body, &payload); err != nil || len(payload.Detail) == 0 {
+	if err := json.Unmarshal(body, &payload); err != nil {
 		return truncate(http.StatusText(status), maxErrorDetailRunes)
+	}
+	if len(payload.Detail) == 0 {
+		var messages []string
+		for _, item := range payload.Errors {
+			if item.Message != "" {
+				messages = append(messages, item.Message)
+			}
+		}
+		if len(messages) > 0 {
+			return strings.Join(messages, "; ")
+		}
+		return http.StatusText(status)
 	}
 
 	var text string
 	if err := json.Unmarshal(payload.Detail, &text); err == nil {
-		return truncate(text, maxErrorDetailRunes)
+		return text
 	}
 
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, payload.Detail); err == nil {
-		return truncate(compact.String(), maxErrorDetailRunes)
+		return compact.String()
 	}
-	return truncate(string(payload.Detail), maxErrorDetailRunes)
+	return string(payload.Detail)
 }
 
 func truncate(text string, limit int) string {

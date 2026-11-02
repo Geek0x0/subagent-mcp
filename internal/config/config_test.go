@@ -535,6 +535,10 @@ func TestAutoValidation(t *testing.T) {
 		{name: "missing env_key", block: "[auto]\nmodel = \"jev-latest\"\n", want: "auto.env_key"},
 		{name: "missing model", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\n", want: "auto.model"},
 		{name: "bad base_url", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\nbase_url = \"ftp://typesafe\"\n", want: "auto.base_url"},
+		{name: "both endpoints", block: "[auto]\nenv_key = \"KEY\"\nmodel = \"clef\"\nbase_url = \"https://example.com\"\nurl = \"https://example.com/run\"\n", want: "auto.url"},
+		{name: "bad url", block: "[auto]\nenv_key = \"KEY\"\nmodel = \"clef\"\nurl = \"ftp://example.com\"\n", want: "auto.url"},
+		{name: "url query", block: "[auto]\nenv_key = \"KEY\"\nmodel = \"clef\"\nurl = \"https://example.com/run?x=1\"\n", want: "auto.url"},
+		{name: "url fragment", block: "[auto]\nenv_key = \"KEY\"\nmodel = \"clef\"\nurl = \"https://example.com/run#x\"\n", want: "auto.url"},
 		{name: "base_url query", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\nbase_url = \"https://typesafe.example?tenant=one\"\n", want: "auto.base_url"},
 		{name: "base_url fragment", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\nbase_url = \"https://typesafe.example#systemone\"\n", want: "auto.base_url"},
 		{name: "negative timeout", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\ntimeout_seconds = -1\n", want: "auto.timeout_seconds"},
@@ -548,6 +552,16 @@ func TestAutoValidation(t *testing.T) {
 				t.Fatalf("Load() error = %v, want it to contain %q", err, test.want)
 			}
 		})
+	}
+}
+
+func TestLoadAutoURL(t *testing.T) {
+	cfg, err := Load(writeConfig(t, autoTOML+"url = \"https://example.com/ai/run/@cf/cloudflare/clef\"\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Auto.URL != "https://example.com/ai/run/@cf/cloudflare/clef" || cfg.Auto.BaseURL != "" {
+		t.Fatalf("Auto = %#v", cfg.Auto)
 	}
 }
 
@@ -572,7 +586,7 @@ func TestAutoAPIKeyMissing(t *testing.T) {
 	}
 	t.Setenv("AUTO_TEST_KEY", "")
 	_, err = cfg.AutoAPIKey()
-	if err == nil || !strings.Contains(err.Error(), "AUTO_TEST_KEY") || !strings.Contains(err.Error(), "auto.env_key") {
+	if err == nil || !strings.Contains(err.Error(), "AUTO_TEST_KEY") || !strings.Contains(err.Error(), "auto.env_key") || !strings.Contains(err.Error(), "decision model API key") {
 		t.Fatalf("AutoAPIKey() error = %v, want the variable and field path", err)
 	}
 }

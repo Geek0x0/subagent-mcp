@@ -82,6 +82,7 @@ var reservedBodyFields = map[string]bool{
 // tool's "auto" model value.
 type Auto struct {
 	BaseURL        string `toml:"base_url"`
+	URL            string `toml:"url"`
 	EnvKey         string `toml:"env_key"`
 	Model          string `toml:"model"`
 	TimeoutSeconds int    `toml:"timeout_seconds"`
@@ -158,7 +159,7 @@ func Load(path string) (*Config, error) {
 		cfg.Providers[name] = provider
 	}
 	if cfg.Auto != nil {
-		if cfg.Auto.BaseURL == "" {
+		if cfg.Auto.BaseURL == "" && cfg.Auto.URL == "" {
 			cfg.Auto.BaseURL = DefaultAutoBaseURL
 		}
 		if cfg.Auto.TimeoutSeconds == 0 {
@@ -196,9 +197,16 @@ func (c *Config) Validate() error {
 		if c.Auto.Model == "" {
 			return errors.New("auto.model is required")
 		}
-		u, err := url.Parse(c.Auto.BaseURL)
+		if c.Auto.URL != "" && c.Auto.BaseURL != "" {
+			return errors.New("auto.url and auto.base_url cannot both be set")
+		}
+		endpoint, field := c.Auto.BaseURL, "auto.base_url"
+		if c.Auto.URL != "" {
+			endpoint, field = c.Auto.URL, "auto.url"
+		}
+		u, err := url.Parse(endpoint)
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
-			return fmt.Errorf("auto.base_url %q must be an absolute http or https URL", c.Auto.BaseURL)
+			return fmt.Errorf("%s %q must be an absolute http or https URL", field, endpoint)
 		}
 		if c.Auto.TimeoutSeconds < 0 || c.Auto.TimeoutSeconds > MaxAutoTimeoutSeconds {
 			return fmt.Errorf("auto.timeout_seconds must be 0 (default) or between 1 and %d", MaxAutoTimeoutSeconds)
@@ -353,7 +361,7 @@ func (c *Config) AutoAPIKey() (string, error) {
 	}
 	key := os.Getenv(c.Auto.EnvKey)
 	if key == "" {
-		return "", fmt.Errorf("environment variable %s (auto.env_key) must be set to the Jev API key", c.Auto.EnvKey)
+		return "", fmt.Errorf("environment variable %s (auto.env_key) must be set to the decision model API key", c.Auto.EnvKey)
 	}
 	return key, nil
 }

@@ -701,13 +701,13 @@ type startOutput struct {
 }
 
 type autoOutput struct {
-	Skipped       bool               `json:"skipped,omitempty" jsonschema_description:"True when Jev was skipped because only one candidate was available."`
+	Skipped       bool               `json:"skipped,omitempty" jsonschema_description:"True when the decision model was skipped because only one candidate was available."`
 	Omitted       []string           `json:"omitted,omitempty" jsonschema_description:"Reasons providers were omitted from the candidates, when any were omitted."`
-	JudgeModel    *string            `json:"judge_model,omitempty" jsonschema_description:"Model that answered the decision request; absent when Jev was skipped."`
-	Confidence    *float64           `json:"confidence,omitempty" jsonschema_description:"Jev confidence in the chosen pair, from 0 to 1; absent when Jev was skipped."`
+	JudgeModel    *string            `json:"judge_model,omitempty" jsonschema_description:"Model that answered the decision request; absent when the decision model was skipped."`
+	Confidence    *float64           `json:"confidence,omitempty" jsonschema_description:"Decision model confidence in the chosen pair, from 0 to 1; absent when the decision model was skipped."`
 	Probabilities map[string]float64 `json:"probabilities,omitempty" jsonschema_description:"Probability of each candidate, keyed by provider/model."`
-	InputTokens   *int               `json:"input_tokens,omitempty" jsonschema_description:"Jev input tokens billed for this decision; absent when Jev was skipped."`
-	OutputTokens  *int               `json:"output_tokens,omitempty" jsonschema_description:"Jev output tokens for this decision; absent when Jev was skipped."`
+	InputTokens   *int               `json:"input_tokens,omitempty" jsonschema_description:"Decision model input tokens billed for this decision; absent when the decision model was skipped."`
+	OutputTokens  *int               `json:"output_tokens,omitempty" jsonschema_description:"Decision model output tokens for this decision; absent when the decision model was skipped."`
 }
 
 type replyOutput struct {

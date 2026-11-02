@@ -89,6 +89,38 @@ func TestChooseRejectsUnknownChoice(t *testing.T) {
 	}
 }
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestChooseClefEndpointAndEnvelope(t *testing.T) {
+	c := New(config.Auto{URL: "https://example.com/ai/run/@cf/cloudflare/clef", Model: "clef"}, "key")
+	c.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		if r.URL.Path != "/ai/run/@cf/cloudflare/clef" {
+			t.Errorf("path = %q", r.URL.Path)
+		}
+		if r.Header.Get("Authorization") != "Bearer key" {
+			t.Error("missing authorization")
+		}
+		return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(`{"result":{"model":"clef","answers":{"model":{"type":"choice","choice":"a/m"}},"usage":{"input_tokens":12}},"success":true}`))}, nil
+	})}
+	got, err := c.Choose(context.Background(), "task", "/repo", []Candidate{{Provider: "a", Model: "m"}})
+	if err != nil || got.Model != "m" || got.JudgeModel != "clef" || got.InputTokens != 12 {
+		t.Fatalf("Choose() = %#v, %v", got, err)
+	}
+}
+
+func TestChooseCloudflareErrors(t *testing.T) {
+	c := New(config.Auto{BaseURL: "https://example.com"}, "test-key")
+	c.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: 400, Body: io.NopCloser(strings.NewReader(`{"errors":[{"code":123,"message":"invalid model"},{"message":"test-key secret-task"}]}`))}, nil
+	})}
+	_, err := c.Choose(context.Background(), "secret-task", "/repo", []Candidate{{Provider: "a", Model: "m"}})
+	if err == nil || !strings.Contains(err.Error(), "invalid model") || strings.Contains(err.Error(), "test-key") || strings.Contains(err.Error(), "secret-task") {
+		t.Fatalf("error = %v", err)
+	}
+}
+
 func TestChooseRejectsNonChoiceAnswer(t *testing.T) {
 	_, err := chooseAgainst(t, `{
 		"model":"jev-1.14.0",

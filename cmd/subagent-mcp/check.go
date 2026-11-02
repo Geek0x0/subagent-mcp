@@ -137,10 +137,14 @@ func runCheck(w io.Writer, cfg *config.Config, live bool) int {
 	}
 
 	if cfg.Auto != nil {
-		fmt.Fprintf(w, "auto     typesafe (%s)\n", cfg.Auto.Model)
-		fmt.Fprintf(w, "  api    %s\n", cfg.Auto.BaseURL)
+		fmt.Fprintf(w, "auto     decision model (%s)\n", cfg.Auto.Model)
+		endpoint := cfg.Auto.BaseURL
+		if cfg.Auto.URL != "" {
+			endpoint = cfg.Auto.URL
+		}
+		fmt.Fprintf(w, "  api    %s\n", endpoint)
 		if os.Getenv(cfg.Auto.EnvKey) == "" {
-			fmt.Fprintf(w, "  key    %s   not set, Jev selection calls will fail\n", cfg.Auto.EnvKey)
+			fmt.Fprintf(w, "  key    %s   not set, decision model selection calls will fail\n", cfg.Auto.EnvKey)
 		} else {
 			fmt.Fprintf(w, "  key    %s   set\n", cfg.Auto.EnvKey)
 		}

@@ -45,8 +45,8 @@ Run these checks with Bash:
    calls run under the kernel sandbox; `WARN` (macOS or Linux below 5.13) means
    the native file tools work but every auto-allowed `shell` call exits with
    code 126. It does not affect the exit code, but report it. An optional
-   `[auto]` section is reported as `auto typesafe (...)`; a missing auto key is
-   a warning that affects Jev selection calls with multiple reachable
+   `[auto]` section is reported as `auto decision model (...)`; a missing auto key is
+   a warning that affects decision model selection calls with multiple reachable
    candidates, while single-candidate `model: "auto"` calls still work. It does
    not change the exit code.
 
@@ -64,8 +64,8 @@ Then report:
 - sandbox: <the `sandbox  Landlock` line: OK, or the WARN with its consequence>
 - providers: <for each provider in the check-config output: name, key name set
   or skipped, api OK or FAIL; never key values>
-- auto: <when `[auto]` is configured: the `auto typesafe (...)` line and whether
-  its key is set; a missing key affects Jev selection calls with multiple
+- auto: <when `[auto]` is configured: the `auto decision model (...)` line and whether
+  its key is set; a missing key affects decision model selection calls with multiple
   reachable candidates, while single-candidate `model: "auto"` calls still
   work, and does not change the exit code>
 - ready: <when the binary, the config, and at least one provider's key all
