@@ -535,6 +535,8 @@ func TestAutoValidation(t *testing.T) {
 		{name: "missing env_key", block: "[auto]\nmodel = \"jev-latest\"\n", want: "auto.env_key"},
 		{name: "missing model", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\n", want: "auto.model"},
 		{name: "bad base_url", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\nbase_url = \"ftp://typesafe\"\n", want: "auto.base_url"},
+		{name: "base_url query", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\nbase_url = \"https://typesafe.example?tenant=one\"\n", want: "auto.base_url"},
+		{name: "base_url fragment", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\nbase_url = \"https://typesafe.example#systemone\"\n", want: "auto.base_url"},
 		{name: "negative timeout", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\ntimeout_seconds = -1\n", want: "auto.timeout_seconds"},
 		{name: "too long timeout", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\ntimeout_seconds = 601\n", want: "auto.timeout_seconds"},
 		{name: "unknown key", block: "[auto]\nenv_key = \"AUTO_TEST_KEY\"\nmodel = \"jev-latest\"\nbogus = 1\n", want: "unknown keys"},

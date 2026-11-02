@@ -46,8 +46,9 @@ Run these checks with Bash:
    the native file tools work but every auto-allowed `shell` call exits with
    code 126. It does not affect the exit code, but report it. An optional
    `[auto]` section is reported as `auto typesafe (...)`; a missing auto key is
-   a warning that only disables `model: "auto"` calls and does not change the
-   exit code.
+   a warning that affects Jev selection calls with multiple reachable
+   candidates, while single-candidate `model: "auto"` calls still work. It does
+   not change the exit code.
 
    Do not add `--live` here: it makes real, billed API calls. Mention it only if
    the user asks how to verify a provider end to end.
@@ -64,8 +65,9 @@ Then report:
 - providers: <for each provider in the check-config output: name, key name set
   or skipped, api OK or FAIL; never key values>
 - auto: <when `[auto]` is configured: the `auto typesafe (...)` line and whether
-  its key is set; a missing key only disables `model: "auto"` calls and does not
-  change the exit code>
+  its key is set; a missing key affects Jev selection calls with multiple
+  reachable candidates, while single-candidate `model: "auto"` calls still
+  work, and does not change the exit code>
 - ready: <when the binary, the config, and at least one provider's key all
   pass: the MCP tools are available once the server is connected — `subagent`
   and `subagent-reply` by default, or the names set by SUBAGENT_MCP_TOOL_NAME.

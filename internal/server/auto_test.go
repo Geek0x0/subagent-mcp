@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/Geek0x0/subagent-mcp/internal/config"
 	"github.com/Geek0x0/subagent-mcp/internal/provider"
@@ -421,6 +422,63 @@ func TestHandleStartAutoDoesNotCallJevOnInvalidArgs(t *testing.T) {
 	}
 	if len(*requests) != 0 {
 		t.Fatalf("Jev requests = %d, want 0", len(*requests))
+	}
+}
+
+func TestHandleStartAutoValidatesWritableRootsBeforeJev(t *testing.T) {
+	t.Setenv("TEST_AUTO_KEY", "jev-key")
+	jev, requests := newAutoStub(t, autoResponse("alpha/m-fast", 0.9), http.StatusOK)
+	cfg := autoConfig(t, jev.URL)
+	s := New(cfg, "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "task",
+		"cwd":    t.TempDir(),
+		"model":  "auto",
+		"config": map[string]any{"writable_roots": []any{"relative/path"}},
+	}))
+	if err != nil || !result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want a tool error", result, err)
+	}
+	if text := toolResultText(t, result); !strings.Contains(text, "writable_roots") {
+		t.Fatalf("error = %q, want writable_roots validation", text)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("Jev requests = %d, want none for invalid local config", len(*requests))
+	}
+}
+
+func TestHandleStartAutoHonorsRunDeadlineDuringJevSelection(t *testing.T) {
+	t.Setenv("TEST_AUTO_KEY", "jev-key")
+	var requestStarted chan struct{}
+	requestStarted = make(chan struct{})
+	jev := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(requestStarted)
+		time.Sleep(1100 * time.Millisecond)
+		_, _ = io.WriteString(w, autoResponse("alpha/m-fast", 0.9))
+	}))
+	t.Cleanup(jev.Close)
+	cfg := autoConfig(t, jev.URL)
+	cfg.Auto.TimeoutSeconds = 3
+	s := New(cfg, "test")
+
+	started := time.Now()
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "task",
+		"cwd":    t.TempDir(),
+		"model":  "auto",
+		"config": map[string]any{"run_deadline_seconds": float64(1)},
+	}))
+	if err != nil || !result.IsError || !strings.Contains(toolResultText(t, result), "deadline") {
+		t.Fatalf("handleStart() = (%#v, %v), want a deadline tool error", result, err)
+	}
+	select {
+	case <-requestStarted:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("Jev request did not start")
+	}
+	if elapsed := time.Since(started); elapsed > 1500*time.Millisecond {
+		t.Fatalf("handleStart() took %s, want run deadline to bound Jev selection", elapsed)
 	}
 }
 

@@ -755,10 +755,10 @@ func TestRunCheckWarnsWhenAutoKeyUnset(t *testing.T) {
 		t.Fatalf("runCheck() = %d, want 0; output:\n%s", code, out.String())
 	}
 	got := out.String()
-	if !strings.Contains(got, "TYPESAFE_TEST_KEY") || !strings.Contains(got, "not set") {
+	if !strings.Contains(got, "TYPESAFE_TEST_KEY") || !strings.Contains(got, "Jev selection calls will fail") {
 		t.Fatalf("runCheck() output missing the auto key warning:\n%s", got)
 	}
-	if strings.Contains(got, "FAIL") {
+	if strings.Contains(got, "auto calls will fail") || strings.Contains(got, "FAIL") {
 		t.Fatalf("runCheck() reported FAIL for a missing optional auto key:\n%s", got)
 	}
 }

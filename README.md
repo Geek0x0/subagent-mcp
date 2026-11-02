@@ -202,7 +202,7 @@ auto     typesafe (jev-latest)
 result   PASS (1 checked, 1 skipped, 0 failed)
 ```
 
-When `[auto]` exists, `--check-config` adds the `auto` block shown above and reports whether its key is set; it does not call Jev. A missing auto key warns (`not set, auto calls will fail`) and only disables `model: "auto"` calls; it does not change the exit code.
+When `[auto]` exists, `--check-config` adds the `auto` block shown above and reports whether its key is set; it does not call Jev. A missing auto key warns (`not set, Jev selection calls will fail`); it only affects auto calls with multiple reachable candidates, because a single reachable candidate skips Jev. The warning does not change the exit code.
 
 If no configured provider has a key set or passes Codex auth, and none failed, the result line instead reads `result   FAIL (0 checked, N skipped, 0 failed) — no configured provider has its key set`.
 

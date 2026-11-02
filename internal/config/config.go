@@ -197,7 +197,7 @@ func (c *Config) Validate() error {
 			return errors.New("auto.model is required")
 		}
 		u, err := url.Parse(c.Auto.BaseURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
 			return fmt.Errorf("auto.base_url %q must be an absolute http or https URL", c.Auto.BaseURL)
 		}
 		if c.Auto.TimeoutSeconds < 0 || c.Auto.TimeoutSeconds > MaxAutoTimeoutSeconds {

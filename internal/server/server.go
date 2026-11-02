@@ -954,10 +954,43 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		return mcp.NewToolResultError(fmt.Sprintf("cwd is not a directory: %q", cwd)), nil
 	}
 
+	var writableRoots []string
+	var budgets runBudgets
+	if autoRequested {
+		writableRoots, err = parseWritableRoots(looseConfig)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		budgets, err = parseBudgets(looseConfig)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+	}
+
+	runCtx := ctx
+	cancelRun := func() {}
+	if autoRequested && budgets.runDeadline > 0 {
+		var cancel context.CancelFunc
+		runCtx, cancel = context.WithTimeoutCause(
+			ctx,
+			budgets.runDeadline,
+			fmt.Errorf("run deadline of %s reached", budgets.runDeadline),
+		)
+		cancelRun = cancel
+	}
+	defer cancelRun()
+	ctx = runCtx
+
 	if autoRequested {
 		sel, errResult := s.resolveAuto(ctx, prompt, cwd, "")
 		if errResult != nil {
+			if ctx.Err() != nil {
+				return mcp.NewToolResultError("auto model selection: " + context.Cause(ctx).Error()), nil
+			}
 			return errResult, nil
+		}
+		if ctx.Err() != nil {
+			return mcp.NewToolResultError("auto model selection: " + context.Cause(ctx).Error()), nil
 		}
 		providerName = sel.providerName
 		providerCfg = sel.providerCfg
@@ -996,14 +1029,16 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		maxNudges = int(value)
 	}
 
-	writableRoots, err := parseWritableRoots(looseConfig)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
-	}
+	if !autoRequested {
+		writableRoots, err = parseWritableRoots(looseConfig)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 
-	budgets, err := parseBudgets(looseConfig)
-	if err != nil {
-		return mcp.NewToolResultError(err.Error()), nil
+		budgets, err = parseBudgets(looseConfig)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
 	}
 
 	options := agent.Options{
