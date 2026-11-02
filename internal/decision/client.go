@@ -10,9 +10,15 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Geek0x0/subagent-mcp/internal/config"
+)
+
+var (
+	httpClientOnce   sync.Once
+	sharedHTTPClient *http.Client
 )
 
 const (
@@ -86,7 +92,7 @@ type systemOneUsage struct {
 }
 
 // New returns a client for cfg. An empty BaseURL or TimeoutSeconds takes the
-// package default. The HTTP transport is a clone of http.DefaultTransport, so
+// package default. Clients share a clone of http.DefaultTransport, so
 // proxy-from-environment and the standard TLS defaults carry over.
 func New(cfg config.Auto, apiKey string) *Client {
 	if cfg.BaseURL == "" {
@@ -96,17 +102,20 @@ func New(cfg config.Auto, apiKey string) *Client {
 		cfg.TimeoutSeconds = config.DefaultAutoTimeoutSeconds
 	}
 
-	var transport http.RoundTripper = http.DefaultTransport
-	if base, ok := http.DefaultTransport.(*http.Transport); ok {
-		transport = base.Clone()
-	}
+	httpClientOnce.Do(func() {
+		var transport http.RoundTripper = http.DefaultTransport
+		if base, ok := http.DefaultTransport.(*http.Transport); ok {
+			transport = base.Clone()
+		}
+		sharedHTTPClient = &http.Client{Transport: transport}
+	})
 
 	return &Client{
 		baseURL:    cfg.BaseURL,
 		apiKey:     apiKey,
 		model:      cfg.Model,
 		timeout:    time.Duration(cfg.TimeoutSeconds) * time.Second,
-		httpClient: &http.Client{Transport: transport},
+		httpClient: sharedHTTPClient,
 	}
 }
 

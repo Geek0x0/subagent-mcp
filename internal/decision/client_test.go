@@ -14,6 +14,17 @@ import (
 	"github.com/Geek0x0/subagent-mcp/internal/config"
 )
 
+func TestNewSharesHTTPClient(t *testing.T) {
+	first := New(config.Auto{}, "first-key")
+	second := New(config.Auto{}, "second-key")
+	if first.httpClient != second.httpClient {
+		t.Fatal("decision clients do not share an HTTP client")
+	}
+	if first.apiKey != "first-key" || second.apiKey != "second-key" {
+		t.Fatal("decision clients do not retain their own API keys")
+	}
+}
+
 func TestChooseSendsOneChoiceQuestionAndMapsAnswer(t *testing.T) {
 	var requestBody map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
