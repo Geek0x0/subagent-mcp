@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"strconv"
-	"syscall"
 )
 
 // HelperArg is the hidden argv[1] that turns the subagent-mcp binary into the sandbox helper.
@@ -55,21 +54,6 @@ type helperArgs struct {
 	rootFDs []int
 	cwdFD   int
 	argv    []string
-}
-
-func parseDirectoryFD(value string) (int, error) {
-	fd, err := strconv.Atoi(value)
-	if err != nil || fd < 3 {
-		return 0, fmt.Errorf("sandbox helper: invalid directory fd %q", value)
-	}
-	var stat syscall.Stat_t
-	if err := syscall.Fstat(fd, &stat); err != nil {
-		return 0, fmt.Errorf("sandbox helper: inspect directory fd %d: %w", fd, err)
-	}
-	if stat.Mode&syscall.S_IFMT != syscall.S_IFDIR {
-		return 0, fmt.Errorf("sandbox helper: fd %d is not a directory", fd)
-	}
-	return fd, nil
 }
 
 func parseArgs(args []string) (helperArgs, error) {
