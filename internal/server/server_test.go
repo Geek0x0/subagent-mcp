@@ -470,6 +470,19 @@ func TestToolOutputSchemas(t *testing.T) {
 					t.Errorf("output schema properties = %#v, want property %q", properties, want)
 				}
 			}
+			if test.name == "subagent" {
+				for _, want := range []string{"provider", "model", "auto"} {
+					if _, ok := properties[want]; !ok {
+						t.Errorf("start output schema properties = %#v, want property %q", properties, want)
+					}
+				}
+			} else {
+				for _, absent := range []string{"provider", "model", "auto"} {
+					if _, ok := properties[absent]; ok {
+						t.Errorf("reply output schema properties = %#v, want no property %q", properties, absent)
+					}
+				}
+			}
 		})
 	}
 }
@@ -2634,6 +2647,23 @@ func TestProviderParameterIsRequiredWithMoreThanOneProvider(t *testing.T) {
 			}),
 			required: true,
 		},
+		{
+			name: "auto makes it optional with two providers",
+			cfg: func() *config.Config {
+				cfg := testMultiConfig(t, map[string]provider.Provider{
+					"deepseek":  &stubProvider{},
+					"secondary": &stubProvider{},
+				})
+				cfg.Auto = &config.Auto{
+					BaseURL:        "https://api.typesafe.ai",
+					EnvKey:         "TEST_AUTO_KEY",
+					Model:          "jev-latest",
+					TimeoutSeconds: 20,
+				}
+				return cfg
+			}(),
+			required: false,
+		},
 	}
 
 	for _, test := range tests {
@@ -2662,6 +2692,40 @@ func TestProviderParameterIsRequiredWithMoreThanOneProvider(t *testing.T) {
 // describes. They drifted once: ultra was added to the accepted efforts and the
 // description beside it still stopped at max, which is exactly the text a model
 // reads when choosing one.
+func TestAutoModelInToolSchema(t *testing.T) {
+	for _, configured := range []bool{false, true} {
+		t.Run(fmt.Sprintf("auto configured %v", configured), func(t *testing.T) {
+			cfg := testConfig(t, &stubProvider{})
+			if configured {
+				cfg.Auto = &config.Auto{
+					BaseURL:        "https://api.typesafe.ai",
+					EnvKey:         "TEST_AUTO_KEY",
+					Model:          "jev-latest",
+					TimeoutSeconds: 20,
+				}
+			}
+			s := New(cfg, "test")
+			var schema struct {
+				Properties map[string]struct {
+					Description string   `json:"description"`
+					Enum        []string `json:"enum"`
+				} `json:"properties"`
+			}
+			if err := json.Unmarshal([]byte(toolInputSchemaJSON(t, s, "subagent")), &schema); err != nil {
+				t.Fatal(err)
+			}
+			model := schema.Properties["model"]
+			hasAuto := slices.Contains(model.Enum, "auto")
+			if hasAuto != configured {
+				t.Fatalf("model enum = %v, want auto = %v", model.Enum, configured)
+			}
+			if strings.Contains(model.Description, "auto") != configured {
+				t.Fatalf("model description = %q, want auto mention = %v", model.Description, configured)
+			}
+		})
+	}
+}
+
 func TestToolSchemaProseMatchesItsEnums(t *testing.T) {
 	s := New(testConfig(t, &stubProvider{}), "test")
 

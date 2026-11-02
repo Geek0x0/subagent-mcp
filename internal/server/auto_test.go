@@ -3,14 +3,19 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/Geek0x0/subagent-mcp/internal/config"
 	"github.com/Geek0x0/subagent-mcp/internal/provider"
+
+	"github.com/mark3labs/mcp-go/mcp"
 )
 
 func newAutoStub(t *testing.T, response string, status int) (*httptest.Server, *[]map[string]any) {
@@ -270,5 +275,232 @@ func TestAutoCandidatesIncludesCodexWithoutKeyCheck(t *testing.T) {
 		if !seen[want] {
 			t.Errorf("candidates missing %q: %#v", want, candidates)
 		}
+	}
+}
+
+func startStructured(t *testing.T, result *mcp.CallToolResult) map[string]any {
+	t.Helper()
+	structured, ok := result.StructuredContent.(map[string]any)
+	if !ok {
+		t.Fatalf("StructuredContent = %#v, want map[string]any", result.StructuredContent)
+	}
+	return structured
+}
+
+func TestHandleStartAutoDispatchesChosenModel(t *testing.T) {
+	t.Setenv("TEST_AUTO_KEY", "jev-key")
+	alpha := &stubProvider{name: "alpha"}
+	bravo := &stubProvider{name: "bravo", turns: []stubTurn{{result: &provider.TurnResult{Text: "chosen result"}}}}
+	cfg := testMultiConfig(t, map[string]provider.Provider{"alpha": alpha, "bravo": bravo})
+	jev, _ := newAutoStub(t, autoResponse("bravo/m-pro", 0.9), http.StatusOK)
+	cfg.Auto = &config.Auto{BaseURL: jev.URL, EnvKey: "TEST_AUTO_KEY", Model: "jev-latest", TimeoutSeconds: 5}
+	s := New(cfg, "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "fix the parser",
+		"cwd":    t.TempDir(),
+		"model":  "auto",
+	}))
+	if err != nil || result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want success; text=%q", result, err, toolResultText(t, result))
+	}
+	if got := toolResultText(t, result); got != "chosen result" {
+		t.Fatalf("result text = %q", got)
+	}
+	if len(alpha.recordedRequests()) != 0 || len(bravo.recordedRequests()) != 1 {
+		t.Fatalf("provider turns = alpha %d, bravo %d", len(alpha.recordedRequests()), len(bravo.recordedRequests()))
+	}
+	structured := startStructured(t, result)
+	if structured["provider"] != "bravo" || structured["model"] != "m-pro" {
+		t.Fatalf("start structured = %#v", structured)
+	}
+	auto := structured["auto"].(map[string]any)
+	if auto["judge_model"] != "jev-1.14.0" || auto["confidence"] != 0.9 {
+		t.Fatalf("auto = %#v", auto)
+	}
+}
+
+func TestHandleStartAutoSingleCandidateNeedsNoJevKey(t *testing.T) {
+	cfg := testMultiConfig(t, map[string]provider.Provider{
+		"alpha": &stubProvider{name: "alpha", turns: []stubTurn{{result: &provider.TurnResult{Text: "single"}}}},
+	})
+	p := cfg.Providers["alpha"]
+	p.Models = []config.Model{{ID: "m-fast"}}
+	p.DefaultModel = "m-fast"
+	cfg.Providers["alpha"] = p
+	jev, requests := newAutoStub(t, autoResponse("alpha/m-fast", 0.9), http.StatusOK)
+	cfg.Auto = &config.Auto{BaseURL: jev.URL, EnvKey: "TEST_AUTO_KEY", Model: "jev-latest", TimeoutSeconds: 5}
+	s := New(cfg, "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "task", "cwd": t.TempDir(), "model": "auto",
+	}))
+	if err != nil || result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want success; text=%q", result, err, toolResultText(t, result))
+	}
+	structured := startStructured(t, result)
+	if structured["provider"] != "alpha" || structured["model"] != "m-fast" {
+		t.Fatalf("start structured = %#v", structured)
+	}
+	auto := structured["auto"].(map[string]any)
+	if auto["judge_model"] != "" || auto["confidence"] != float64(1) {
+		t.Fatalf("auto = %#v", auto)
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("Jev requests = %d, want 0", len(*requests))
+	}
+}
+
+func TestHandleStartAutoFailureCreatesNoSession(t *testing.T) {
+	t.Setenv("TEST_AUTO_KEY", "jev-key")
+	alpha := &stubProvider{name: "alpha"}
+	bravo := &stubProvider{name: "bravo"}
+	cfg := testMultiConfig(t, map[string]provider.Provider{"alpha": alpha, "bravo": bravo})
+	jev, _ := newAutoStub(t, `{"detail":"upstream failed"}`, http.StatusInternalServerError)
+	cfg.Auto = &config.Auto{BaseURL: jev.URL, EnvKey: "TEST_AUTO_KEY", Model: "jev-latest", TimeoutSeconds: 5}
+	s := New(cfg, "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "task", "cwd": t.TempDir(), "model": "auto",
+	}))
+	if err != nil || !result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want a tool error", result, err)
+	}
+	text := toolResultText(t, result)
+	for _, want := range []string{"auto model selection", "500"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("error %q lacks %q", text, want)
+		}
+	}
+	if len(alpha.recordedRequests()) != 0 || len(bravo.recordedRequests()) != 0 {
+		t.Fatal("a provider turn ran after a failed decision")
+	}
+	if result.StructuredContent != nil {
+		t.Fatalf("StructuredContent = %#v, want none before a session exists", result.StructuredContent)
+	}
+}
+
+func TestHandleStartAutoExecutionErrorKeepsMetadata(t *testing.T) {
+	t.Setenv("TEST_AUTO_KEY", "jev-key")
+	bravo := &stubProvider{name: "bravo", turns: []stubTurn{{err: errors.New("boom")}}}
+	cfg := testMultiConfig(t, map[string]provider.Provider{"alpha": &stubProvider{name: "alpha"}, "bravo": bravo})
+	jev, _ := newAutoStub(t, autoResponse("bravo/m-pro", 0.9), http.StatusOK)
+	cfg.Auto = &config.Auto{BaseURL: jev.URL, EnvKey: "TEST_AUTO_KEY", Model: "jev-latest", TimeoutSeconds: 5}
+	s := New(cfg, "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "task", "cwd": t.TempDir(), "model": "auto",
+	}))
+	if err != nil || !result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want a tool error", result, err)
+	}
+	structured := startStructured(t, result)
+	if structured["threadId"] == "" || structured["provider"] != "bravo" || structured["model"] != "m-pro" {
+		t.Fatalf("start structured = %#v", structured)
+	}
+	if _, ok := structured["auto"]; !ok {
+		t.Fatalf("start structured = %#v, want auto metadata", structured)
+	}
+}
+
+func TestHandleStartAutoDoesNotCallJevOnInvalidArgs(t *testing.T) {
+	t.Setenv("TEST_AUTO_KEY", "jev-key")
+	cfg := testConfig(t, &stubProvider{})
+	jev, requests := newAutoStub(t, autoResponse("deepseek/m-fast", 0.9), http.StatusOK)
+	cfg.Auto = &config.Auto{BaseURL: jev.URL, EnvKey: "TEST_AUTO_KEY", Model: "jev-latest", TimeoutSeconds: 5}
+	s := New(cfg, "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "task", "cwd": t.TempDir(), "model": "auto", "sandbox": "bogus",
+	}))
+	if err != nil || !result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want a tool error", result, err)
+	}
+	if !strings.Contains(toolResultText(t, result), "read-only") {
+		t.Fatalf("error = %q", toolResultText(t, result))
+	}
+	if len(*requests) != 0 {
+		t.Fatalf("Jev requests = %d, want 0", len(*requests))
+	}
+}
+
+func TestHandleStartExplicitKeepsProviderErrorFirst(t *testing.T) {
+	cfg := testMultiConfig(t, map[string]provider.Provider{"alpha": &stubProvider{}, "bravo": &stubProvider{}})
+	s := New(cfg, "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "task", "cwd": t.TempDir(), "provider": "bogus", "sandbox": "bogus",
+	}))
+	if err != nil || !result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want a tool error", result, err)
+	}
+	text := toolResultText(t, result)
+	if !strings.Contains(text, "unknown provider") {
+		t.Fatalf("error = %q, want unknown provider first", text)
+	}
+	if strings.Contains(text, "read-only") {
+		t.Fatalf("error = %q, want the provider error to win", text)
+	}
+}
+
+func TestHandleStartExplicitResultReportsProviderAndModel(t *testing.T) {
+	alpha := &stubProvider{name: "alpha", turns: []stubTurn{{result: &provider.TurnResult{Text: "ok"}}}}
+	cfg := testMultiConfig(t, map[string]provider.Provider{"alpha": alpha, "bravo": &stubProvider{name: "bravo"}})
+	s := New(cfg, "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "task", "cwd": t.TempDir(), "provider": "alpha", "model": "m-pro",
+	}))
+	if err != nil || result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want success", result, err)
+	}
+	structured := startStructured(t, result)
+	if structured["provider"] != "alpha" || structured["model"] != "m-pro" {
+		t.Fatalf("start structured = %#v", structured)
+	}
+	if _, ok := structured["auto"]; ok {
+		t.Fatalf("start structured = %#v, want no auto key", structured)
+	}
+}
+
+func TestHandleStartAutoWritesModelSelectionToRollout(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("CODEX_HOME", home)
+	t.Setenv("SUBAGENT_MCP_ROLLOUT", "")
+	t.Setenv("TEST_AUTO_KEY", "jev-key")
+	cfg := testConfig(t, &stubProvider{turns: []stubTurn{{result: &provider.TurnResult{Text: "ok"}}}})
+	jev, _ := newAutoStub(t, autoResponse("deepseek/m-pro", 0.9), http.StatusOK)
+	cfg.Auto = &config.Auto{BaseURL: jev.URL, EnvKey: "TEST_AUTO_KEY", Model: "jev-latest", TimeoutSeconds: 5}
+	s := New(cfg, "test")
+
+	result, err := s.handleStart(context.Background(), callToolRequest("subagent", map[string]any{
+		"prompt": "task", "cwd": t.TempDir(), "model": "auto",
+	}))
+	if err != nil || result.IsError {
+		t.Fatalf("handleStart() = (%#v, %v), want success", result, err)
+	}
+	threadID := toolResultThreadID(t, result)
+	matches, _ := filepath.Glob(filepath.Join(home, "sessions", "*", "*", "*", "rollout-*-"+threadID+".jsonl"))
+	if len(matches) != 1 {
+		t.Fatalf("rollout files = %v", matches)
+	}
+	data, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	var meta struct {
+		Type    string         `json:"type"`
+		Payload map[string]any `json:"payload"`
+	}
+	if err := json.Unmarshal([]byte(lines[0]), &meta); err != nil {
+		t.Fatal(err)
+	}
+	selection, ok := meta.Payload["model_selection"].(map[string]any)
+	if !ok {
+		t.Fatalf("session_meta = %#v", meta.Payload)
+	}
+	if selection["provider"] != "deepseek" || selection["model"] != "m-pro" || selection["judge_model"] != "jev-1.14.0" || selection["confidence"] != 0.9 {
+		t.Fatalf("model_selection = %#v", selection)
 	}
 }

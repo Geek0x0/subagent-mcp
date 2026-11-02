@@ -161,6 +161,9 @@ func resolveEffort(arguments map[string]any, configMap map[string]any) (string, 
 // as though the provider had one model, and a model summarising it kept only the
 // default. Marking one entry of the list keeps every id visible.
 func modelUnionSchema(cfg *config.Config) (ids []string, description string) {
+	if cfg.Auto != nil {
+		ids = append(ids, "auto")
+	}
 	seen := map[string]bool{}
 	var groups []string
 	for _, name := range cfg.ProviderNames() {
@@ -182,10 +185,11 @@ func modelUnionSchema(cfg *config.Config) (ids []string, description string) {
 		}
 		groups = append(groups, fmt.Sprintf("%s: %s", name, strings.Join(models, ", ")))
 	}
-	description = fmt.Sprintf(
-		"Model to use; the available id depends on the chosen provider. By provider: %s",
-		strings.Join(groups, "; "),
-	)
+	description = "Model to use; the available id depends on the chosen provider."
+	if cfg.Auto != nil {
+		description += ` Pass "auto" to let the configured decision model choose among every reachable configured model.`
+	}
+	description += fmt.Sprintf(" By provider: %s", strings.Join(groups, "; "))
 	return ids, description
 }
 
@@ -208,10 +212,14 @@ func effortDescription() string {
 // providerDescription lists every configured provider name for the provider
 // parameter of the start tool.
 func providerDescription(cfg *config.Config) string {
-	return fmt.Sprintf(
+	description := fmt.Sprintf(
 		"Configured provider to use for this session; required when more than one is configured. Available: %s.",
 		strings.Join(cfg.ProviderNames(), ", "),
 	)
+	if cfg.Auto != nil {
+		description += ` Omit it and set model to "auto" to let the decision model choose.`
+	}
+	return description
 }
 
 // runBudgets holds the per-session spending limits parsed from the call's config
@@ -684,7 +692,23 @@ func (s *Server) handleCancelledNotification(_ context.Context, notification mcp
 	}
 }
 
-type toolOutput struct {
+type startOutput struct {
+	ThreadID string      `json:"threadId" jsonschema_description:"ID of the subagent thread that produced this result."`
+	Content  string      `json:"content" jsonschema_description:"Human-readable report text from the subagent."`
+	Provider string      `json:"provider,omitempty" jsonschema_description:"Configured provider the session uses."`
+	Model    string      `json:"model,omitempty" jsonschema_description:"Model id the session uses."`
+	Auto     *autoOutput `json:"auto,omitempty" jsonschema_description:"Jev decision details, present when the model was selected by auto mode."`
+}
+
+type autoOutput struct {
+	JudgeModel    string             `json:"judge_model" jsonschema_description:"Model that answered the decision request."`
+	Confidence    float64            `json:"confidence" jsonschema_description:"Jev confidence in the chosen pair, from 0 to 1."`
+	Probabilities map[string]float64 `json:"probabilities,omitempty" jsonschema_description:"Probability of each candidate, keyed by provider/model."`
+	InputTokens   int                `json:"input_tokens" jsonschema_description:"Jev input tokens billed for this decision."`
+	OutputTokens  int                `json:"output_tokens" jsonschema_description:"Jev output tokens for this decision."`
+}
+
+type replyOutput struct {
 	ThreadID string `json:"threadId" jsonschema_description:"ID of the subagent thread that produced this result."`
 	Content  string `json:"content" jsonschema_description:"Human-readable report text from the subagent."`
 }
@@ -700,7 +724,7 @@ func startTool(name string, cfg *config.Config) mcp.Tool {
 		mcp.Enum(cfg.ProviderNames()...),
 		mcp.Description(providerDescription(cfg)),
 	}
-	if len(cfg.Providers) > 1 {
+	if len(cfg.Providers) > 1 && cfg.Auto == nil {
 		providerOptions = append(providerOptions, mcp.Required())
 	}
 	return mcp.NewTool(
@@ -746,7 +770,7 @@ func startTool(name string, cfg *config.Config) mcp.Tool {
 			"config",
 			mcp.Description("loose config map; recognized keys: max_turns (number from 1 to 100000), model_reasoning_effort (same values as reasoning-effort; the top-level argument wins), writable_roots (array of absolute directory paths the shell may also write under workspace-write), max_nudges (integer 0 to 10; how many times a reply without a tool call is answered with a continue prompt, overriding the provider default), max_history_bytes (integer ceiling on the history the thread replays; default 67108864, 0 disables), max_total_tokens (integer ceiling on the tokens the thread reports across all turns; default 0, off), run_deadline_seconds (integer wall-clock ceiling on one call; default 0, off); an unusable budget value is an error, other unknown keys are silently ignored"),
 		),
-		mcp.WithOutputSchema[toolOutput](),
+		mcp.WithOutputSchema[startOutput](),
 	)
 }
 
@@ -764,22 +788,22 @@ func replyTool(baseName string) mcp.Tool {
 			mcp.Required(),
 			mcp.Description("Follow-up prompt to send to the existing subagent thread."),
 		),
-		mcp.WithOutputSchema[toolOutput](),
+		mcp.WithOutputSchema[replyOutput](),
 	)
 }
 
 // resolveProvider picks the provider named by the "provider" argument, or the
 // sole configured provider when none is given, and constructs its adapter.
-// The third return value is a ready-to-return tool-error result, non-nil
+// The fourth return value is a ready-to-return tool-error result, non-nil
 // exactly when resolution failed for any reason; callers should return it
 // immediately (with a nil Go error) when non-nil.
-func (s *Server) resolveProvider(arguments map[string]any) (config.Provider, provider.Provider, *mcp.CallToolResult) {
+func (s *Server) resolveProvider(arguments map[string]any) (string, config.Provider, provider.Provider, *mcp.CallToolResult) {
 	var providerArg string
 	if raw, present := arguments["provider"]; present {
 		var ok bool
 		providerArg, ok = raw.(string)
 		if !ok {
-			return config.Provider{}, nil, mcp.NewToolResultError(`argument "provider" must be a string`)
+			return "", config.Provider{}, nil, mcp.NewToolResultError(`argument "provider" must be a string`)
 		}
 	}
 	var providerName string
@@ -788,7 +812,7 @@ func (s *Server) resolveProvider(arguments map[string]any) (config.Provider, pro
 	case providerArg != "":
 		cfg, err := s.cfg.Provider(providerArg)
 		if err != nil {
-			return config.Provider{}, nil, mcp.NewToolResultError(err.Error())
+			return "", config.Provider{}, nil, mcp.NewToolResultError(err.Error())
 		}
 		providerName, providerCfg = providerArg, cfg
 	case len(s.cfg.Providers) == 1:
@@ -796,20 +820,20 @@ func (s *Server) resolveProvider(arguments map[string]any) (config.Provider, pro
 			providerName, providerCfg = name, p
 		}
 	default:
-		return config.Provider{}, nil, mcp.NewToolResultError(fmt.Sprintf(
+		return "", config.Provider{}, nil, mcp.NewToolResultError(fmt.Sprintf(
 			"provider is required when more than one is configured; available: %s",
 			strings.Join(s.cfg.ProviderNames(), ", "),
 		))
 	}
 	key, err := s.cfg.APIKeyFor(providerName)
 	if err != nil {
-		return config.Provider{}, nil, mcp.NewToolResultError(err.Error())
+		return "", config.Provider{}, nil, mcp.NewToolResultError(err.Error())
 	}
 	adapter, err := provider.New(providerName, providerCfg, key)
 	if err != nil {
-		return config.Provider{}, nil, mcp.NewToolResultError(err.Error())
+		return "", config.Provider{}, nil, mcp.NewToolResultError(err.Error())
 	}
-	return providerCfg, adapter, nil
+	return providerName, providerCfg, adapter, nil
 }
 
 func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -824,10 +848,36 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		return mcp.NewToolResultError("prompt must not be empty or whitespace-only"), nil
 	}
 	arguments := req.GetArguments()
+	rawModel, modelPresent := arguments["model"]
+	modelArg, modelIsString := "", false
+	if modelPresent {
+		modelArg, modelIsString = rawModel.(string)
+	}
+	autoRequested := modelIsString && modelArg == "auto"
 
-	providerCfg, selectedProvider, errResult := s.resolveProvider(arguments)
-	if errResult != nil {
-		return errResult, nil
+	var providerName string
+	var providerCfg config.Provider
+	var selectedProvider provider.Provider
+	var model string
+	var autoSel *autoSelection
+	var autoMeta map[string]any
+	var errResult *mcp.CallToolResult
+
+	if autoRequested {
+		if raw, present := arguments["provider"]; present {
+			value, ok := raw.(string)
+			if !ok {
+				return mcp.NewToolResultError(`argument "provider" must be a string`), nil
+			}
+			if value != "" {
+				return mcp.NewToolResultError(`provider must be omitted when model is "auto"`), nil
+			}
+		}
+	} else {
+		providerName, providerCfg, selectedProvider, errResult = s.resolveProvider(arguments)
+		if errResult != nil {
+			return errResult, nil
+		}
 	}
 
 	sandboxValue := req.GetString("sandbox", "read-only")
@@ -848,22 +898,23 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 		)), nil
 	}
 
-	var model string
-	if raw, present := arguments["model"]; present {
-		var ok bool
-		model, ok = raw.(string)
-		if !ok {
-			return mcp.NewToolResultError(`argument "model" must be a string`), nil
+	if !autoRequested {
+		if raw, present := arguments["model"]; present {
+			var ok bool
+			model, ok = raw.(string)
+			if !ok {
+				return mcp.NewToolResultError(`argument "model" must be a string`), nil
+			}
 		}
-	}
-	if model == "" {
-		model = providerCfg.DefaultModel
-	} else if !providerCfg.HasModel(model) {
-		return mcp.NewToolResultError(fmt.Sprintf(
-			"unknown model %q; available models: %s",
-			model,
-			strings.Join(providerCfg.ModelIDs(), ", "),
-		)), nil
+		if model == "" {
+			model = providerCfg.DefaultModel
+		} else if !providerCfg.HasModel(model) {
+			return mcp.NewToolResultError(fmt.Sprintf(
+				"unknown model %q; available models: %s",
+				model,
+				strings.Join(providerCfg.ModelIDs(), ", "),
+			)), nil
+		}
 	}
 
 	looseConfig, _ := arguments["config"].(map[string]any)
@@ -898,6 +949,19 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	}
 	if !cwdInfo.IsDir() {
 		return mcp.NewToolResultError(fmt.Sprintf("cwd is not a directory: %q", cwd)), nil
+	}
+
+	if autoRequested {
+		sel, errResult := s.resolveAuto(ctx, prompt, cwd, "")
+		if errResult != nil {
+			return errResult, nil
+		}
+		providerName = sel.providerName
+		providerCfg = sel.providerCfg
+		selectedProvider = sel.adapter
+		model = sel.model
+		autoMeta = sel.meta()
+		autoSel = sel
 	}
 
 	agentProvider, isAgent := selectedProvider.(provider.Agent)
@@ -983,8 +1047,14 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 			"originator":        "subagent-mcp",
 			"cli_version":       s.version,
 			"source":            "mcp",
-			"model_provider":    sess.Provider().Name(),
+			"model_provider":    providerName,
 			"base_instructions": map[string]any{"text": systemPrompt},
+		}
+		if autoSel != nil {
+			selection := autoSel.meta()
+			selection["provider"] = autoSel.providerName
+			selection["model"] = autoSel.model
+			meta["model_selection"] = selection
 		}
 		if resolvedCwd, err := filepath.EvalSymlinks(cwd); err == nil {
 			if root, ok := repo.Root(resolvedCwd); ok {
@@ -996,7 +1066,7 @@ func (s *Server) handleStart(ctx context.Context, req mcp.CallToolRequest) (*mcp
 	}
 
 	text, err := s.runner.Run(ctx, sess, prompt)
-	return resultWithThreadID(sess.ID, text, err), nil
+	return resultWithStart(sess.ID, text, err, providerName, model, autoMeta), nil
 }
 
 func (s *Server) handleReply(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
@@ -1030,6 +1100,27 @@ func (s *Server) handleReply(ctx context.Context, req mcp.CallToolRequest) (*mcp
 
 	text, err := s.runner.RunLocked(ctx, sess, prompt)
 	return resultWithThreadID(threadID, text, err), nil
+}
+
+func resultWithStart(threadID, text string, err error, providerName, model string, auto map[string]any) *mcp.CallToolResult {
+	structured := map[string]any{"threadId": threadID, "content": text}
+	if providerName != "" {
+		structured["provider"] = providerName
+	}
+	if model != "" {
+		structured["model"] = model
+	}
+	if auto != nil {
+		structured["auto"] = auto
+	}
+	if err == nil {
+		return mcp.NewToolResultStructured(structured, text)
+	}
+	errorText := "error: " + err.Error()
+	structured["content"] = errorText
+	result := mcp.NewToolResultStructured(structured, errorText)
+	result.IsError = true
+	return result
 }
 
 func resultWithThreadID(threadID, text string, err error) *mcp.CallToolResult {
