@@ -31,6 +31,10 @@ subagent-mcp is one MCP server binary that exposes a coding agent — real shell
 
    Linux is the supported platform. The kernel sandbox needs Landlock (Linux 5.13 or newer); on macOS or an older kernel the server still starts and the native `read_file`, `write_file`, and `apply_patch` tools work, but every auto-allowed `shell` call exits with code 126 rather than run unsandboxed (see [Kernel sandbox for shell calls](#kernel-sandbox-for-shell-calls)). `--check-config` prints a `sandbox  Landlock` line that says which case applies.
 
+   If you only use the Claude Code plugin (steps 2 and 3) on Linux or macOS, you can skip this step: the plugin's launcher downloads the matching release binary on first start, verifies it against the checksums committed in `scripts/release.lock`, and stores it under the plugin's data directory. Set `SUBAGENT_MCP_BIN` to the path of a binary to use that instead of the download. Windows, and servers registered directly rather than through the plugin, still need the binary installed as described above.
+
+   Maintainers: after publishing a release, run `scripts/update-release-lock.sh <version>` and commit `scripts/release.lock` so the plugin picks up the new binary.
+
 2. Add this repository as a Claude Code plugin marketplace:
 
    ```bash
