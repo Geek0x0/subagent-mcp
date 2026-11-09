@@ -330,6 +330,12 @@ Claude Code names MCP tools `mcp__<server name>__<tool name>`. Register the serv
 
 With the default `SUBAGENT_MCP_TOOL_NAME=subagent`, the tools are `subagent` and `subagent-reply` (as `mcp__subagent__subagent` and `mcp__subagent__subagent-reply`).
 
+## Worker policy
+
+The plugin delivers a delegation policy (`policy/WORKER.md`) to each conversation through a hooks module (`hooks/register.ts`). `/worker on|off` switches delegation, and `/worker mode mcp|sonnet` picks the worker: the subagent-mcp tools or a Sonnet subagent. State lives in `~/.claude/worker-policy.state` and `~/.claude/worker-policy.mode`. When delegation is off, or the mode is `sonnet`, the plugin refuses calls to its MCP worker tools. The refusal matches tools by MCP server name (`subagent`, the plugin's own server, or `worker`), so a server registered under another name is not covered.
+
+The hooks module needs a Claude Code build that supports plugin hooks modules. `claude plugin test .` runs its tests.
+
 ## Provider notes
 
 Every adapter waits at most ten minutes for the response headers of a model API call. The bound does not apply to the response body, so a long stream is unaffected; it exists so that an endpoint which accepts the connection and then never answers fails the turn instead of leaving it — and the thread lock behind it — waiting until the caller cancels. Connections are pooled per provider endpoint, so sessions against one `base_url` reuse TLS and TCP connections rather than handshaking per session.
