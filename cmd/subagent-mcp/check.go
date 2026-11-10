@@ -79,13 +79,19 @@ func runCheck(w io.Writer, cfg *config.Config, live bool) int {
 			continue
 		}
 
-		key := os.Getenv(p.EnvKey)
-		if key == "" {
-			fmt.Fprintf(w, "  key    %s   not set, skipped\n", p.EnvKey)
-			skipped++
-			continue
+		// Never print the key itself, only where it comes from.
+		key := p.Key
+		if key != "" {
+			fmt.Fprintf(w, "  key    config file   set\n")
+		} else {
+			key = os.Getenv(p.EnvKey)
+			if key == "" {
+				fmt.Fprintf(w, "  key    %s   not set, skipped\n", p.EnvKey)
+				skipped++
+				continue
+			}
+			fmt.Fprintf(w, "  key    %s   set\n", p.EnvKey)
 		}
-		fmt.Fprintf(w, "  key    %s   set\n", p.EnvKey)
 		checked++
 
 		adapter, err := provider.New(name, p, key)
@@ -143,7 +149,9 @@ func runCheck(w io.Writer, cfg *config.Config, live bool) int {
 			endpoint = cfg.Auto.URL
 		}
 		fmt.Fprintf(w, "  api    %s\n", endpoint)
-		if os.Getenv(cfg.Auto.EnvKey) == "" {
+		if cfg.Auto.Key != "" {
+			fmt.Fprintf(w, "  key    config file   set\n")
+		} else if os.Getenv(cfg.Auto.EnvKey) == "" {
 			fmt.Fprintf(w, "  key    %s   not set, decision model selection calls will fail\n", cfg.Auto.EnvKey)
 		} else {
 			fmt.Fprintf(w, "  key    %s   set\n", cfg.Auto.EnvKey)

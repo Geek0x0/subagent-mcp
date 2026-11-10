@@ -6,7 +6,8 @@ allowed-tools: Bash
 Verify the local subagent-mcp installation and print a compact status report.
 
 `subagent-mcp --check-config` validates the config file, reports each provider's
-`env_key` name and whether it is set, and asks each configured provider for its
+key source (the `env_key` name, or the config file for a `key`) and whether it is
+set, and asks each configured provider for its
 model list so a bad key or base URL fails loudly. It never prints key values.
 
 Run these checks with Bash:
@@ -55,7 +56,7 @@ Run these checks with Bash:
 
 3. If the config file is missing, tell the user to copy `config.example.toml`
    from the subagent-mcp repository to the path from step 2, set at least one
-   provider's `env_key`, and reconnect the MCP server.
+   provider's `env_key` or `key`, and reconnect the MCP server.
 
 Then report:
 

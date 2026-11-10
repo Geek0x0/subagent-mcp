@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -611,5 +612,124 @@ effort_map = { high = "ultra" }
 	}
 	if got := cfg.Providers["codex"].MapEffort("high"); got != "ultra" {
 		t.Errorf("MapEffort(high) = %q, want ultra", got)
+	}
+}
+
+const keySecret = "sk-test-secret-value-9f3a"
+
+// keyTOML carries the anthropic key in the file instead of an env_key.
+var keyTOML = strings.Replace(validTOML, `env_key = "ANT_TEST_KEY"`, `key = "`+keySecret+`"`, 1)
+
+func TestKeyInConfig(t *testing.T) {
+	cfg, err := Load(writeConfig(t, keyTOML))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	got, err := cfg.APIKeyFor("anthropic")
+	if err != nil || got != keySecret {
+		t.Fatalf("APIKeyFor(anthropic) = %q, %v; want the key from the file", got, err)
+	}
+	// A provider that keeps env_key still reads the environment.
+	t.Setenv("DS_TEST_KEY", "from-env")
+	if got, err := cfg.APIKeyFor("deepseek"); err != nil || got != "from-env" {
+		t.Fatalf("APIKeyFor(deepseek) = %q, %v; want from-env", got, err)
+	}
+	// Only env_key names are scrubbed from the agent's shell; a key in the file
+	// names no variable.
+	if got := cfg.EnvKeys(); !reflect.DeepEqual(got, []string{"DS_TEST_KEY"}) {
+		t.Fatalf("EnvKeys() = %v, want [DS_TEST_KEY]", got)
+	}
+}
+
+func TestAutoKeyInConfig(t *testing.T) {
+	cfg, err := Load(writeConfig(t, validTOML+"\n[auto]\nmodel = \"jev-latest\"\nkey = \""+keySecret+"\"\n"))
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if got, err := cfg.AutoAPIKey(); err != nil || got != keySecret {
+		t.Fatalf("AutoAPIKey() = %q, %v; want the key from the file", got, err)
+	}
+}
+
+func TestKeyAndEnvKeyRules(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"provider both", strings.Replace(validTOML, `env_key = "ANT_TEST_KEY"`, "env_key = \"ANT_TEST_KEY\"\nkey = \""+keySecret+"\"", 1), "providers.anthropic.env_key and providers.anthropic.key cannot both be set"},
+		{"provider neither", strings.Replace(validTOML, `env_key = "ANT_TEST_KEY"`, "", 1), "providers.anthropic.env_key or providers.anthropic.key is required"},
+		{"codex key", codexTOML + `key = "` + keySecret + `"`, "providers.codex.key is not used by codex-app-server"},
+		{"auto both", validTOML + "\n[auto]\nmodel = \"jev-latest\"\nenv_key = \"AUTO_TEST_KEY\"\nkey = \"" + keySecret + "\"\n", "auto.env_key and auto.key cannot both be set"},
+		{"auto neither", validTOML + "\n[auto]\nmodel = \"jev-latest\"\n", "auto.env_key or auto.key is required"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, test.content))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error = %v, want it to mention %q", err, test.want)
+			}
+			if strings.Contains(err.Error(), keySecret) {
+				t.Fatalf("Load() error leaks the key: %v", err)
+			}
+		})
+	}
+}
+
+func TestKeyRequiresPrivateFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("mode bits are not meaningful on Windows")
+	}
+	path := writeConfig(t, keyTOML)
+	for _, mode := range []os.FileMode{0o644, 0o640, 0o604} {
+		if err := os.Chmod(path, mode); err != nil {
+			t.Fatal(err)
+		}
+		_, err := Load(path)
+		if err == nil || !strings.Contains(err.Error(), "chmod 600") {
+			t.Fatalf("Load() with mode %04o error = %v, want it to name chmod 600", mode, err)
+		}
+		if strings.Contains(err.Error(), keySecret) {
+			t.Fatalf("Load() error leaks the key: %v", err)
+		}
+	}
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err != nil {
+		t.Fatalf("Load() with mode 0600 error = %v", err)
+	}
+	// A config with only env_key names holds no secret and may stay world-readable.
+	open := writeConfig(t, validTOML)
+	if err := os.Chmod(open, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(open); err != nil {
+		t.Fatalf("Load() of an env_key-only config with mode 0644 error = %v", err)
+	}
+}
+
+// A mistyped field name next to a key, or a key of the wrong type, must not put
+// the value into the error: the decoder's own report quotes the source line.
+func TestLoadErrorsNeverQuoteTheKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		content string
+		want    string
+	}{
+		{"mistyped field", strings.Replace(validTOML, `env_key = "ANT_TEST_KEY"`, `kee = "`+keySecret+`"`, 1), "providers.anthropic.kee"},
+		{"wrong type", strings.Replace(validTOML, `env_key = "ANT_TEST_KEY"`, `key = ["`+keySecret+`"]`, 1), "line"},
+		{"broken syntax", strings.Replace(validTOML, `env_key = "ANT_TEST_KEY"`, `key = "`+keySecret, 1), "line"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := Load(writeConfig(t, test.content))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Load() error = %v, want it to mention %q", err, test.want)
+			}
+			if strings.Contains(err.Error(), keySecret) {
+				t.Fatalf("Load() error leaks the key: %v", err)
+			}
+		})
 	}
 }

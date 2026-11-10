@@ -106,7 +106,8 @@ model = "jev-latest"
 |---|---|---|---|
 | `api` | provider | yes | One of `chat-completions`, `responses`, `messages`, `codex-app-server`. |
 | `base_url` | provider | no | Defaults per api: `https://api.openai.com/v1` for `chat-completions` and `responses`, `https://api.anthropic.com` for `messages`. Rejected when non-empty for `codex-app-server`, which has no URL default. |
-| `env_key` | provider | except Codex | Name of the environment variable holding the key. Its value is read when a session is created for that provider (via the `provider` argument, or the sole configured provider); a missing value fails that call naming the variable and `providers.<name>.env_key`. Rejected when non-empty for `codex-app-server`: authentication goes through `codex login`. |
+| `env_key` | provider | one of `env_key`, `key`; except Codex | Name of the environment variable holding the key. Its value is read when a session is created for that provider (via the `provider` argument, or the sole configured provider); a missing value fails that call naming the variable and `providers.<name>.env_key`. Rejected when non-empty for `codex-app-server`: authentication goes through `codex login`. |
+| `key` | provider | one of `env_key`, `key`; except Codex | The API key itself, instead of `env_key`; setting both is an error. A config file that holds a key must be mode `600` (see [API keys](#api-keys)). Rejected when non-empty for `codex-app-server`. |
 | `command` | provider | no | Executable name or path for `codex-app-server`; defaults to `codex` on `PATH`. The server adds the `app-server` argument; this is not a shell command or argument list. Rejected when non-empty for every other api. |
 | `default_model` | provider | yes | Must be one of `models[].id`. Used when a caller omits `model`. |
 | `models` | provider | yes | Non-empty list of `{ id, description? }` tables; ids must be unique and are advertised in config order. |
@@ -119,7 +120,8 @@ The optional `[auto]` table configures the decision model used by `model: "auto"
 
 | Field | Required | Rules |
 |---|---|---|
-| `env_key` | yes | Name of the environment variable holding the decision model API key. A missing value fails only calls that need a decision, naming the variable and `auto.env_key`. |
+| `env_key` | one of `env_key`, `key` | Name of the environment variable holding the decision model API key. A missing value fails only calls that need a decision, naming the variable and `auto.env_key`. |
+| `key` | one of `env_key`, `key` | The decision model API key itself, instead of `env_key`; setting both is an error. Same file-mode rule as a provider `key`. |
 | `model` | yes | Decision model name or alias, for example `jev-latest`, `clef`, or `clef-flash`. |
 | `base_url` | no | Defaults to `https://api.typesafe.ai`. The System One path `/v1/systemone` is appended. A same-protocol proxy can be used by pointing here. Mutually exclusive with `url`. |
 | `url` | no | Full decision endpoint used verbatim; mutually exclusive with `base_url`. |
@@ -150,7 +152,11 @@ Accepted caller values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, 
 
 ### API keys
 
-Keys are never stored in the config file. For the three model API families, when a session is created, the server reads the selected provider's `env_key` variable from its own environment; every provider's `env_key` variable is also removed from shell commands run by the agent (see [Environment](#environment)). `auto.env_key` is scrubbed the same way. Keep the variable in the environment that launches the MCP server, for example in an MCP client's `env` block. Do not rely on a shell profile to provide the key to the agent: login profiles are loaded for shell commands, but configured keys are removed again before the command runs. Codex uses its own login instead.
+A provider names its key in one of two ways: `env_key`, the name of an environment variable, or `key`, the key itself in the config file.
+
+With `key`, every provider's settings live in the one file and nothing has to be exported into the environment that launches the server. The file then holds a secret, so the server refuses to start unless its mode is `600` (`chmod 600 ~/.config/subagent-mcp/config.toml`; not checked on Windows), and neither `--check-config` nor any error message prints the value. Be aware of what this does not protect: the agent's `read_file` tool refuses the config file, but its `shell` tool can read any file the server's user can, so a command such as `cat` on the config path returns the keys to the model and into the rollout file. The same is true of a key kept in an MCP client's `env` block on disk. Prefer `env_key` with a variable that exists only in the launching process when that matters.
+
+With `env_key`, for the three model API families, when a session is created, the server reads the selected provider's `env_key` variable from its own environment; every provider's `env_key` variable is also removed from shell commands run by the agent (see [Environment](#environment)). `auto.env_key` is scrubbed the same way. Keep the variable in the environment that launches the MCP server, for example in an MCP client's `env` block. Do not rely on a shell profile to provide the key to the agent: login profiles are loaded for shell commands, but configured keys are removed again before the command runs. Codex uses its own login instead.
 Requests to a provider's `base_url` carry only that provider's configured key and the SDK's standard protocol headers: the SDKs' own credential environments (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`, `OPENAI_CUSTOM_HEADERS`, and the `*_BASE_URL`/`*_API_KEY` variables) are ignored, so gateway tokens and headers from the server's environment are never forwarded to a configured endpoint.
 
 ### Selecting a provider

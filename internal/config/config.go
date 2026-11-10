@@ -5,11 +5,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strings"
 
@@ -50,9 +52,12 @@ const DefaultMaxOutputTokens = 64000
 
 // Provider holds the configuration of a single API provider.
 type Provider struct {
-	API             string            `toml:"api"`
-	BaseURL         string            `toml:"base_url"`
-	EnvKey          string            `toml:"env_key"`
+	API     string `toml:"api"`
+	BaseURL string `toml:"base_url"`
+	EnvKey  string `toml:"env_key"`
+	// Key is the API key itself, as an alternative to env_key. A config that
+	// holds one must not be readable by other users (see Load).
+	Key             string            `toml:"key"`
 	Command         string            `toml:"command"`
 	DefaultModel    string            `toml:"default_model"`
 	Models          []Model           `toml:"models"`
@@ -84,6 +89,7 @@ type Auto struct {
 	BaseURL        string `toml:"base_url"`
 	URL            string `toml:"url"`
 	EnvKey         string `toml:"env_key"`
+	Key            string `toml:"key"`
 	Model          string `toml:"model"`
 	TimeoutSeconds int    `toml:"timeout_seconds"`
 }
@@ -115,10 +121,20 @@ func DefaultPath() (string, error) {
 
 // Load reads, strictly decodes, defaults and validates the config at path.
 func Load(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
 		return nil, fmt.Errorf("config file %s not found; copy config.example.toml from the subagent-mcp repository to that path or set SUBAGENT_MCP_CONFIG", path)
 	}
+	if err != nil {
+		return nil, fmt.Errorf("read config file %s: %w", path, err)
+	}
+	defer file.Close()
+	// Stat the opened file, so the mode checked below is the mode of what was read.
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("read config file %s: %w", path, err)
+	}
+	data, err := io.ReadAll(file)
 	if err != nil {
 		return nil, fmt.Errorf("read config file %s: %w", path, err)
 	}
@@ -134,9 +150,24 @@ func Load(path string) (*Config, error) {
 					return nil, fmt.Errorf("config file %s: active_provider was removed in subagent-mcp 0.8.0; delete that line and select a provider per call with the start tool's provider argument instead", path)
 				}
 			}
-			return nil, fmt.Errorf("config file %s: unknown keys: %s", path, strict.String())
+			// Name the keys only: the decoder's own report quotes the source
+			// lines, which would put a mistyped key's value into the error.
+			unknown := make([]string, 0, len(strict.Errors))
+			for _, fieldErr := range strict.Errors {
+				unknown = append(unknown, strings.Join(fieldErr.Key(), "."))
+			}
+			return nil, fmt.Errorf("config file %s: unknown keys: %s", path, strings.Join(unknown, ", "))
+		}
+		var decodeErr *toml.DecodeError
+		if errors.As(err, &decodeErr) {
+			// Same reason: report where and what, never the offending line.
+			row, column := decodeErr.Position()
+			return nil, fmt.Errorf("config file %s: line %d, column %d: %s", path, row, column, decodeErr.Error())
 		}
 		return nil, fmt.Errorf("config file %s: %w", path, err)
+	}
+	if cfg.holdsKey() && runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
+		return nil, fmt.Errorf("config file %s holds an API key but its mode is %04o, so other users can read it; run: chmod 600 %s", path, info.Mode().Perm(), path)
 	}
 	absolute, err := filepath.Abs(path)
 	if err != nil {
@@ -191,8 +222,11 @@ func (c *Config) Validate() error {
 		}
 	}
 	if c.Auto != nil {
-		if c.Auto.EnvKey == "" {
-			return errors.New("auto.env_key is required")
+		if c.Auto.EnvKey == "" && c.Auto.Key == "" {
+			return errors.New("auto.env_key or auto.key is required")
+		}
+		if c.Auto.EnvKey != "" && c.Auto.Key != "" {
+			return errors.New("auto.env_key and auto.key cannot both be set")
 		}
 		if c.Auto.Model == "" {
 			return errors.New("auto.model is required")
@@ -225,6 +259,9 @@ func (p Provider) validate(prefix string) error {
 		if p.EnvKey != "" {
 			return fmt.Errorf("%s.env_key is not used by codex-app-server: authentication goes through codex login", prefix)
 		}
+		if p.Key != "" {
+			return fmt.Errorf("%s.key is not used by codex-app-server: authentication goes through codex login", prefix)
+		}
 		if p.BaseURL != "" {
 			return fmt.Errorf("%s.base_url is not used by codex-app-server", prefix)
 		}
@@ -235,8 +272,11 @@ func (p Provider) validate(prefix string) error {
 		if p.Command != "" {
 			return fmt.Errorf("%s.command is only valid for codex-app-server", prefix)
 		}
-		if p.EnvKey == "" {
-			return fmt.Errorf("%s.env_key is required", prefix)
+		if p.EnvKey == "" && p.Key == "" {
+			return fmt.Errorf("%s.env_key or %s.key is required", prefix, prefix)
+		}
+		if p.EnvKey != "" && p.Key != "" {
+			return fmt.Errorf("%s.env_key and %s.key cannot both be set", prefix, prefix)
 		}
 	}
 	if len(p.Models) == 0 {
@@ -307,7 +347,18 @@ func (c *Config) Provider(name string) (Provider, error) {
 	return p, nil
 }
 
-// APIKeyFor returns the named provider's API key from its env_key variable.
+// holdsKey reports whether any provider or auto carries its key in the file.
+func (c *Config) holdsKey() bool {
+	for _, p := range c.Providers {
+		if p.Key != "" {
+			return true
+		}
+	}
+	return c.Auto != nil && c.Auto.Key != ""
+}
+
+// APIKeyFor returns the named provider's API key: its key field, or else the
+// value of its env_key variable.
 // Codex app-server providers use codex login and return an empty key.
 func (c *Config) APIKeyFor(name string) (string, error) {
 	p, err := c.Provider(name)
@@ -316,6 +367,9 @@ func (c *Config) APIKeyFor(name string) (string, error) {
 	}
 	if p.API == APICodexAppServer {
 		return "", nil
+	}
+	if p.Key != "" {
+		return p.Key, nil
 	}
 	key := os.Getenv(p.EnvKey)
 	if key == "" {
@@ -354,10 +408,13 @@ func (c *Config) EnvKeys() []string {
 	return keys
 }
 
-// AutoAPIKey returns the Jev key from auto.env_key.
+// AutoAPIKey returns the Jev key from auto.key, or else from auto.env_key.
 func (c *Config) AutoAPIKey() (string, error) {
 	if c.Auto == nil {
 		return "", errors.New("auto model selection is not configured")
+	}
+	if c.Auto.Key != "" {
+		return c.Auto.Key, nil
 	}
 	key := os.Getenv(c.Auto.EnvKey)
 	if key == "" {

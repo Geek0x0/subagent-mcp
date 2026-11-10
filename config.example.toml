@@ -1,6 +1,8 @@
 # subagent-mcp configuration.
 # Copy to ~/.config/subagent-mcp/config.toml (or point SUBAGENT_MCP_CONFIG at it).
-# API keys are never stored here: env_key names the environment variable that holds each key.
+# env_key names the environment variable that holds a provider's API key.
+# Alternatively write the key itself as `key = "..."` (not both); the file must
+# then be mode 600, and the agent's shell can still read it (see README, API keys).
 # The caller selects which provider a session uses via the start tool's
 # `provider` argument; omit it when only one provider is configured below.
 

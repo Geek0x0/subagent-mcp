@@ -774,3 +774,30 @@ func TestRunCheckWarnsWhenAutoKeyUnset(t *testing.T) {
 		t.Fatalf("runCheck() reported FAIL for a missing optional auto key:\n%s", got)
 	}
 }
+
+// A key kept in the config file is used and reported by its source, never by value.
+func TestRunCheckKeyFromConfigFile(t *testing.T) {
+	const fileKey = "sk-file-secret-value-7c21"
+	chat := testutil.NewFakeChat(t, nil)
+	chat.SetModels([]string{"deepseek-flash"})
+
+	p := chatProvider(chat.URL, "", "deepseek-flash", "deepseek-flash")
+	p.Key = fileKey
+	cfg := &config.Config{
+		Providers: map[string]config.Provider{"deepseek": p},
+		Auto:      &config.Auto{BaseURL: "https://auto.invalid", Model: "jev-latest", Key: fileKey},
+	}
+
+	var out bytes.Buffer
+	if code := runCheck(&out, cfg, false); code != 0 {
+		t.Fatalf("runCheck() = %d, want 0; output:\n%s", code, out.String())
+	}
+	got := out.String()
+	if n := strings.Count(got, "  key    config file   set"); n != 2 {
+		t.Errorf("runCheck() reports the config-file key %d times, want 2 (provider and auto):\n%s", n, got)
+	}
+	if !strings.Contains(got, "result   PASS (1 checked, 0 skipped, 0 failed)") {
+		t.Errorf("runCheck() output missing the PASS line:\n%s", got)
+	}
+	assertNoKeyLeak(t, got, fileKey)
+}
