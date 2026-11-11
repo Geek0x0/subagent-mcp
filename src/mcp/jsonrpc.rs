@@ -107,10 +107,15 @@ impl Frame {
 
 /// A frame-level rejection that the server turns into a JSON-RPC error
 /// response. `code` is one of the `-327xx` constants above.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `id` carries the client id when the frame was parseable enough to extract
+/// one, so the error response can echo it (Go replies with `id:5` for an
+/// invalid version).
+#[derive(Debug, Clone, PartialEq)]
 pub struct JsonRpcError {
     pub code: i32,
     pub message: String,
+    pub id: Option<RequestId>,
 }
 
 impl JsonRpcError {
@@ -118,7 +123,14 @@ impl JsonRpcError {
         Self {
             code,
             message: message.into(),
+            id: None,
         }
+    }
+
+    /// Attaches the id from the rejected frame for the error response echo.
+    pub fn with_id(mut self, id: RequestId) -> Self {
+        self.id = Some(id);
+        self
     }
 }
 
@@ -159,7 +171,7 @@ pub fn parse_frame(line: &str) -> Result<Frame, JsonRpcError> {
     if value.is_null() {
         // Go's encoding/json decodes `null` into a struct as a no-op, leaving
         // the version empty; mcp-go then reports an invalid version.
-        return Err(invalid_version());
+        return Err(invalid_version(None));
     }
     if !value.is_object() {
         // Arrays and scalars cannot decode into mcp-go's message struct.
@@ -173,8 +185,9 @@ pub fn parse_frame(line: &str) -> Result<Frame, JsonRpcError> {
         result,
         error,
     } = serde_json::from_value(value).map_err(|_| parse_error())?;
+    let error_id = id.as_ref().map(|raw| RequestId::new(raw.clone()));
     if jsonrpc.as_deref() != Some("2.0") {
-        return Err(invalid_version());
+        return Err(invalid_version(error_id));
     }
 
     let Some(raw_id) = id else {
@@ -184,10 +197,10 @@ pub fn parse_frame(line: &str) -> Result<Frame, JsonRpcError> {
         }));
     };
     if !matches!(&raw_id, Value::String(_) | Value::Number(_)) {
-        return Err(JsonRpcError::new(
-            INVALID_REQUEST,
-            format!("invalid request id: {raw_id}"),
-        ));
+        return Err(
+            JsonRpcError::new(INVALID_REQUEST, format!("invalid request id: {raw_id}"))
+                .with_id(RequestId::new(raw_id)),
+        );
     }
     let id = RequestId::new(raw_id);
 
@@ -211,8 +224,10 @@ fn parse_error() -> JsonRpcError {
     JsonRpcError::new(PARSE_ERROR, "Failed to parse message")
 }
 
-fn invalid_version() -> JsonRpcError {
-    JsonRpcError::new(INVALID_REQUEST, "Invalid JSON-RPC version")
+fn invalid_version(id: Option<RequestId>) -> JsonRpcError {
+    let mut error = JsonRpcError::new(INVALID_REQUEST, "Invalid JSON-RPC version");
+    error.id = id;
+    error
 }
 
 #[cfg(test)]
@@ -467,6 +482,14 @@ mod tests {
             request.id.canonical.as_deref(),
             Some("int64:-9223372036854775808")
         );
+
+        // Exactly 2^63 is out of int64 range; Go/amd64 wraps the conversion to
+        // MinInt64, so the round-trip check fails and it is a float key.
+        let request = parse_request(r#"{"jsonrpc":"2.0","id":9223372036854775808,"method":"x"}"#);
+        assert_eq!(
+            request.id.canonical.as_deref(),
+            Some("float64:9223372036854776000")
+        );
     }
 
     #[test]
@@ -500,6 +523,60 @@ mod tests {
                 "message={}",
                 err.message
             );
+        }
+
+        // mcp-go's RequestId.UnmarshalJSON text for a bool id is exactly this.
+        // Note: mcp-go's server dispatch never decodes the top-level id through
+        // RequestId (mcp.Request has no ID field), so it accepts and echoes
+        // these ids; the plan restricts RequestId to string/number/null, so the
+        // frame layer rejects them here (reported as a known divergence).
+        let err = parse_error(r#"{"jsonrpc":"2.0","id":true,"method":"x"}"#);
+        assert_eq!(err.message, "invalid request id: true");
+        let id = err.id.expect("rejected id should still be echoed");
+        assert_eq!(id.raw, json!(true));
+        assert!(id.canonical.is_none());
+    }
+
+    #[test]
+    fn frame_errors_echo_a_parseable_numeric_id() {
+        // Go replies with the client id for an invalid version:
+        // {"jsonrpc":"2.0","id":5,"error":{"code":-32600,...}}
+        let err = parse_error(r#"{"jsonrpc":"1.0","id":5,"method":"x"}"#);
+        assert_eq!(err.code, INVALID_REQUEST);
+        assert_eq!(err.message, "Invalid JSON-RPC version");
+        let id = err.id.expect("invalid version must echo the id");
+        assert_eq!(id.raw, json!(5));
+        assert_eq!(id.canonical.as_deref(), Some("int64:5"));
+        assert_eq!(serde_json::to_string(&id).unwrap(), "5");
+    }
+
+    #[test]
+    fn frame_errors_echo_a_parseable_string_id() {
+        let err = parse_error(r#"{"jsonrpc":"1.0","id":"req-9","method":"x"}"#);
+        assert_eq!(err.code, INVALID_REQUEST);
+        assert_eq!(err.message, "Invalid JSON-RPC version");
+        let id = err.id.expect("invalid version must echo the id");
+        assert_eq!(id.raw, json!("req-9"));
+        assert_eq!(id.canonical.as_deref(), Some("string:req-9"));
+        assert_eq!(serde_json::to_string(&id).unwrap(), "\"req-9\"");
+    }
+
+    #[test]
+    fn frame_errors_echo_non_scalar_ids_like_go() {
+        // Go's version check runs before any RequestId validation and wraps
+        // baseMessage.ID unchanged, so an object id is echoed as-is.
+        let err = parse_error(r#"{"jsonrpc":"1.0","id":{"a":1}}"#);
+        let id = err.id.expect("invalid version must echo the id");
+        assert_eq!(id.raw, json!({"a":1}));
+        assert!(id.canonical.is_none());
+    }
+
+    #[test]
+    fn malformed_json_has_no_id_to_echo() {
+        for line in ["{", "not json", r#"{"jsonrpc":"2.0","id":1"#] {
+            let err = parse_error(line);
+            assert_eq!(err.code, PARSE_ERROR, "line={line}");
+            assert!(err.id.is_none(), "line={line}");
         }
     }
 

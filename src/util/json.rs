@@ -3,20 +3,31 @@
 // JSON numbers decode as f64 in Go (both in the before-call hook and in
 // notifications/cancelled), so mirror that by converting serde_json::Number to
 // f64 first. This also matches Go's loss of precision for integers past 2^53.
+//
+// Go's int64(f) conversion is implementation-defined outside [MinInt64, 2^63).
+// On amd64 2^63 wraps to MinInt64, so the equality check fails and Go emits the
+// float64 form; Rust's saturating cast would instead land on MaxInt64, whose
+// round-trip back to f64 is exactly 2^63 and would wrongly integralize. Gate the
+// conversion to the half-open range Go can represent, then require the
+// round-trip.
 #[allow(clippy::float_cmp)] // integral detection is an intentional exact compare
 pub fn canonical_request_id(v: &serde_json::Value) -> Option<String> {
+    const INT64_MIN_F64: f64 = -9_223_372_036_854_775_808.0;
+    const INT64_MAX_EXCLUSIVE_F64: f64 = 9_223_372_036_854_775_808.0;
+
     match v {
         serde_json::Value::String(s) => Some(format!("string:{s}")),
         serde_json::Value::Number(n) => {
             let f = n.as_f64()?;
-            let i = f as i64;
-            if f == i as f64 {
-                Some(format!("int64:{i}"))
-            } else {
-                // strconv.FormatFloat(v, 'f', -1, 64) matches Rust's f64
-                // Display: the shortest fixed-point decimal that round-trips.
-                Some(format!("float64:{f}"))
+            if (INT64_MIN_F64..INT64_MAX_EXCLUSIVE_F64).contains(&f) {
+                let i = f as i64;
+                if f == i as f64 {
+                    return Some(format!("int64:{i}"));
+                }
             }
+            // strconv.FormatFloat(v, 'f', -1, 64) matches Rust's f64
+            // Display: the shortest fixed-point decimal that round-trips.
+            Some(format!("float64:{f}"))
         }
         _ => None,
     }
@@ -149,6 +160,26 @@ mod tests {
             canonical_request_id(&v),
             Some("int64:9007199254740992".into())
         );
+    }
+
+    #[test]
+    fn canonical_request_id_matches_go_at_int64_boundaries() {
+        // Go's int64(f) conversion is implementation-defined outside
+        // [MinInt64, 2^63). On amd64 2^63 wraps to MinInt64, so the round-trip
+        // check fails and FormatFloat('f', -1, 64) prints the positional
+        // decimal form. Integralize only inside that half-open range.
+        let cases: &[(&str, &str)] = &[
+            ("9223372036854775808", "float64:9223372036854776000"), // 2^63
+            ("9223372036854777856", "float64:9223372036854778000"), // 2^63 + ulp
+            ("9223372036854773760", "int64:9223372036854773760"),   // 2^63 - ulp
+            ("9223372036854774784", "int64:9223372036854774784"),
+            ("-9223372036854775808", "int64:-9223372036854775808"), // MinInt64
+            ("-9223372036854777856", "float64:-9223372036854778000"), // MinInt64 - ulp
+        ];
+        for &(raw, want) in cases {
+            let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+            assert_eq!(canonical_request_id(&v).as_deref(), Some(want), "raw={raw}");
+        }
     }
 
     #[test]
