@@ -182,30 +182,97 @@ pub(crate) mod test_support {
 
     use rcgen::{
         BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose,
+        date_time_ymd,
     };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use rustls::{ClientConfig, ServerConfig};
 
+    /// A generated chain plus the trust anchor the tests inject.
+    ///
+    /// Every key is generated in-process for the test only; nothing here is a
+    /// committed key or a real credential.
     pub(crate) struct TestCert {
+        /// Trust anchor the tests install as an extra root.
         pub root: CertificateDer<'static>,
-        pub leaf: CertificateDer<'static>,
+        /// Chain served by the test server: leaf first, then intermediates.
+        pub chain: Vec<CertificateDer<'static>>,
+        /// Ephemeral, test-only PKCS#8 key for `chain[0]`.
         pub key: Vec<u8>,
+    }
+
+    fn ca_params(constraint: IsCa) -> CertificateParams {
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.is_ca = constraint;
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params
+    }
+
+    fn leaf_params(san: &str) -> CertificateParams {
+        CertificateParams::new(vec![san.to_string()]).unwrap()
     }
 
     /// A leaf certificate signed by a temporary root that the tests inject.
     pub(crate) fn ca_signed(san: &str) -> TestCert {
-        let ca_key = KeyPair::generate().unwrap();
-        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
-        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        let ca = CertifiedIssuer::self_signed(ca_params, ca_key).unwrap();
-
+        let ca = CertifiedIssuer::self_signed(
+            ca_params(IsCa::Ca(BasicConstraints::Unconstrained)),
+            KeyPair::generate().unwrap(),
+        )
+        .unwrap();
         let leaf_key = KeyPair::generate().unwrap();
-        let leaf_params = CertificateParams::new(vec![san.to_string()]).unwrap();
-        let leaf = leaf_params.signed_by(&leaf_key, &ca).unwrap();
+        let leaf = leaf_params(san).signed_by(&leaf_key, &ca).unwrap();
         TestCert {
             root: ca.der().clone(),
-            leaf: leaf.der().clone(),
+            chain: vec![leaf.der().clone()],
+            key: leaf_key.serialize_der(),
+        }
+    }
+
+    /// A root-signed leaf whose validity ended in 2020. Fixed dates keep the
+    /// case deterministic instead of depending on the wall clock.
+    pub(crate) fn expired_ca_signed(san: &str) -> TestCert {
+        let ca = CertifiedIssuer::self_signed(
+            ca_params(IsCa::Ca(BasicConstraints::Unconstrained)),
+            KeyPair::generate().unwrap(),
+        )
+        .unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let mut params = leaf_params(san);
+        params.not_before = date_time_ymd(2020, 1, 1);
+        params.not_after = date_time_ymd(2020, 1, 2);
+        let leaf = params.signed_by(&leaf_key, &ca).unwrap();
+        TestCert {
+            root: ca.der().clone(),
+            chain: vec![leaf.der().clone()],
+            key: leaf_key.serialize_der(),
+        }
+    }
+
+    /// A root -> intermediate -> leaf chain. `send_intermediate` controls
+    /// whether the server includes the intermediate, so the tests can prove the
+    /// intermediate is what makes the chain verifiable.
+    pub(crate) fn intermediate_chain(san: &str, send_intermediate: bool) -> TestCert {
+        let root = CertifiedIssuer::self_signed(
+            ca_params(IsCa::Ca(BasicConstraints::Unconstrained)),
+            KeyPair::generate().unwrap(),
+        )
+        .unwrap();
+        let intermediate = CertifiedIssuer::signed_by(
+            ca_params(IsCa::Ca(BasicConstraints::Constrained(0))),
+            KeyPair::generate().unwrap(),
+            &root,
+        )
+        .unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf = leaf_params(san)
+            .signed_by(&leaf_key, &intermediate)
+            .unwrap();
+        let mut chain = vec![leaf.der().clone()];
+        if send_intermediate {
+            chain.push(intermediate.der().clone());
+        }
+        TestCert {
+            root: root.der().clone(),
+            chain,
             key: leaf_key.serialize_der(),
         }
     }
@@ -213,11 +280,10 @@ pub(crate) mod test_support {
     /// A self-signed leaf that no trust store knows.
     pub(crate) fn self_signed(san: &str) -> TestCert {
         let key = KeyPair::generate().unwrap();
-        let params = CertificateParams::new(vec![san.to_string()]).unwrap();
-        let cert = params.self_signed(&key).unwrap();
+        let cert = leaf_params(san).self_signed(&key).unwrap();
         TestCert {
             root: cert.der().clone(),
-            leaf: cert.der().clone(),
+            chain: vec![cert.der().clone()],
             key: key.serialize_der(),
         }
     }
@@ -227,7 +293,7 @@ pub(crate) mod test_support {
         let config = ServerConfig::builder()
             .with_no_client_auth()
             .with_single_cert(
-                vec![cert.leaf.clone()],
+                cert.chain.clone(),
                 PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key.clone())),
             )
             .unwrap();
@@ -299,7 +365,10 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{ca_signed, connect, mentions_certificate, self_signed, serve};
+    use super::test_support::{
+        ca_signed, connect, expired_ca_signed, intermediate_chain, mentions_certificate,
+        self_signed, serve,
+    };
     use super::*;
 
     #[test]
@@ -379,6 +448,47 @@ mod tests {
     fn native_roots_are_loaded() {
         let roots = native_roots().expect("native roots");
         assert!(!roots.is_empty(), "no native root certificates were loaded");
+    }
+
+    #[test]
+    fn expired_certificate_is_rejected() {
+        let cert = expired_ca_signed("localhost");
+        let port = serve(&cert);
+        let config = client_config_with_extra_roots(std::slice::from_ref(&cert.root))
+            .expect("config with temporary root");
+        let err = connect(&config, port, "localhost").expect_err("expired certificate accepted");
+        assert!(
+            mentions_certificate(&err),
+            "expected a certificate rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn intermediate_chain_is_accepted() {
+        let cert = intermediate_chain("localhost", true);
+        let port = serve(&cert);
+        let config = client_config_with_extra_roots(std::slice::from_ref(&cert.root))
+            .expect("config with temporary root");
+        let body = connect(&config, port, "localhost").expect("intermediate chain rejected");
+        assert!(
+            body.ends_with(b"ok"),
+            "unexpected response body: {:?}",
+            String::from_utf8_lossy(&body)
+        );
+    }
+
+    #[test]
+    fn intermediate_chain_without_the_intermediate_is_rejected() {
+        let cert = intermediate_chain("localhost", false);
+        let port = serve(&cert);
+        let config = client_config_with_extra_roots(std::slice::from_ref(&cert.root))
+            .expect("config with temporary root");
+        let err = connect(&config, port, "localhost")
+            .expect_err("chain without the intermediate was accepted");
+        assert!(
+            mentions_certificate(&err),
+            "expected a certificate rejection, got: {err}"
+        );
     }
 
     #[test]

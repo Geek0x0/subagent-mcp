@@ -17,10 +17,21 @@
 //! #    the platform store (or supplied with --ca-file) must be accepted.
 //! cargo run --example tls_probe -- --enterprise-ca --expect accept
 //!
-//! # 4. An externally installed enterprise CA, against a real endpoint:
+//! # 4. Expired certificate: a root-signed leaf valid only in 2020 must be
+//! #    rejected even though its root is trusted.
+//! cargo run --example tls_probe -- --expired --expect reject
+//!
+//! # 5. Intermediate chain: the server sends leaf + intermediate and only the
+//! #    root is trusted; the chain must be accepted.
+//! cargo run --example tls_probe -- --intermediate-chain --expect accept
+//!
+//! # 6. An externally installed enterprise CA, against a real endpoint:
 //! cargo run --example tls_probe -- --url https://internal.example:8443 \
 //!     --ca-file /path/to/enterprise-root.pem --expect accept
 //! ```
+//!
+//! All local certificates and keys are generated in-process for the probe. They
+//! are test-only, ephemeral, and never written to disk or committed.
 //!
 //! Exit codes: `0` the observed decision matched `--expect`, `1` it did not,
 //! `2` the probe could not run (bad arguments, TLS config failure). The
@@ -37,7 +48,10 @@ use std::net::TcpListener;
 use std::sync::Arc;
 use std::time::Duration;
 
-use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose};
+use rcgen::{
+    BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose,
+    date_time_ymd,
+};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use subagent_mcp::provider::tls;
@@ -65,6 +79,8 @@ impl Expect {
 enum LocalServer {
     SelfSigned,
     EnterpriseCa,
+    Expired,
+    IntermediateChain,
 }
 
 struct Options {
@@ -131,20 +147,11 @@ async fn main() {
 async fn run(options: &Options) -> Result<(String, Decision), String> {
     let (url, mut extra_roots) = match options.local {
         None => (options.url.clone(), Vec::new()),
-        Some(LocalServer::SelfSigned) => {
-            let key = KeyPair::generate().map_err(|e| format!("generate key: {e}"))?;
-            let params = CertificateParams::new(vec![LOCAL_SAN.to_string()])
-                .map_err(|e| format!("certificate parameters: {e}"))?;
-            let cert = params
-                .self_signed(&key)
-                .map_err(|e| format!("self-signed certificate: {e}"))?;
-            let port = serve(cert.der().clone(), key.serialize_der())?;
-            (format!("https://{LOCAL_SAN}:{port}/"), Vec::new())
-        }
-        Some(LocalServer::EnterpriseCa) => {
-            let (root, leaf, key) = enterprise_ca()?;
-            let port = serve(leaf, key)?;
-            (format!("https://{LOCAL_SAN}:{port}/"), vec![root])
+        Some(mode) => {
+            let local = local_server(mode)?;
+            let port = serve(local.chain, local.key)?;
+            let extra = local.root.into_iter().collect();
+            (format!("https://{LOCAL_SAN}:{port}/"), extra)
         }
     };
     extra_roots.extend(options.extra_roots.iter().cloned());
@@ -174,38 +181,104 @@ async fn run(options: &Options) -> Result<(String, Decision), String> {
     Ok((url, decision))
 }
 
-/// A CA and a leaf signed by it. The CA is returned as a root the probe can
-/// trust; the leaf is served on loopback.
-fn enterprise_ca() -> Result<(CertificateDer<'static>, CertificateDer<'static>, Vec<u8>), String> {
-    let ca_key = KeyPair::generate().map_err(|e| format!("generate CA key: {e}"))?;
-    let mut ca_params =
+/// A generated chain plus the trust anchor the probe installs as an extra root.
+/// Every key is ephemeral and test-only.
+struct LocalCert {
+    root: Option<CertificateDer<'static>>,
+    chain: Vec<CertificateDer<'static>>,
+    key: Vec<u8>,
+}
+
+fn local_server(mode: LocalServer) -> Result<LocalCert, String> {
+    match mode {
+        LocalServer::SelfSigned => self_signed_local(),
+        LocalServer::EnterpriseCa => ca_signed_leaf(false),
+        LocalServer::Expired => ca_signed_leaf(true),
+        LocalServer::IntermediateChain => intermediate_chain_local(),
+    }
+}
+
+fn ca_params(constraint: IsCa) -> Result<CertificateParams, String> {
+    let mut params =
         CertificateParams::new(Vec::<String>::new()).map_err(|e| format!("CA parameters: {e}"))?;
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    let ca = CertifiedIssuer::self_signed(ca_params, ca_key)
-        .map_err(|e| format!("self-signed CA: {e}"))?;
+    params.is_ca = constraint;
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    Ok(params)
+}
+
+fn leaf_params() -> Result<CertificateParams, String> {
+    CertificateParams::new(vec![LOCAL_SAN.to_string()]).map_err(|e| format!("leaf parameters: {e}"))
+}
+
+fn self_signed_local() -> Result<LocalCert, String> {
+    let key = KeyPair::generate().map_err(|e| format!("generate key: {e}"))?;
+    let cert = leaf_params()?
+        .self_signed(&key)
+        .map_err(|e| format!("self-signed certificate: {e}"))?;
+    Ok(LocalCert {
+        root: None,
+        chain: vec![cert.der().clone()],
+        key: key.serialize_der(),
+    })
+}
+
+/// A leaf signed by a temporary root. `expired` fixes its validity to
+/// 2020-01-01..2020-01-02, which keeps the rejection case deterministic instead
+/// of depending on the wall clock.
+fn ca_signed_leaf(expired: bool) -> Result<LocalCert, String> {
+    let ca = CertifiedIssuer::self_signed(
+        ca_params(IsCa::Ca(BasicConstraints::Unconstrained))?,
+        KeyPair::generate().map_err(|e| format!("generate CA key: {e}"))?,
+    )
+    .map_err(|e| format!("self-signed CA: {e}"))?;
 
     let leaf_key = KeyPair::generate().map_err(|e| format!("generate leaf key: {e}"))?;
-    let leaf_params = CertificateParams::new(vec![LOCAL_SAN.to_string()])
-        .map_err(|e| format!("leaf parameters: {e}"))?;
-    let leaf = leaf_params
+    let mut params = leaf_params()?;
+    if expired {
+        params.not_before = date_time_ymd(2020, 1, 1);
+        params.not_after = date_time_ymd(2020, 1, 2);
+    }
+    let leaf = params
         .signed_by(&leaf_key, &ca)
         .map_err(|e| format!("sign leaf: {e}"))?;
-    Ok((
-        ca.der().clone(),
-        leaf.der().clone(),
-        leaf_key.serialize_der(),
-    ))
+    Ok(LocalCert {
+        root: Some(ca.der().clone()),
+        chain: vec![leaf.der().clone()],
+        key: leaf_key.serialize_der(),
+    })
+}
+
+/// root -> intermediate -> leaf. The server sends leaf + intermediate; the
+/// probe trusts only the root, so acceptance depends on the intermediate.
+fn intermediate_chain_local() -> Result<LocalCert, String> {
+    let root = CertifiedIssuer::self_signed(
+        ca_params(IsCa::Ca(BasicConstraints::Unconstrained))?,
+        KeyPair::generate().map_err(|e| format!("generate root key: {e}"))?,
+    )
+    .map_err(|e| format!("self-signed root: {e}"))?;
+    let intermediate = CertifiedIssuer::signed_by(
+        ca_params(IsCa::Ca(BasicConstraints::Constrained(0)))?,
+        KeyPair::generate().map_err(|e| format!("generate intermediate key: {e}"))?,
+        &root,
+    )
+    .map_err(|e| format!("sign intermediate: {e}"))?;
+
+    let leaf_key = KeyPair::generate().map_err(|e| format!("generate leaf key: {e}"))?;
+    let leaf = leaf_params()?
+        .signed_by(&leaf_key, &intermediate)
+        .map_err(|e| format!("sign leaf: {e}"))?;
+    Ok(LocalCert {
+        root: Some(root.der().clone()),
+        chain: vec![leaf.der().clone(), intermediate.der().clone()],
+        key: leaf_key.serialize_der(),
+    })
 }
 
 /// Serve one HTTP/1.1 response over TLS on a loopback port.
-fn serve(cert: CertificateDer<'static>, key: Vec<u8>) -> Result<u16, String> {
+fn serve(chain: Vec<CertificateDer<'static>>, key: Vec<u8>) -> Result<u16, String> {
     let config = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(
-            vec![cert],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)),
-        )
+        .with_single_cert(chain, PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key)))
         .map_err(|e| format!("server TLS config: {e}"))?;
     let listener = TcpListener::bind("127.0.0.1:0").map_err(|e| format!("bind: {e}"))?;
     let port = listener
@@ -346,6 +419,10 @@ impl Options {
                 }
                 "--self-signed" => set_local(&mut options, LocalServer::SelfSigned)?,
                 "--enterprise-ca" => set_local(&mut options, LocalServer::EnterpriseCa)?,
+                "--expired" => set_local(&mut options, LocalServer::Expired)?,
+                "--intermediate-chain" => {
+                    set_local(&mut options, LocalServer::IntermediateChain)?;
+                }
                 "--json" => options.json = true,
                 "-h" | "--help" => {
                     usage();
@@ -365,7 +442,11 @@ impl Options {
 
 fn set_local(options: &mut Options, local: LocalServer) -> Result<(), String> {
     if options.local.is_some() {
-        return Err("--self-signed and --enterprise-ca are mutually exclusive".to_string());
+        return Err(
+            "only one local server mode (--self-signed, --enterprise-ca, --expired, \
+             --intermediate-chain) may be selected"
+                .to_string(),
+        );
     }
     options.local = Some(local);
     Ok(())
@@ -393,7 +474,8 @@ fn load_pem_certificates(path: &str) -> Result<Vec<CertificateDer<'static>>, Str
 fn usage() {
     eprintln!(
         "usage: tls_probe [--url URL] [--expect accept|reject] [--ca-file PEM]...\n\
-         \x20                [--self-signed | --enterprise-ca] [--timeout SECONDS] [--json]\n\
+         \x20                [--self-signed | --enterprise-ca | --expired |\n\
+         \x20                 --intermediate-chain] [--timeout SECONDS] [--json]\n\
          \n\
          Connects with the crate's platform TLS configuration and reports whether the\n\
          verifier accepted the chain. Exit 0 when the decision matches --expect."

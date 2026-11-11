@@ -51,6 +51,10 @@ jobs:
             | tee tls-evidence/self-signed.txt
           cargo run --example tls_probe -- --enterprise-ca --expect accept 2>&1 \
             | tee tls-evidence/enterprise-ca-extra-root.txt
+          cargo run --example tls_probe -- --expired --expect reject 2>&1 \
+            | tee tls-evidence/expired-certificate.txt
+          cargo run --example tls_probe -- --intermediate-chain --expect accept 2>&1 \
+            | tee tls-evidence/intermediate-chain.txt
 
           work="$(mktemp -d)"
           openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/ca.key" -out "$work/ca.pem" \
@@ -92,6 +96,10 @@ jobs:
             | tee tls-evidence/self-signed.txt
           cargo run --example tls_probe -- --enterprise-ca --expect accept 2>&1 \
             | tee tls-evidence/enterprise-ca-extra-root.txt
+          cargo run --example tls_probe -- --expired --expect reject 2>&1 \
+            | tee tls-evidence/expired-certificate.txt
+          cargo run --example tls_probe -- --intermediate-chain --expect accept 2>&1 \
+            | tee tls-evidence/intermediate-chain.txt
 
           work="$(mktemp -d)"
           openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/ca.key" -out "$work/ca.pem" \
@@ -153,6 +161,8 @@ jobs:
           Invoke-Probe @("run", "--example", "tls_probe", "--", "--url", "https://example.com", "--expect", "accept") "tls-evidence/system-roots.txt"
           Invoke-Probe @("run", "--example", "tls_probe", "--", "--self-signed", "--expect", "reject") "tls-evidence/self-signed.txt"
           Invoke-Probe @("run", "--example", "tls_probe", "--", "--enterprise-ca", "--expect", "accept") "tls-evidence/enterprise-ca-extra-root.txt"
+          Invoke-Probe @("run", "--example", "tls_probe", "--", "--expired", "--expect", "reject") "tls-evidence/expired-certificate.txt"
+          Invoke-Probe @("run", "--example", "tls_probe", "--", "--intermediate-chain", "--expect", "accept") "tls-evidence/intermediate-chain.txt"
 
           $openssl = "C:\Program Files\Git\usr\bin\openssl.exe"
           if (-not (Test-Path $openssl)) { $openssl = (Get-Command openssl).Source }

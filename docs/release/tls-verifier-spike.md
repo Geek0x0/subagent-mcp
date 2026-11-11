@@ -35,7 +35,10 @@ Rules enforced by `client_config()`:
   HTTP/2 from the negotiated ALPN, so this preserves Go's HTTP/2-capable
   transport; without it the preconfigured TLS config would be HTTP/1.1 only.
 
-Dependency invariants (run in CI; both must fail to resolve):
+Dependency invariants. The enforcing check is the manifest unit test
+(`provider::tls::tests::manifest_uses_manual_roots_and_ring_without_bundled_roots`),
+run by `cargo test --all-targets` on every platform. The literal `cargo tree`
+commands exit non-zero precisely because the crates are absent:
 
 ```console
 $ cargo tree -i webpki-roots
@@ -69,22 +72,30 @@ OpenSSL 3.0.13 30 Jan 2024 (Library: OpenSSL 3.0.13 30 Jan 2024)
 
 ```console
 $ cargo test provider::tls
-running 8 tests
+running 11 tests
 test provider::tls::tests::backend_name_matches_the_platform ... ok
 test provider::tls::tests::client_config_builds_with_a_verifier ... ok
+test provider::tls::tests::expired_certificate_is_rejected ... ok
 test provider::tls::tests::hostname_mismatch_is_rejected ... ok
+test provider::tls::tests::intermediate_chain_is_accepted ... ok
+test provider::tls::tests::intermediate_chain_without_the_intermediate_is_rejected ... ok
 test provider::tls::tests::invalid_extra_root_fails_closed ... ok
 test provider::tls::tests::manifest_uses_manual_roots_and_ring_without_bundled_roots ... ok
 test provider::tls::tests::native_roots_are_loaded ... ok
 test provider::tls::tests::self_signed_certificate_is_rejected ... ok
 test provider::tls::tests::temporary_root_certificate_is_accepted ... ok
-test result: ok. 8 passed; 0 failed
+test result: ok. 11 passed; 0 failed
 ```
 
 The temporary-root test signs a leaf with a generated CA and trusts only that
-CA through `client_config_with_extra_roots`. The self-signed and
-hostname-mismatch tests use `client_config()` (system roots) and must fail with
-`invalid peer certificate: UnknownIssuer` / `NotValidForName`.
+CA through `client_config_with_extra_roots`. Only the self-signed test uses
+`client_config()` (system roots). The hostname-mismatch test also uses
+`client_config_with_extra_roots` (temporary CA), so it isolates the name check
+from root trust; it must fail with `NotValidForName`. The expired test uses the
+temporary CA with a leaf valid only in 2020 and must fail with
+`certificate expired`. The intermediate-chain tests use root -> intermediate ->
+leaf: acceptance when the server sends the intermediate, rejection when it does
+not, both with only the root injected as an extra root.
 `client_config_builds_with_a_verifier` pins the `h2`/`http/1.1` ALPN list, and
 `invalid_extra_root_fails_closed` proves a malformed extra root is an error, not
 a silently skipped root.
@@ -161,7 +172,37 @@ EXIT: 0
 
 (`HTTP/1.0` is `openssl s_server -www`, which does not offer HTTP/2.)
 
-### 2.6 Auto-selection client wiring
+### 2.6 Probe: expired certificate
+
+A root-signed leaf with fixed validity 2020-01-01..2020-01-02 (deterministic,
+not clock-dependent) must be rejected even though its root is trusted:
+
+```console
+$ cargo run --example tls_probe -- --expired --expect reject
+backend: native-roots+webpki
+url: https://127.0.0.1:37651/
+expect: reject
+decision: rejected
+detail: error sending request for url (https://127.0.0.1:37651/): client error (Connect): invalid peer certificate: certificate expired: verification time 1794425348 (UNIX), but certificate is not valid after 1577923200 (216502148 seconds ago)
+EXIT: 0
+```
+
+### 2.7 Probe: intermediate chain
+
+Root -> intermediate -> leaf. The server sends leaf + intermediate; only the
+root is injected as a trusted extra root, so acceptance depends on the
+intermediate:
+
+```console
+$ cargo run --example tls_probe -- --intermediate-chain --expect accept
+backend: native-roots+webpki
+url: https://127.0.0.1:34795/
+expect: accept
+decision: accepted (status 200, HTTP/1.1)
+EXIT: 0
+```
+
+### 2.8 Auto-selection client wiring
 
 `DecisionClient` tests prove reqwest actually receives the preconfigured TLS
 config:
@@ -186,6 +227,8 @@ $ cargo test provider::tls -- --nocapture
 $ cargo run --example tls_probe -- --url https://example.com --expect accept
 $ cargo run --example tls_probe -- --self-signed --expect reject
 $ cargo run --example tls_probe -- --enterprise-ca --expect accept
+$ cargo run --example tls_probe -- --expired --expect reject
+$ cargo run --example tls_probe -- --intermediate-chain --expect accept
 ```
 
 Enterprise CA in the System Keychain (admin required):
@@ -214,9 +257,10 @@ $ sudo security delete-certificate -c "TLS Probe Enterprise CA" \
 
 Record: macOS version (`sw_vers`), arch (`uname -m`), every command, and the
 full probe output. Expected: system-root accept, self-signed reject, extra-root
-accept, Keychain trust accept, Keychain deny reject. The decisive case is the
-Keychain one: it proves the platform verifier honors OS trust **and** distrust,
-which native-roots-only cannot do.
+accept, expired reject, intermediate-chain accept, Keychain trust accept,
+Keychain deny reject. The decisive case is the Keychain one: it proves the
+platform verifier honors OS trust **and** distrust, which native-roots-only
+cannot do.
 
 ## 4. Windows evidence — PENDING NATIVE EVIDENCE
 
@@ -230,6 +274,8 @@ cargo test provider::tls -- --nocapture
 cargo run --example tls_probe -- --url https://example.com --expect accept
 cargo run --example tls_probe -- --self-signed --expect reject
 cargo run --example tls_probe -- --enterprise-ca --expect accept
+cargo run --example tls_probe -- --expired --expect reject
+cargo run --example tls_probe -- --intermediate-chain --expect accept
 ```
 
 Enterprise CA in the machine store (Administrator):
@@ -263,9 +309,10 @@ certutil -delstore Disallowed "TLS Probe Enterprise CA"
 Record: `[System.Environment]::OSVersion`, `$PSVersionTable`, `uname -m` from
 Git Bash or `$env:PROCESSOR_ARCHITECTURE`, every command, and the full probe
 output. Expected: system-root accept, self-signed reject, extra-root accept,
-machine-store trust accept, `Disallowed` store reject. The decisive cases are
-the machine-store trust and the `Disallowed` distrust: they prove CryptoAPI/CNG
-policy is honored rather than a static root list.
+expired reject, intermediate-chain accept, machine-store trust accept,
+`Disallowed` store reject. The decisive cases are the machine-store trust and
+the `Disallowed` distrust: they prove CryptoAPI/CNG policy is honored rather
+than a static root list.
 
 ## 5. Gate decision
 
@@ -276,9 +323,10 @@ policy is honored rather than a static root list.
 - Windows: **PENDING NATIVE EVIDENCE**. Task 9 must not start until the commands
   in §4 are run and their output is appended here.
 - If either platform verifier cannot reproduce OS trust policy (for example the
-  enterprise-CA or distrusted-root case disagrees with the OS), record the
-  OS-native TLS stack fallback decision here **before** Task 9. Do not silently
-  fall back to webpki or native roots on macOS/Windows.
+  enterprise-CA, distrusted-root, expired-certificate, or intermediate-chain
+  case disagrees with the OS), record the OS-native TLS stack fallback decision
+  here **before** Task 9. Do not silently fall back to webpki or native roots on
+  macOS/Windows.
 
 The probes are automated in `.github/workflows/tls-probe.yml` (manual
 `workflow_dispatch`; it uploads each platform's evidence as an artifact). It has
@@ -289,10 +337,14 @@ artifacts into §3 and §4 and flip the status line.
 
 - `--ca-file` adds roots to platform trust; it does not install them in the OS
   store. The store cases in §3/§4 are the release gate.
-- Expired-certificate and intermediate-chain cases from design §8.1 are not
-  covered by this probe yet. They belong to the native TLS test suite
-  (design §8.1 item 4) and must be in place before the release gate, not just
-  before Task 9.
+- Expired-certificate and intermediate-chain cases are covered by the inline
+  tests and the `--expired` / `--intermediate-chain` probe modes on every
+  platform the workflow runs. The native runs are still **PENDING** (§3/§4), so
+  they are evidence to collect, not a passed gate.
+- The workflow currently runs one architecture per OS (`macos-latest` = arm64,
+  `windows-latest` = amd64). Design §8.5 additionally requires macOS amd64 and
+  Windows arm64 runtime TLS evidence for the release matrix; those runners must
+  be added before the release gate, not just before Task 9.
 - Error classification in the probe is heuristic (it looks for
   certificate/handshake text in the error chain). Every run prints the full
   error chain, so a misclassification is visible in the evidence.
