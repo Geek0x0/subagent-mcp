@@ -1,7 +1,10 @@
-//! Shell execution and managed-process cleanup.
+//! Shell execution, managed-process cleanup, and the file tools.
 
+pub mod files;
 pub mod process;
 pub mod shell;
+
+pub use files::{read_file_range, set_protected_files, set_scrubbed_env, write_file};
 
 #[cfg(unix)]
 pub mod process_unix;
