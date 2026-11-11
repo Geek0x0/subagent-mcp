@@ -1,0 +1,17 @@
+
+[providers.deepseek]
+api = "chat-completions"
+base_url = "https://api.deepseek.com"
+env_key = "DS_TEST_KEY"
+default_model = "deepseek-flash"
+models = [
+  { id = "deepseek-flash", description = "fast" },
+  { id = "deepseek-v4-pro" },
+]
+effort_map = { medium = "high", xhigh = "max" }
+
+[providers.anthropic]
+api = "messages"
+env_key = "ANT_TEST_KEY"
+default_model = "claude-sonnet-5"
+models = [{ id = "claude-sonnet-5" }]

@@ -1,0 +1,7 @@
+active_provider = "deepseek"
+
+[providers.deepseek]
+api = "chat-completions"
+env_key = "DS_TEST_KEY"
+default_model = "deepseek-flash"
+models = [{ id = "deepseek-flash" }]

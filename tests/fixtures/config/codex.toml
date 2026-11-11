@@ -1,0 +1,6 @@
+
+[providers.codex]
+api = "codex-app-server"
+default_model = "gpt-6-astra"
+models = [{ id = "gpt-6-astra" }]
+command = "/opt/codex/bin/codex"
