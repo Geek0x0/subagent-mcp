@@ -539,15 +539,49 @@ fn key_requires_private_file_mode() {
 // Default path
 // ---------------------------------------------------------------------------
 
+// These tests mutate process-wide environment variables; serialize them so
+// they cannot race with each other under the default parallel test runner.
+static DEFAULT_PATH_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct EnvGuard {
+    saved: Vec<(&'static str, Option<String>)>,
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl EnvGuard {
+    fn new(keys: &[&'static str]) -> Self {
+        let _lock = DEFAULT_PATH_ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let saved = keys
+            .iter()
+            .map(|&key| (key, std::env::var(key).ok()))
+            .collect();
+        EnvGuard { saved, _lock }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        for (key, value) in &self.saved {
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var(*key, v),
+                    None => std::env::remove_var(*key),
+                }
+            }
+        }
+    }
+}
+
+const ENV_KEYS: [&str; 3] = ["SUBAGENT_MCP_CONFIG", "HOME", "USERPROFILE"];
+
 #[test]
 fn default_path_from_env_and_home() {
-    // Only this test touches these variables; restore them afterwards so the
-    // rest of the binary (which never reads them) is unaffected.
-    let old_cfg = std::env::var("SUBAGENT_MCP_CONFIG").ok();
-    let old_home = std::env::var("HOME").ok();
-
+    let _guard = EnvGuard::new(&ENV_KEYS);
     unsafe {
         std::env::set_var("SUBAGENT_MCP_CONFIG", "/custom/config.toml");
+        std::env::set_var("HOME", "/home/test");
     }
     assert_eq!(
         config::default_path().unwrap(),
@@ -556,23 +590,61 @@ fn default_path_from_env_and_home() {
 
     unsafe {
         std::env::set_var("SUBAGENT_MCP_CONFIG", "");
-        std::env::set_var("HOME", "/home/test");
     }
     assert_eq!(
         config::default_path().unwrap(),
         PathBuf::from("/home/test/.config/subagent-mcp/config.toml")
     );
+}
 
+#[test]
+fn default_path_falls_back_to_userprofile() {
+    let _guard = EnvGuard::new(&ENV_KEYS);
     unsafe {
-        match old_cfg {
-            Some(v) => std::env::set_var("SUBAGENT_MCP_CONFIG", v),
-            None => std::env::remove_var("SUBAGENT_MCP_CONFIG"),
-        }
-        match old_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
+        std::env::remove_var("SUBAGENT_MCP_CONFIG");
+        std::env::remove_var("HOME");
+        std::env::set_var("USERPROFILE", "C:\\Users\\tester");
     }
+    let want = PathBuf::from("C:\\Users\\tester")
+        .join(".config")
+        .join("subagent-mcp")
+        .join("config.toml");
+    assert_eq!(config::default_path().unwrap(), want);
+}
+
+#[test]
+fn default_path_uses_platform_primary_home_var() {
+    let _guard = EnvGuard::new(&ENV_KEYS);
+    unsafe {
+        std::env::remove_var("SUBAGENT_MCP_CONFIG");
+        std::env::set_var("HOME", "/home/unix");
+        std::env::set_var("USERPROFILE", "C:\\Users\\win");
+    }
+    #[cfg(not(windows))]
+    let primary = "/home/unix";
+    #[cfg(windows)]
+    let primary = "C:\\Users\\win";
+    let want = PathBuf::from(primary)
+        .join(".config")
+        .join("subagent-mcp")
+        .join("config.toml");
+    assert_eq!(config::default_path().unwrap(), want);
+}
+
+#[test]
+fn default_path_error_when_no_home_var() {
+    let _guard = EnvGuard::new(&ENV_KEYS);
+    unsafe {
+        std::env::remove_var("SUBAGENT_MCP_CONFIG");
+        std::env::remove_var("HOME");
+        std::env::remove_var("USERPROFILE");
+    }
+    #[cfg(not(windows))]
+    let expected = "resolve home directory for the default config path: $HOME is not defined";
+    #[cfg(windows)]
+    let expected =
+        "resolve home directory for the default config path: %userprofile% is not defined";
+    assert_eq!(config::default_path().unwrap_err().to_string(), expected);
 }
 
 // ---------------------------------------------------------------------------
@@ -771,5 +843,221 @@ fn legacy_active_provider_fixture_is_rejected() {
         path.display()
     );
     assert_eq!(err, expected);
+    drop(dir);
+}
+
+// ---------------------------------------------------------------------------
+// Review fix 1: net/url.Parse parity (scheme case, port, escapes, control chars)
+// ---------------------------------------------------------------------------
+
+fn auto_with_url(u: &str) -> String {
+    with_auto(&format!(
+        "[auto]\nenv_key = \"KEY\"\nmodel = \"m\"\nurl = \"{u}\"\n"
+    ))
+}
+
+#[test]
+fn url_uppercase_scheme_is_accepted() {
+    // Go net/url.Parse lowercases the scheme, so uppercase HTTP(S) is valid.
+    for url in ["HTTPS://example.com/x", "HTTP://Example.COM/Path"] {
+        let (dir, path) = write_config(&auto_with_url(url));
+        assert!(
+            config::load(&path).is_ok(),
+            "uppercase scheme should be accepted: {url}"
+        );
+        drop(dir);
+    }
+    let (dir, path) = write_config(&with_auto(
+        "[auto]\nenv_key = \"KEY\"\nmodel = \"m\"\nbase_url = \"HTTPS://example.com\"\n",
+    ));
+    assert!(
+        config::load(&path).is_ok(),
+        "uppercase scheme base_url should be accepted"
+    );
+    drop(dir);
+}
+
+#[test]
+fn url_invalid_port_is_rejected() {
+    assert_load_err(&[
+        (
+            "invalid port",
+            auto_with_url("http://host:bad/path"),
+            r#"config file <PATH>: auto.url "http://host:bad/path" must be an absolute http or https URL"#,
+        ),
+        (
+            "invalid port trailing alpha",
+            auto_with_url("http://host:80a/path"),
+            r#"config file <PATH>: auto.url "http://host:80a/path" must be an absolute http or https URL"#,
+        ),
+        (
+            "multiple colons in host",
+            auto_with_url("http://host:80:90/x"),
+            r#"config file <PATH>: auto.url "http://host:80:90/x" must be an absolute http or https URL"#,
+        ),
+        (
+            "invalid port after userinfo",
+            auto_with_url("http://user:bad@example.com:80a/x"),
+            r#"config file <PATH>: auto.url "http://user:bad@example.com:80a/x" must be an absolute http or https URL"#,
+        ),
+    ]);
+}
+
+#[test]
+fn url_bad_percent_escape_is_rejected() {
+    assert_load_err(&[
+        (
+            "bad escape in path",
+            auto_with_url("http://example.com/%zz"),
+            r#"config file <PATH>: auto.url "http://example.com/%zz" must be an absolute http or https URL"#,
+        ),
+        (
+            "truncated escape",
+            auto_with_url("http://example.com/%"),
+            r#"config file <PATH>: auto.url "http://example.com/%" must be an absolute http or https URL"#,
+        ),
+        (
+            "bad escape in host",
+            auto_with_url("http://exa%zzmple.com/x"),
+            r#"config file <PATH>: auto.url "http://exa%zzmple.com/x" must be an absolute http or https URL"#,
+        ),
+    ]);
+}
+
+#[test]
+fn url_control_character_is_rejected() {
+    // A tab is legal inside a TOML basic string, but net/url.Parse rejects any
+    // ASCII control byte. Go's %q renders the tab as the two chars `\t`.
+    assert_load_err(&[(
+        "tab in path",
+        auto_with_url("http://example.com/a\tb"),
+        r#"config file <PATH>: auto.url "http://example.com/a\tb" must be an absolute http or https URL"#,
+    )]);
+}
+
+#[test]
+fn url_ipv6_bad_port_or_bracket_is_rejected() {
+    assert_load_err(&[
+        (
+            "ipv6 bad port",
+            auto_with_url("http://[::1]:bad/x"),
+            r#"config file <PATH>: auto.url "http://[::1]:bad/x" must be an absolute http or https URL"#,
+        ),
+        (
+            "ipv6 missing closing bracket",
+            auto_with_url("http://[::1/x"),
+            r#"config file <PATH>: auto.url "http://[::1/x" must be an absolute http or https URL"#,
+        ),
+    ]);
+}
+
+#[test]
+fn url_valid_ports_escapes_and_hosts_are_accepted() {
+    for url in [
+        "http://host:8080/path",
+        "http://example.com:/x",
+        "https://example.com/%20x",
+        "http://[::1]:8080/x",
+        "http://user:pass@example.com/x",
+        "http://example.com/a b",
+    ] {
+        let (dir, path) = write_config(&auto_with_url(url));
+        assert!(config::load(&path).is_ok(), "should accept: {url}");
+        drop(dir);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Review fix 2: go-toml unknown-key paths for AoT / nested / inline forms
+// ---------------------------------------------------------------------------
+
+const AOT_PROVIDER_HEAD: &str = r#"
+[providers.deepseek]
+api = "chat-completions"
+env_key = "DS_TEST_KEY"
+default_model = "m"
+"#;
+
+#[test]
+fn unknown_key_paths_match_go_toml() {
+    assert_load_err(&[
+        (
+            "AoT model unknown field includes models",
+            format!("{AOT_PROVIDER_HEAD}[[providers.deepseek.models]]\nid = \"m\"\nextra = 1\n"),
+            r#"config file <PATH>: unknown keys: providers.deepseek.models.extra"#,
+        ),
+        (
+            "AoT nested table header full path",
+            format!("{AOT_PROVIDER_HEAD}[[providers.deepseek.models]]\nid = \"m\"\n[providers.deepseek.models.sub]\nx = 1\n"),
+            r#"config file <PATH>: unknown keys: providers.deepseek.models.sub"#,
+        ),
+        (
+            "top-level nested header",
+            "[bogus.sub]\nx = 1\n".into(),
+            r#"config file <PATH>: unknown keys: bogus.sub"#,
+        ),
+        (
+            "deep top-level nested header",
+            "[a.b.c]\nx = 1\n".into(),
+            r#"config file <PATH>: unknown keys: a.b.c"#,
+        ),
+        (
+            "nested header under a provider",
+            format!("{AOT_PROVIDER_HEAD}models = [{{ id = \"m\" }}]\n[providers.deepseek.bogus.sub]\nx = 1\n"),
+            r#"config file <PATH>: unknown keys: providers.deepseek.bogus.sub"#,
+        ),
+        (
+            "nested header under auto",
+            with_auto("[auto.bogus.sub]\nx = 1\n"),
+            r#"config file <PATH>: unknown keys: auto.bogus.sub"#,
+        ),
+        (
+            "fully inline providers reports only the offending key",
+            "providers = { deepseek = { api = \"chat-completions\", env_key = \"K\", default_model = \"m\", models = [{ id = \"m\" }], extra = 1 } }\n".into(),
+            r#"config file <PATH>: unknown keys: extra"#,
+        ),
+        (
+            "fully inline nested table reports its key",
+            "providers = { deepseek = { api = \"chat-completions\", env_key = \"K\", default_model = \"m\", models = [{ id = \"m\" }], bogus = { extra = 1 } } }\n".into(),
+            r#"config file <PATH>: unknown keys: bogus"#,
+        ),
+        (
+            "inline provider under a table header",
+            "[providers]\ndeepseek = { api = \"chat-completions\", env_key = \"K\", default_model = \"m\", models = [{ id = \"m\" }], extra = 1 }\n".into(),
+            r#"config file <PATH>: unknown keys: providers.extra"#,
+        ),
+        (
+            "dotted top-level key",
+            "bogus.sub = 1\n".into(),
+            r#"config file <PATH>: unknown keys: bogus.sub"#,
+        ),
+        (
+            "two nested headers in document order",
+            "[zebra.sub]\nx = 1\n[typo.deep]\ny = 2\n".into(),
+            r#"config file <PATH>: unknown keys: zebra.sub, typo.deep"#,
+        ),
+        (
+            "plain provider unknown key (baseline)",
+            format!("{AOT_PROVIDER_HEAD}models = [{{ id = \"m\" }}]\nmodel = \"x\"\n"),
+            r#"config file <PATH>: unknown keys: providers.deepseek.model"#,
+        ),
+        (
+            "inline model entry drops models (baseline)",
+            format!("{AOT_PROVIDER_HEAD}models = [{{ id = \"m\", extra = 1 }}]\n"),
+            r#"config file <PATH>: unknown keys: providers.deepseek.extra"#,
+        ),
+    ]);
+}
+
+#[test]
+fn valid_aot_models_config_loads() {
+    let (dir, path) = write_config(&format!(
+        "{AOT_PROVIDER_HEAD}[[providers.deepseek.models]]\nid = \"m\"\ndescription = \"a model\"\n"
+    ));
+    let cfg = config::load(&path).unwrap();
+    let p = &cfg.providers["deepseek"];
+    assert_eq!(p.models.len(), 1);
+    assert_eq!(p.models[0].id, "m");
+    assert_eq!(p.models[0].description, "a model");
     drop(dir);
 }

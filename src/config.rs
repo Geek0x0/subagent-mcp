@@ -138,19 +138,141 @@ fn opt_str(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
 }
 
+/// Go `os.UserHomeDir` reads `%USERPROFILE%` on Windows and `$HOME` on Unix.
+/// Off Windows we additionally accept `USERPROFILE` as a fallback so a
+/// Windows-style environment resolves on any host (and is testable off
+/// Windows); on Windows only `USERPROFILE` is consulted, exactly like Go.
+#[cfg(windows)]
+const HOME_ENV_KEYS: [&str; 1] = ["USERPROFILE"];
+#[cfg(not(windows))]
+const HOME_ENV_KEYS: [&str; 2] = ["HOME", "USERPROFILE"];
+
+/// The exact `os.UserHomeDir` error text for the target platform.
+#[cfg(windows)]
+const HOME_ENV_ERROR: &str = "%userprofile% is not defined";
+#[cfg(not(windows))]
+const HOME_ENV_ERROR: &str = "$HOME is not defined";
+
 /// Return `$SUBAGENT_MCP_CONFIG` or `~/.config/subagent-mcp/config.toml`.
 pub fn default_path() -> Result<PathBuf, ConfigError> {
-    let configured = std::env::var("SUBAGENT_MCP_CONFIG").unwrap_or_default();
-    if !configured.is_empty() {
+    resolve_default_path(
+        |key| std::env::var(key).ok(),
+        &HOME_ENV_KEYS,
+        HOME_ENV_ERROR,
+    )
+}
+
+/// Pure core of `default_path`, parameterised over the environment so both the
+/// Windows and Unix var sets / error texts can be tested on any host.
+fn resolve_default_path(
+    getenv: impl Fn(&str) -> Option<String>,
+    home_keys: &[&str],
+    home_error: &str,
+) -> Result<PathBuf, ConfigError> {
+    if let Some(configured) = getenv("SUBAGENT_MCP_CONFIG").filter(|v| !v.is_empty()) {
         return Ok(PathBuf::from(configured));
     }
-    let home = std::env::var("HOME").map_err(|_| {
-        err("resolve home directory for the default config path: $HOME is not defined")
-    })?;
+    // Go's UserHomeDir treats an empty value as undefined.
+    let home = home_keys
+        .iter()
+        .find_map(|key| getenv(key).filter(|v| !v.is_empty()))
+        .ok_or_else(|| {
+            err(format!(
+                "resolve home directory for the default config path: {home_error}"
+            ))
+        })?;
     Ok(PathBuf::from(home)
         .join(".config")
         .join("subagent-mcp")
         .join("config.toml"))
+}
+
+#[cfg(test)]
+mod default_path_tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn fake_env(entries: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let map: HashMap<String, String> = entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        move |key| map.get(key).cloned()
+    }
+
+    // Go on Windows: %USERPROFILE% resolves home (verified against Go's
+    // os.UserHomeDir source, os/file.go, and the default-path integration
+    // tests). These inline tests exercise that branch on a Linux test host.
+    #[test]
+    fn windows_style_home_resolves_via_userprofile() {
+        let got = resolve_default_path(
+            fake_env(&[("USERPROFILE", "C:\\Users\\tester")]),
+            &["USERPROFILE"],
+            "%userprofile% is not defined",
+        )
+        .unwrap();
+        assert_eq!(
+            got,
+            PathBuf::from("C:\\Users\\tester")
+                .join(".config")
+                .join("subagent-mcp")
+                .join("config.toml")
+        );
+    }
+
+    #[test]
+    fn windows_style_error_text_is_go_exact() {
+        let err = resolve_default_path(
+            fake_env(&[]),
+            &["USERPROFILE"],
+            "%userprofile% is not defined",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "resolve home directory for the default config path: %userprofile% is not defined"
+        );
+    }
+
+    #[test]
+    fn unix_style_error_text_is_go_exact() {
+        let err =
+            resolve_default_path(fake_env(&[]), &["HOME"], "$HOME is not defined").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "resolve home directory for the default config path: $HOME is not defined"
+        );
+    }
+
+    #[test]
+    fn subagent_mcp_config_wins_over_home() {
+        let got = resolve_default_path(
+            fake_env(&[
+                ("SUBAGENT_MCP_CONFIG", "/custom/config.toml"),
+                ("HOME", "/home/test"),
+            ]),
+            &["HOME"],
+            "$HOME is not defined",
+        )
+        .unwrap();
+        assert_eq!(got, PathBuf::from("/custom/config.toml"));
+    }
+
+    #[test]
+    fn empty_home_var_is_treated_as_unset() {
+        // A Unix host with HOME empty falls back to USERPROFILE; when that is
+        // empty too, Go's Unix error text is produced.
+        let err = resolve_default_path(
+            fake_env(&[("HOME", ""), ("SUBAGENT_MCP_CONFIG", "")]),
+            &["HOME", "USERPROFILE"],
+            "$HOME is not defined",
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "resolve home directory for the default config path: $HOME is not defined"
+        );
+    }
 }
 
 // --- Load ------------------------------------------------------------------
@@ -313,70 +435,157 @@ fn item_type_err(path: &Path, data: &str, item: &Item, field: &str, expected: &s
 }
 
 // --- Strict unknown-key walk -----------------------------------------------
+//
+// go-toml's strict decoder keeps a "current key" that is reset to the full
+// dotted path of each `[table]` / `[[array-table]]` header (EnterTable). An
+// unknown key-value reports that header prefix plus the key's own path
+// (MissingField); an unknown table header reports its full path (MissingTable).
+// Inline tables (and inline arrays) are transparent: assignInlineTable builds a
+// fresh path from each element's own keys, so intermediate inline keys never
+// enter the prefix and an unknown field inside one is reported as
+// `header-prefix + offending-key`.
+//
+// `toml_edit` distinguishes the shapes: `Item::Table` / `Item::ArrayOfTables`
+// come from headers (contribute to the prefix), while `Value::InlineTable` /
+// `Value::Array` are inline (transparent). `Table::position().is_some()` marks
+// an explicit header, which is where a MissingTable path stops.
 
 fn collect_unknown(doc: &Document<String>) -> Vec<String> {
     let mut out = Vec::new();
-    let root = doc.as_table();
-    for (key, item) in root.iter() {
+    let prefix: Vec<String> = Vec::new();
+    for (key, item) in doc.as_table().iter() {
         match key {
-            "providers" => {
-                if let Some(t) = item.as_table_like() {
-                    for (pname, pitem) in t.iter() {
-                        if let Some(pt) = pitem.as_table_like() {
-                            for (pkey, pval) in pt.iter() {
-                                match pkey {
-                                    // effort_map and extra_body have dynamic
-                                    // keys and are never walked for unknowns.
-                                    "api" | "base_url" | "env_key" | "key" | "command"
-                                    | "default_model" | "max_output_tokens" | "max_nudges"
-                                    | "effort_map" | "extra_body" => {}
-                                    "models" => collect_model_unknown(pname, pval, &mut out),
-                                    _ => out.push(format!("providers.{pname}.{pkey}")),
-                                }
-                            }
-                        }
-                        // A provider whose value is not a table is a type error,
-                        // reported by extract() below.
-                    }
-                }
-            }
-            "auto" => {
-                if let Some(t) = item.as_table_like() {
-                    for (akey, _) in t.iter() {
-                        match akey {
-                            "base_url" | "url" | "env_key" | "key" | "model"
-                            | "timeout_seconds" => {}
-                            _ => out.push(format!("auto.{akey}")),
-                        }
-                    }
-                }
-            }
-            _ => out.push(key.to_string()),
+            "providers" => walk_providers(item, &prefix, &mut out),
+            "auto" => walk_auto(item, &prefix, &mut out),
+            _ => report_unknown(key, item, &prefix, &mut out),
         }
     }
     out
 }
 
-/// go-toml reports an unknown key inside an inline-table model entry at the
-/// parent provider level (`providers.<name>.<key>`), dropping the `models`
-/// segment and the array index. Mirrors that quirk.
-fn collect_model_unknown(pname: &str, item: &Item, out: &mut Vec<String>) {
-    if let Some(arr) = item.as_array() {
-        for elem in arr.iter() {
-            if let Some(it) = elem.as_inline_table() {
-                for (k, _) in it.iter() {
-                    if k != "id" && k != "description" {
-                        out.push(format!("providers.{pname}.{k}"));
-                    }
+fn with_key(prefix: &[String], key: &str) -> Vec<String> {
+    let mut path = prefix.to_vec();
+    path.push(key.to_string());
+    path
+}
+
+/// Report an unknown key with go-toml's key path. A table-header value is
+/// reported with its full (possibly nested) header path; a scalar, inline table
+/// or inline array is reported as `prefix + key` only (go-toml does not descend
+/// into the value of an unknown field).
+fn report_unknown(key: &str, item: &Item, prefix: &[String], out: &mut Vec<String>) {
+    let path = with_key(prefix, key);
+    match item {
+        Item::Table(t) => push_table_paths(t, path, out),
+        _ => out.push(path.join(".")),
+    }
+}
+
+/// Descend the implicit/dotted table chain of a table-header value, emitting a
+/// path for every explicit header or dotted leaf it ends in.
+fn push_table_paths(t: &toml_edit::Table, path: Vec<String>, out: &mut Vec<String>) {
+    if t.position().is_some() {
+        // An explicit `[header]`: go-toml's EnterTable stopped here.
+        out.push(path.join("."));
+        return;
+    }
+    let mut children = 0;
+    for (k, child) in t.iter() {
+        children += 1;
+        let child_path = with_key(&path, k);
+        match child {
+            Item::Table(ct) => push_table_paths(ct, child_path, out),
+            // An array table is itself a header; a dotted-key leaf ends the
+            // dotted path. Both report the child path as-is.
+            _ => out.push(child_path.join(".")),
+        }
+    }
+    if children == 0 {
+        out.push(path.join("."));
+    }
+}
+
+/// The `providers` value. A real table header contributes `providers` to the
+/// prefix; an inline `providers = { ... }` does not.
+fn walk_providers(item: &Item, prefix: &[String], out: &mut Vec<String>) {
+    let is_table = matches!(item, Item::Table(_));
+    if let Some(t) = item.as_table_like() {
+        let p = if is_table {
+            with_key(prefix, "providers")
+        } else {
+            prefix.to_vec()
+        };
+        for (name, pval) in t.iter() {
+            if let Some(pt) = pval.as_table_like() {
+                let p2 = if matches!(pval, Item::Table(_)) {
+                    with_key(&p, name)
+                } else {
+                    p.clone()
+                };
+                walk_provider(pt, &p2, out);
+            }
+            // A non-table provider value is a type error reported by extract().
+        }
+    }
+}
+
+fn walk_provider(t: &dyn TableLike, prefix: &[String], out: &mut Vec<String>) {
+    for (key, item) in t.iter() {
+        match key {
+            // effort_map and extra_body have dynamic keys; never walked.
+            "api" | "base_url" | "env_key" | "key" | "command" | "default_model"
+            | "max_output_tokens" | "max_nudges" | "effort_map" | "extra_body" => {}
+            "models" => walk_models(item, prefix, out),
+            _ => report_unknown(key, item, prefix, out),
+        }
+    }
+}
+
+fn walk_models(item: &Item, prefix: &[String], out: &mut Vec<String>) {
+    match item {
+        // Inline array of inline tables: transparent, so `models` is not in
+        // the path (go-toml rebuilds it from each element's own keys).
+        Item::Value(v) if v.as_array().is_some() => {
+            for elem in v.as_array().unwrap().iter() {
+                if let Some(it) = elem.as_inline_table() {
+                    let tl: &dyn TableLike = it;
+                    walk_model(tl, prefix, out);
                 }
             }
         }
-    } else if let Some(aot) = item.as_array_of_tables() {
-        for t in aot.iter() {
-            for (k, _) in t.iter() {
-                if k != "id" && k != "description" {
-                    out.push(format!("providers.{pname}.{k}"));
-                }
+        // `[[...models]]`: the array-table name IS part of the header path.
+        Item::ArrayOfTables(aot) => {
+            let p = with_key(prefix, "models");
+            for t in aot.iter() {
+                let tl: &dyn TableLike = t;
+                walk_model(tl, &p, out);
+            }
+        }
+        _ => {} // wrong type: type error reported by extract()
+    }
+}
+
+fn walk_model(t: &dyn TableLike, prefix: &[String], out: &mut Vec<String>) {
+    for (key, item) in t.iter() {
+        match key {
+            "id" | "description" => {}
+            _ => report_unknown(key, item, prefix, out),
+        }
+    }
+}
+
+fn walk_auto(item: &Item, prefix: &[String], out: &mut Vec<String>) {
+    let is_table = matches!(item, Item::Table(_));
+    if let Some(t) = item.as_table_like() {
+        let p = if is_table {
+            with_key(prefix, "auto")
+        } else {
+            prefix.to_vec()
+        };
+        for (key, aitem) in t.iter() {
+            match key {
+                "base_url" | "url" | "env_key" | "key" | "model" | "timeout_seconds" => {}
+                _ => report_unknown(key, aitem, &p, out),
             }
         }
     }
@@ -920,8 +1129,19 @@ fn validate_auto(a: &RawAuto) -> Result<(), String> {
 /// Subset of Go `net/url.Parse` used by config validation: an absolute http or
 /// https URL with a non-empty host and no query (RawQuery/ForceQuery) or
 /// fragment. No `url` crate dependency is available, so this parses the shape
-/// directly.
+/// directly, mirroring the `url.Parse` checks that can reject a config URL:
+/// control bytes, invalid `%` escapes, the scheme (lowercased), the optional
+/// port, and IPv6 brackets.
 fn valid_http_url(endpoint: &str) -> bool {
+    // Go: stringContainsCTLByte rejects any byte < 0x20 or == 0x7f anywhere.
+    // (A tab is legal in a TOML basic string but not in a URL.)
+    if endpoint.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        return false;
+    }
+    // Go: unescape() rejects any '%' not followed by two hex digits.
+    if !valid_percent_escapes(endpoint) {
+        return false;
+    }
     let Some(colon) = endpoint.find(':') else {
         return false;
     };
@@ -934,6 +1154,8 @@ fn valid_http_url(endpoint: &str) -> bool {
     {
         return false;
     }
+    // Go: url.Scheme = strings.ToLower(url.Scheme) before comparing.
+    let scheme = scheme.to_ascii_lowercase();
     if scheme != "http" && scheme != "https" {
         return false;
     }
@@ -941,8 +1163,17 @@ fn valid_http_url(endpoint: &str) -> bool {
         return false; // opaque URL: Host is empty
     };
     let auth_end = after.find(['/', '?', '#']).unwrap_or(after.len());
-    if auth_end == 0 {
+    let authority = &after[..auth_end];
+    // Go: parseAuthority splits userinfo at the last '@' before parseHost.
+    let hostport = match authority.rfind('@') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    if hostport.is_empty() {
         return false; // u.Host == ""
+    }
+    if !valid_host_port(hostport) {
+        return false;
     }
     let tail = &after[auth_end..];
     let (before_frag, fragment) = match tail.split_once('#') {
@@ -956,6 +1187,55 @@ fn valid_http_url(endpoint: &str) -> bool {
         return false; // u.Fragment != ""
     }
     true
+}
+
+/// Every '%' must be followed by two hex digits (Go's `unescape`).
+fn valid_percent_escapes(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            if i + 2 >= b.len() || !b[i + 1].is_ascii_hexdigit() || !b[i + 2].is_ascii_hexdigit() {
+                return false;
+            }
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    true
+}
+
+/// Go's `validOptionalPort`: empty, or a ':' followed by digits only.
+fn valid_optional_port(port: &str) -> bool {
+    let Some(digits) = port.strip_prefix(':') else {
+        return port.is_empty();
+    };
+    digits.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Go's `parseHost` port/bracket validation (enough for the config's needs).
+fn valid_host_port(hostport: &str) -> bool {
+    if let Some(rest) = hostport.strip_prefix('[') {
+        // IPv6 IP-literal; Go also validates the address with netip.ParseAddr.
+        let Some(close) = rest.find(']') else {
+            return false; // missing ']'
+        };
+        let inner = &rest[..close];
+        if inner.is_empty()
+            || !inner
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() || matches!(b, b':' | b'.' | b'%'))
+        {
+            return false;
+        }
+        return valid_optional_port(&rest[close + 1..]);
+    }
+    // For http/https Go uses the FIRST colon, so multiple colons are rejected.
+    match hostport.find(':') {
+        Some(i) => valid_optional_port(&hostport[i..]),
+        None => true,
+    }
 }
 
 // --- Raw -> public mapping -------------------------------------------------
