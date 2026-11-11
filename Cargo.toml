@@ -61,7 +61,14 @@ rustix = "1"
 landlock = "0.4"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = "0.61"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }

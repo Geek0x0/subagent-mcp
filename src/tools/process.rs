@@ -10,13 +10,15 @@
 //! the kept bytes during draining (never buffering unbounded output) and counts
 //! every byte seen so the exact Go truncation marker can be produced. The final
 //! capped/marked bytes are returned in `Output.stdout` (with `Output.stderr`
-//! empty) — Task 18 must keep this contract when it replaces the Windows backend.
+//! empty); the Windows `CreateProcessW` backend (Task 18) keeps this contract.
 
 use crate::tools::shell::MAX_OUTPUT_BYTES;
 use std::ffi::OsString;
 use std::io;
 use std::path::PathBuf;
-use std::process::{Command, Output, Stdio};
+#[cfg(unix)]
+use std::process::Command;
+use std::process::{Output, Stdio};
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
@@ -98,7 +100,8 @@ pub(crate) fn cancelled_error(output: Vec<u8>) -> io::Error {
 }
 
 /// True when `run_managed_command` had to kill a still-running direct child.
-pub(crate) fn is_cancelled(err: &io::Error) -> bool {
+/// Public so the Windows integration tests can identify the killed path.
+pub fn is_cancelled(err: &io::Error) -> bool {
     err.kind() == io::ErrorKind::Interrupted
         && err
             .get_ref()
@@ -106,16 +109,21 @@ pub(crate) fn is_cancelled(err: &io::Error) -> bool {
             .is_some()
 }
 
-/// Recover the captured output bytes from a cancellation error.
-pub(crate) fn cancelled_output(err: &io::Error) -> Vec<u8> {
+/// Recover the captured output bytes from a cancellation error. Public so the
+/// Windows integration tests can assert output preservation on the killed path.
+pub fn cancelled_output(err: &io::Error) -> Vec<u8> {
     err.get_ref()
         .and_then(|e| e.downcast_ref::<Cancelled>())
         .map(|c| c.output.clone())
         .unwrap_or_default()
 }
 
-/// Build a `std::process::Command` from a `CommandSpec`. Platform-neutral; the
-/// platform backends add process-group / job-object handling before spawn.
+/// Build a `std::process::Command` from a `CommandSpec` for the Unix backend,
+/// which adds process-group handling before spawn. The Windows backend (Task 18)
+/// uses `CreateProcessW` directly and does not use `std::process::Command`, so
+/// this helper is Unix-only; keeping it unconditional would be dead code on
+/// Windows and fail `clippy -D warnings` there.
+#[cfg(unix)]
 pub(crate) fn build_command(spec: CommandSpec) -> Command {
     let mut command = Command::new(spec.program);
     command.args(spec.args);
@@ -132,8 +140,8 @@ pub(crate) fn build_command(spec: CommandSpec) -> Command {
     command
 }
 
-/// Dispatch to the platform backend. Task 18 replaces the temporary Windows
-/// backend with the suspended-start `CreateProcessW` / Job Object path.
+/// Dispatch to the platform backend. Unix uses a process group; Windows uses
+/// the `CreateProcessW` suspended-start / Job Object / resume path.
 #[cfg(unix)]
 pub fn run_managed_command(
     spec: CommandSpec,
@@ -143,6 +151,12 @@ pub fn run_managed_command(
     crate::tools::process_unix::run_managed_command(spec, cancel, wait_delay)
 }
 
+/// **Differential allowlist entry.** The Windows backend is the single
+/// intentional security-strengthening deviation from Go (design §5.6/§8.2): Go
+/// starts the child then assigns it to a Job Object, leaving a window in which a
+/// descendant can escape; Rust creates the job first, starts the child suspended,
+/// assigns it, then resumes. The differential suite allowlists this difference;
+/// do not report it as an unexplained Go-vs-Rust diff.
 #[cfg(windows)]
 pub fn run_managed_command(
     spec: CommandSpec,
