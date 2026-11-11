@@ -1,6 +1,10 @@
 use crate::util::run::RunContext;
 
 pub struct ApprovalRequest {
+    /// The thread that requested approval. Go's `Server.Approve` takes this as
+    /// a separate argument; the Rust `Approver` trait carries it on the request
+    /// so the elicitation message can name the thread.
+    pub thread_id: String,
     pub tool: String,
     pub command: Option<String>,
     pub path: Option<String>,
@@ -33,6 +37,7 @@ mod tests {
             deadline: None,
         };
         let req = ApprovalRequest {
+            thread_id: "thread-1".into(),
             tool: "shell".into(),
             command: Some("ls".into()),
             path: None,
@@ -40,6 +45,7 @@ mod tests {
         };
         assert!(Always(true).approve(&ctx, req).await);
         let req2 = ApprovalRequest {
+            thread_id: "thread-1".into(),
             tool: "write_file".into(),
             command: None,
             path: Some("a.txt".into()),

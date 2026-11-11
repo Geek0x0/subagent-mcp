@@ -3,16 +3,22 @@
 //! were captured from the Go 0.13.1 binary (mcp-go v0.44.0) before cutover and
 //! are the source of truth for the wire shape.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use subagent_mcp::mcp::approval::{ElicitationApprover, request_approval, sanitize_approval_field};
+use subagent_mcp::mcp::jsonrpc::{RequestId, Response, RpcError};
+use subagent_mcp::mcp::progress::ProgressSink;
 use subagent_mcp::mcp::server::{
     CallContext, McpError, McpServer, ToolDefinition, ToolError, ToolHandler,
 };
+use subagent_mcp::util::approval::{ApprovalRequest, Approver};
+use subagent_mcp::util::run::RunContext;
 use tokio::sync::{Notify, mpsc};
 use tokio::time::timeout;
+use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
 struct RecordedCall {
@@ -144,6 +150,13 @@ impl ToolHandler for FakeHandler {
                 output_schema: Value::Null,
                 annotations: None,
             },
+            ToolDefinition {
+                name: "emit".into(),
+                description: "emits progress events".into(),
+                input_schema: json!({"type": "object"}),
+                output_schema: Value::Null,
+                annotations: None,
+            },
         ]
     }
 
@@ -178,6 +191,23 @@ impl ToolHandler for FakeHandler {
             "inline" => {
                 self.inner.inline_release.notified().await;
                 Ok(json!({"ok": true}))
+            }
+            "emit" => {
+                let thread_id = args
+                    .get("threadId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("thread");
+                let events = args
+                    .get("events")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(progress) = ctx.progress.as_ref() {
+                    for event in &events {
+                        progress.emit(thread_id, event);
+                    }
+                }
+                Ok(json!({"emitted": events.len()}))
             }
             "queued" => Ok(json!({"ok": true})),
             other => Ok(json!({"name": other, "args": args})),
@@ -813,4 +843,541 @@ async fn close_cancels_active_calls_within_the_deadline() {
     .expect("close should return within its deadline");
     let response = server.recv().await;
     assert_eq!(response["result"]["cancelled"], true);
+}
+
+fn run_context() -> RunContext {
+    RunContext {
+        cancel: CancellationToken::new(),
+        deadline: None,
+    }
+}
+
+fn approval_request() -> ApprovalRequest {
+    ApprovalRequest {
+        thread_id: "thread-1".into(),
+        tool: "shell".into(),
+        command: Some("echo hello".into()),
+        path: None,
+        reason: "test approval".into(),
+    }
+}
+
+fn elicitation_response(id: Value, result: Value) -> Response {
+    Response {
+        id: RequestId::new(id),
+        result: Some(result),
+        error: None,
+    }
+}
+
+async fn elicit(
+    approver: &ElicitationApprover,
+    rx: &mut mpsc::Receiver<String>,
+    ctx: &RunContext,
+    req: ApprovalRequest,
+    response: Response,
+) -> (Value, bool) {
+    let fut = approver.approve(ctx, req);
+    tokio::pin!(fut);
+    let frame = tokio::select! {
+        frame = rx.recv() => frame.expect("approval should send an elicitation request"),
+        decision = &mut fut => panic!("approval resolved before the client answered: {decision}"),
+    };
+    let request: Value =
+        serde_json::from_str(&frame).expect("elicitation request should be valid JSON");
+    assert!(
+        approver.handle_response(&response).await,
+        "the response should match a pending elicitation"
+    );
+    (request, fut.await)
+}
+
+async fn collect_until_response(server: &mut Harness, id: i64) -> Vec<Value> {
+    let mut frames = Vec::new();
+    loop {
+        let frame = server.recv().await;
+        let done = frame["id"] == id;
+        frames.push(frame);
+        if done {
+            return frames;
+        }
+    }
+}
+
+async fn next_frame(rx: &mut mpsc::Receiver<String>) -> Value {
+    let line = timeout(Duration::from_secs(2), rx.recv())
+        .await
+        .expect("a notification frame should arrive")
+        .expect("the output channel should stay open");
+    serde_json::from_str(&line).expect("frame should be JSON")
+}
+
+#[tokio::test]
+async fn progress_emit_sends_event_and_maps_summaries() {
+    let (tx, mut rx) = mpsc::channel(32);
+    let sink = ProgressSink::new(Some(json!("tok-1")), tx, Arc::new(AtomicU64::new(0)));
+
+    let events = [
+        json!({"type": "task_started"}),
+        json!({"type": "exec_command_begin", "command": "echo hi"}),
+        json!({"type": "exec_command_begin", "paths": ["a.txt", "b.txt"]}),
+        json!({"type": "exec_command_begin", "tool": "read_file", "path": "x"}),
+        json!({"type": "agent_message", "message": "line one\nline two"}),
+        json!({"type": "task_complete"}),
+        json!({"type": "error", "message": "boom"}),
+        json!({"type": "provider_request"}),
+    ];
+    for event in &events {
+        sink.emit("thread-1", event);
+    }
+
+    let mut frames = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        frames.push(serde_json::from_str::<Value>(&line).expect("frame should be JSON"));
+    }
+
+    let event_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["method"] == "subagent/event")
+        .collect();
+    assert_eq!(event_frames.len(), events.len());
+    for (frame, event) in event_frames.iter().zip(events.iter()) {
+        assert_eq!(frame["params"]["threadId"], "thread-1");
+        assert_eq!(frame["params"]["msg"], *event);
+    }
+
+    let progress_frames: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["method"] == "notifications/progress")
+        .collect();
+    let want = [
+        "started",
+        "shell: echo hi",
+        "apply_patch: a.txt, b.txt",
+        "read_file: x",
+        "agent: line one",
+        "completed",
+        "error: boom",
+    ];
+    assert_eq!(progress_frames.len(), want.len());
+    for (index, frame) in progress_frames.iter().enumerate() {
+        assert_eq!(frame["params"]["progressToken"], "tok-1");
+        assert_eq!(frame["params"]["message"], want[index]);
+        assert_eq!(
+            frame["params"]["progress"].as_f64(),
+            Some((index + 1) as f64)
+        );
+        assert!(frame["params"].get("total").is_none());
+    }
+}
+
+#[tokio::test]
+async fn progress_summary_caps_at_200_runes_with_ellipsis() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let sink = ProgressSink::new(Some(json!(7)), tx, Arc::new(AtomicU64::new(0)));
+    sink.emit(
+        "thread",
+        &json!({"type": "exec_command_begin", "command": "é".repeat(300)}),
+    );
+
+    let _event = next_frame(&mut rx).await;
+    let frame = next_frame(&mut rx).await;
+    let message = frame["params"]["message"].as_str().unwrap();
+    assert_eq!(message.chars().count(), 201);
+    assert!(message.ends_with('…'));
+    assert!(message.starts_with("shell: "));
+    assert_eq!(message.trim_end_matches('…').chars().count(), 200);
+}
+
+#[tokio::test]
+async fn progress_notifications_are_per_call() {
+    let (tx, mut rx) = mpsc::channel(16);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let first = ProgressSink::new(Some(json!("tok-a")), tx.clone(), dropped.clone());
+    let second = ProgressSink::new(Some(json!("tok-b")), tx, dropped);
+
+    first.emit("thread-a", &json!({"type": "task_started"}));
+    second.emit("thread-b", &json!({"type": "task_started"}));
+    first.emit("thread-a", &json!({"type": "task_complete"}));
+
+    let mut progress = Vec::new();
+    while let Ok(line) = rx.try_recv() {
+        let frame: Value = serde_json::from_str(&line).unwrap();
+        if frame["method"] == "notifications/progress" {
+            progress.push(frame);
+        }
+    }
+    assert_eq!(progress.len(), 3);
+    assert_eq!(progress[0]["params"]["progressToken"], "tok-a");
+    assert_eq!(progress[0]["params"]["progress"].as_f64(), Some(1.0));
+    assert_eq!(progress[1]["params"]["progressToken"], "tok-b");
+    assert_eq!(progress[1]["params"]["progress"].as_f64(), Some(1.0));
+    assert_eq!(progress[2]["params"]["progressToken"], "tok-a");
+    assert_eq!(progress[2]["params"]["progress"].as_f64(), Some(2.0));
+}
+
+#[tokio::test]
+async fn progress_without_a_token_still_emits_events() {
+    let (tx, mut rx) = mpsc::channel(4);
+    let sink = ProgressSink::new(None, tx, Arc::new(AtomicU64::new(0)));
+    sink.emit("thread", &json!({"type": "task_started"}));
+
+    let frame = next_frame(&mut rx).await;
+    assert_eq!(frame["method"], "subagent/event");
+    assert_eq!(frame["params"]["msg"]["type"], "task_started");
+    assert!(
+        rx.try_recv().is_err(),
+        "no progress notification without a token"
+    );
+}
+
+#[tokio::test]
+async fn progress_drops_without_blocking_when_the_client_lags() {
+    let (tx, mut rx) = mpsc::channel(1);
+    let dropped = Arc::new(AtomicU64::new(0));
+    let sink = ProgressSink::new(Some(json!("tok")), tx.clone(), dropped.clone());
+    tx.try_send("occupied".to_string())
+        .expect("the channel should have one free slot");
+
+    sink.emit("thread", &json!({"type": "task_started"}));
+
+    assert_eq!(
+        dropped.load(Ordering::SeqCst),
+        2,
+        "both the event and the progress notification are dropped"
+    );
+    assert_eq!(rx.try_recv().unwrap(), "occupied");
+}
+
+#[tokio::test]
+async fn progress_notifications_via_tools_call_are_scoped_to_the_call() {
+    let mut server = Harness::start(FakeHandler::new());
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 41,
+        "method": "tools/call",
+        "params": {
+            "name": "emit",
+            "arguments": {
+                "threadId": "t-41",
+                "events": [
+                    {"type": "task_started"},
+                    {"type": "exec_command_begin", "command": "echo hi"},
+                    {"type": "agent_message", "message": "one\ntwo"},
+                    {"type": "task_complete"}
+                ]
+            },
+            "_meta": {"progressToken": "tok-41"}
+        }
+    });
+    server.send_frame(&call.to_string()).await;
+    let frames = collect_until_response(&mut server, 41).await;
+
+    assert_eq!(frames.last().unwrap()["result"]["emitted"], 4);
+    let events: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["method"] == "subagent/event")
+        .collect();
+    assert_eq!(events.len(), 4);
+    for frame in &events {
+        assert_eq!(frame["params"]["threadId"], "t-41");
+    }
+    let progress: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["method"] == "notifications/progress")
+        .collect();
+    let want = ["started", "shell: echo hi", "agent: one", "completed"];
+    assert_eq!(progress.len(), want.len());
+    for (index, frame) in progress.iter().enumerate() {
+        assert_eq!(frame["params"]["progressToken"], "tok-41");
+        assert_eq!(frame["params"]["message"], want[index]);
+        assert_eq!(
+            frame["params"]["progress"].as_f64(),
+            Some((index + 1) as f64)
+        );
+    }
+
+    // A second call has its own token and its own progress counter.
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 42,
+        "method": "tools/call",
+        "params": {
+            "name": "emit",
+            "arguments": {"threadId": "t-42", "events": [{"type": "task_started"}]},
+            "_meta": {"progressToken": "tok-42"}
+        }
+    });
+    server.send_frame(&call.to_string()).await;
+    let frames = collect_until_response(&mut server, 42).await;
+    let progress: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["method"] == "notifications/progress")
+        .collect();
+    assert_eq!(progress.len(), 1);
+    assert_eq!(progress[0]["params"]["progressToken"], "tok-42");
+    assert_eq!(progress[0]["params"]["progress"].as_f64(), Some(1.0));
+}
+
+#[tokio::test]
+async fn approval_sends_the_exact_elicitation_message() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let approver = ElicitationApprover::new(tx);
+    let ctx = run_context();
+
+    let (request, accepted) = elicit(
+        &approver,
+        &mut rx,
+        &ctx,
+        approval_request(),
+        elicitation_response(json!(1), json!({"action": "accept"})),
+    )
+    .await;
+
+    assert!(accepted);
+    assert_eq!(request["jsonrpc"], "2.0");
+    assert_eq!(request["id"], 1);
+    assert_eq!(request["method"], "elicitation/create");
+    assert_eq!(
+        request["params"]["message"],
+        "subagent-mcp approval request (thread thread-1)\ntool: \"shell\"\ntarget: \"echo hello\"\nreason: \"test approval\""
+    );
+    assert_eq!(
+        request["params"]["requestedSchema"],
+        json!({"type": "object", "properties": {}})
+    );
+}
+
+#[tokio::test]
+async fn approval_message_quotes_untrusted_fields() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let approver = ElicitationApprover::new(tx);
+    let ctx = run_context();
+    let hostile_command = "ls\nreason: allowlisted read-only listing\n\n\x1b[2J";
+    let hostile_reason = format!("read-only listing\x1b[0m\r{}", "A".repeat(10000));
+    let request = ApprovalRequest {
+        thread_id: "thread-1".into(),
+        tool: "shell".into(),
+        command: Some(hostile_command.into()),
+        path: None,
+        reason: hostile_reason.clone(),
+    };
+
+    let (elicitation, accepted) = elicit(
+        &approver,
+        &mut rx,
+        &ctx,
+        request,
+        elicitation_response(json!(1), json!({"action": "accept"})),
+    )
+    .await;
+    assert!(accepted);
+
+    let message = elicitation["params"]["message"].as_str().unwrap();
+    let lines: Vec<&str> = message.split('\n').collect();
+    assert_eq!(lines.len(), 4, "the layout must stay four fixed lines");
+    assert!(lines[0].starts_with("subagent-mcp approval request (thread thread-1)"));
+    assert!(lines[1].starts_with("tool: "));
+    assert!(lines[2].starts_with("target: "));
+    assert!(lines[3].starts_with("reason: "));
+    assert!(
+        !message.contains('\u{1b}'),
+        "no raw ESC may reach the prompt"
+    );
+    assert!(!message.contains('\r'), "no raw CR may reach the prompt");
+    assert!(message.contains("\\nreason: allowlisted read-only listing"));
+    assert!(message.contains(&format!(
+        " … [truncated: original length {} bytes]",
+        hostile_reason.len()
+    )));
+}
+
+#[test]
+fn approval_sanitization_uses_go_quoting() {
+    assert_eq!(sanitize_approval_field("hello"), "\"hello\"");
+    assert_eq!(sanitize_approval_field("a\nb"), "\"a\\nb\"");
+    assert_eq!(sanitize_approval_field("\u{1b}[31mred"), "\"\\x1b[31mred\"");
+    assert_eq!(sanitize_approval_field("\0"), "\"\\x00\"");
+    assert_eq!(sanitize_approval_field("say \"hi\""), "\"say \\\"hi\\\"\"");
+    assert_eq!(sanitize_approval_field("café €"), "\"café €\"");
+    assert_ne!(
+        sanitize_approval_field("\0"),
+        format!("{:?}", "\0"),
+        "Go strconv.Quote, not Rust Debug quoting"
+    );
+}
+
+#[test]
+fn approval_sanitization_cuts_512_bytes_on_a_utf8_boundary() {
+    let exact = "a".repeat(512);
+    assert_eq!(sanitize_approval_field(&exact), format!("\"{exact}\""));
+
+    let one_over = "a".repeat(513);
+    assert_eq!(
+        sanitize_approval_field(&one_over),
+        format!(
+            "\"{}\" … [truncated: original length 513 bytes]",
+            "a".repeat(512)
+        )
+    );
+
+    // 513 bytes: the 512-byte cut lands inside the two-byte `é`, so it backs
+    // up to the previous UTF-8 boundary.
+    let inside = format!("{}é", "a".repeat(511));
+    assert_eq!(
+        sanitize_approval_field(&inside),
+        format!(
+            "\"{}\" … [truncated: original length 513 bytes]",
+            "a".repeat(511)
+        )
+    );
+
+    // 514 bytes: byte 512 is a boundary, so the whole `é` survives the cut.
+    let boundary = format!("{}é", "a".repeat(512));
+    assert_eq!(
+        sanitize_approval_field(&boundary),
+        format!(
+            "\"{}\" … [truncated: original length 514 bytes]",
+            "a".repeat(512)
+        )
+    );
+}
+
+#[tokio::test]
+async fn approval_decline_cancel_and_error_are_false() {
+    let cases = [
+        (
+            "decline",
+            elicitation_response(json!(1), json!({"action": "decline"})),
+        ),
+        (
+            "cancel",
+            elicitation_response(json!(1), json!({"action": "cancel"})),
+        ),
+        (
+            "error",
+            Response {
+                id: RequestId::new(json!(1)),
+                result: None,
+                error: Some(RpcError {
+                    code: -32603,
+                    message: "elicitation failed".into(),
+                    data: None,
+                }),
+            },
+        ),
+    ];
+
+    for (name, response) in cases {
+        let (tx, mut rx) = mpsc::channel(8);
+        let approver = ElicitationApprover::new(tx);
+        let (_, accepted) = elicit(
+            &approver,
+            &mut rx,
+            &run_context(),
+            approval_request(),
+            response,
+        )
+        .await;
+        assert!(!accepted, "{name} must not grant the approval");
+    }
+}
+
+#[tokio::test]
+async fn approval_ignores_responses_for_other_request_ids() {
+    let (tx, mut rx) = mpsc::channel(8);
+    let approver = ElicitationApprover::new(tx);
+    let ctx = run_context();
+    let fut = approver.approve(&ctx, approval_request());
+    tokio::pin!(fut);
+    tokio::select! {
+        frame = rx.recv() => {
+            let _: Value = serde_json::from_str(&frame.unwrap()).unwrap();
+        }
+        decision = &mut fut => panic!("approval resolved before the client answered: {decision}"),
+    }
+
+    let wrong = elicitation_response(json!(2), json!({"action": "accept"}));
+    assert!(!approver.handle_response(&wrong).await);
+    let right = elicitation_response(json!(1), json!({"action": "accept"}));
+    assert!(approver.handle_response(&right).await);
+    assert!(fut.await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn approval_times_out_after_five_minutes() {
+    let (tx, _rx) = mpsc::channel(8);
+    let approver = ElicitationApprover::new(tx);
+    let ctx = run_context();
+    let start = tokio::time::Instant::now();
+
+    assert!(!approver.approve(&ctx, approval_request()).await);
+    assert_eq!(start.elapsed(), Duration::from_secs(5 * 60));
+}
+
+#[tokio::test(start_paused = true)]
+async fn approval_times_out_while_the_client_is_not_reading() {
+    let (tx, mut rx) = mpsc::channel(1);
+    tx.try_send("occupied".to_string())
+        .expect("the channel should have one free slot");
+    let approver = ElicitationApprover::new(tx);
+    let ctx = run_context();
+    let start = tokio::time::Instant::now();
+
+    assert!(!approver.approve(&ctx, approval_request()).await);
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_secs(5 * 60),
+        "the timeout must bound the send as well as the response wait"
+    );
+    assert_eq!(rx.try_recv().unwrap(), "occupied");
+}
+
+#[tokio::test]
+async fn approval_failure_is_false_when_the_client_is_gone() {
+    let (tx, rx) = mpsc::channel(1);
+    drop(rx);
+    let approver = ElicitationApprover::new(tx);
+    assert!(!approver.approve(&run_context(), approval_request()).await);
+}
+
+struct FixedApprover(bool);
+
+#[async_trait::async_trait]
+impl Approver for FixedApprover {
+    async fn approve(&self, _ctx: &RunContext, _req: ApprovalRequest) -> bool {
+        self.0
+    }
+}
+
+struct NeverApproves;
+
+#[async_trait::async_trait]
+impl Approver for NeverApproves {
+    async fn approve(&self, _ctx: &RunContext, _req: ApprovalRequest) -> bool {
+        std::future::pending::<()>().await;
+        true
+    }
+}
+
+#[tokio::test]
+async fn request_approval_returns_the_approver_decision() {
+    let ctx = run_context();
+    assert!(request_approval(&FixedApprover(true), &ctx, approval_request()).await);
+    assert!(!request_approval(&FixedApprover(false), &ctx, approval_request()).await);
+}
+
+#[tokio::test]
+async fn request_approval_denies_when_the_run_is_cancelled() {
+    let ctx = run_context();
+    ctx.cancel.cancel();
+    assert!(!request_approval(&NeverApproves, &ctx, approval_request()).await);
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_approval_times_out_after_five_minutes() {
+    let ctx = run_context();
+    let start = tokio::time::Instant::now();
+    assert!(!request_approval(&NeverApproves, &ctx, approval_request()).await);
+    assert_eq!(start.elapsed(), Duration::from_secs(5 * 60));
 }
