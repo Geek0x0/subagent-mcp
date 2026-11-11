@@ -3,6 +3,7 @@ pub mod config;
 pub mod decision;
 pub mod mcp;
 pub mod policy;
+pub mod provider;
 pub mod repo;
 pub mod util;
 

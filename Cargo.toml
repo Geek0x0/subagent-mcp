@@ -70,6 +70,7 @@ rcgen = { version = "0.14", default-features = false, features = [
     "ring",
     "pem",
 ] }
+pem = "4"
 rustls = { version = "0.23", default-features = false, features = [
     "ring",
     "std",

@@ -7,9 +7,9 @@
 //! is only matched semantically.
 //!
 //! TASK 8 HOOK: `build_http_client` is the single construction site for the
-//! reqwest client. Task 8 will rebuild it with `tls::client_config()` via
+//! reqwest client. It builds the client with `tls::client_config()` via
 //! `use_preconfigured_tls`, so auto selection shares the platform TLS trust
-//! policy. Keep all client construction here so that change stays local.
+//! policy with the provider layer. Keep all client construction here.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -247,15 +247,25 @@ impl DecisionClient {
 }
 
 // ---------------------------------------------------------------------------
-// Client construction (Task 8 hook)
+// Client construction
 // ---------------------------------------------------------------------------
 
-/// TASK 8 HOOK — the single construction site for the reqwest client. Task 8
-/// replaces the plain builder with one configured through `tls::client_config()`
-/// and `use_preconfigured_tls`, so auto selection uses the same platform TLS
-/// trust policy as the provider layer. Keep all construction here.
+/// The single construction site for the reqwest client. The TLS configuration
+/// comes from [`crate::provider::tls::client_config`], so auto selection uses
+/// the same platform trust policy as the provider transport.
 fn build_http_client(cfg: &AutoConfig) -> Result<reqwest::Client, DecisionError> {
-    let mut builder = reqwest::Client::builder();
+    let tls = crate::provider::tls::client_config()
+        .map_err(|e| derr(format!("build HTTP client: {}", e)))?;
+    build_http_client_with_tls(cfg, tls)
+}
+
+/// Build the client with an explicit rustls configuration. Kept separate so the
+/// trust tests can prove the preconfigured TLS settings reach reqwest.
+fn build_http_client_with_tls(
+    cfg: &AutoConfig,
+    tls: rustls::ClientConfig,
+) -> Result<reqwest::Client, DecisionError> {
+    let mut builder = reqwest::Client::builder().use_preconfigured_tls(tls);
     if cfg.timeout_seconds > 0 {
         builder = builder.timeout(Duration::from_secs(cfg.timeout_seconds));
     }
@@ -617,5 +627,39 @@ mod tests {
         assert_eq!(truncate("abcdef", 3), "abc");
         assert_eq!(truncate("éééé", 2), "éé");
         assert_eq!(truncate("short", 512), "short");
+    }
+
+    #[tokio::test]
+    async fn build_http_client_uses_the_configured_tls_roots() {
+        use crate::provider::tls;
+        let cert = tls::test_support::ca_signed("localhost");
+        let port = tls::test_support::serve(&cert);
+        let config = tls::client_config_with_extra_roots(std::slice::from_ref(&cert.root))
+            .expect("config with temporary root");
+        let client = build_http_client_with_tls(&cfg("key"), config).unwrap();
+        let response = client
+            .get(format!("https://localhost:{port}/"))
+            .send()
+            .await
+            .expect("temporary root rejected by reqwest");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(response.text().await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn build_http_client_rejects_an_untrusted_certificate() {
+        use crate::provider::tls;
+        let cert = tls::test_support::ca_signed("localhost");
+        let port = tls::test_support::serve(&cert);
+        let client = build_http_client(&cfg("key")).unwrap();
+        let err = client
+            .get(format!("https://localhost:{port}/"))
+            .send()
+            .await
+            .expect_err("untrusted certificate accepted");
+        assert!(
+            tls::test_support::mentions_certificate(&err),
+            "expected a certificate rejection, got: {err}"
+        );
     }
 }

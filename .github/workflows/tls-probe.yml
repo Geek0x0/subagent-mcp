@@ -1,0 +1,195 @@
+name: TLS verifier probe
+
+# Manual only. The native macOS/Windows TLS evidence is a hard gate before the
+# provider transport (Task 9) and is recorded in
+# docs/release/tls-verifier-spike.md. This workflow has not been pushed or
+# triggered. Once the native evidence is attached, promote it to a required
+# check (and add push/pull_request triggers).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: TLS probe (${{ matrix.platform }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+          - platform: macos
+            os: macos-latest
+          - platform: windows
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      # ---------------------------------------------------------------------
+      # Linux: native roots + webpki. Exercises the system bundle through
+      # SSL_CERT_FILE (honored by rustls-native-certs) so the job does not need
+      # to mutate the runner's root store.
+      # ---------------------------------------------------------------------
+      - name: Linux probe
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tls-evidence
+          { uname -a; grep PRETTY_NAME /etc/os-release; rustc --version; cargo --version; openssl version; } \
+            | tee tls-evidence/environment.txt
+          cargo test provider::tls -- --nocapture 2>&1 | tee tls-evidence/tests.txt
+          cargo run --example tls_probe -- --url https://example.com --expect accept 2>&1 \
+            | tee tls-evidence/system-roots.txt
+          cargo run --example tls_probe -- --self-signed --expect reject 2>&1 \
+            | tee tls-evidence/self-signed.txt
+          cargo run --example tls_probe -- --enterprise-ca --expect accept 2>&1 \
+            | tee tls-evidence/enterprise-ca-extra-root.txt
+
+          work="$(mktemp -d)"
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/ca.key" -out "$work/ca.pem" \
+            -days 1 -subj "/CN=TLS Probe Enterprise CA" >/dev/null 2>&1
+          openssl req -newkey rsa:2048 -nodes -keyout "$work/leaf.key" -out "$work/leaf.csr" \
+            -subj "/CN=127.0.0.1" >/dev/null 2>&1
+          printf 'subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' \
+            > "$work/leaf.ext"
+          openssl x509 -req -in "$work/leaf.csr" -CA "$work/ca.pem" -CAkey "$work/ca.key" \
+            -CAcreateserial -out "$work/leaf.pem" -days 1 -extfile "$work/leaf.ext" >/dev/null 2>&1
+          openssl s_server -accept 127.0.0.1:9443 -cert "$work/leaf.pem" -key "$work/leaf.key" \
+            -www -quiet >/dev/null 2>&1 &
+          server=$!
+          trap 'kill "$server" 2>/dev/null || true' EXIT
+          sleep 1
+          cargo run --example tls_probe -- --url https://127.0.0.1:9443/ --expect reject 2>&1 \
+            | tee tls-evidence/untrusted-root.txt
+          SSL_CERT_FILE="$work/ca.pem" cargo run --example tls_probe -- \
+            --url https://127.0.0.1:9443/ --expect accept 2>&1 \
+            | tee tls-evidence/enterprise-ca-system-bundle.txt
+
+      # ---------------------------------------------------------------------
+      # macOS: Security.framework verifier. Trust and distrust the generated CA
+      # in the System Keychain; the distrust case is the one native-roots-only
+      # cannot reproduce.
+      # ---------------------------------------------------------------------
+      - name: macOS probe
+        if: matrix.platform == 'macos'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tls-evidence
+          { sw_vers; uname -m; rustc --version; cargo --version; openssl version; } \
+            | tee tls-evidence/environment.txt
+          cargo test provider::tls -- --nocapture 2>&1 | tee tls-evidence/tests.txt
+          cargo run --example tls_probe -- --url https://example.com --expect accept 2>&1 \
+            | tee tls-evidence/system-roots.txt
+          cargo run --example tls_probe -- --self-signed --expect reject 2>&1 \
+            | tee tls-evidence/self-signed.txt
+          cargo run --example tls_probe -- --enterprise-ca --expect accept 2>&1 \
+            | tee tls-evidence/enterprise-ca-extra-root.txt
+
+          work="$(mktemp -d)"
+          openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work/ca.key" -out "$work/ca.pem" \
+            -days 1 -subj "/CN=TLS Probe Enterprise CA" >/dev/null 2>&1
+          openssl req -newkey rsa:2048 -nodes -keyout "$work/leaf.key" -out "$work/leaf.csr" \
+            -subj "/CN=127.0.0.1" >/dev/null 2>&1
+          printf 'subjectAltName=IP:127.0.0.1\nbasicConstraints=CA:FALSE\nextendedKeyUsage=serverAuth\n' \
+            > "$work/leaf.ext"
+          openssl x509 -req -in "$work/leaf.csr" -CA "$work/ca.pem" -CAkey "$work/ca.key" \
+            -CAcreateserial -out "$work/leaf.pem" -days 1 -extfile "$work/leaf.ext" >/dev/null 2>&1
+          openssl s_server -accept 127.0.0.1:9443 -cert "$work/leaf.pem" -key "$work/leaf.key" \
+            -www -quiet >/dev/null 2>&1 &
+          server=$!
+          cleanup() {
+            kill "$server" 2>/dev/null || true
+            sudo security delete-certificate -c "TLS Probe Enterprise CA" \
+              /Library/Keychains/System.keychain 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          sleep 1
+          cargo run --example tls_probe -- --url https://127.0.0.1:9443/ --expect reject 2>&1 \
+            | tee tls-evidence/untrusted-root.txt
+          sudo security add-trusted-cert -d -r trustRoot \
+            -k /Library/Keychains/System.keychain "$work/ca.pem"
+          cargo run --example tls_probe -- --url https://127.0.0.1:9443/ --expect accept 2>&1 \
+            | tee tls-evidence/enterprise-ca-keychain.txt
+          sudo security add-trusted-cert -d -r deny \
+            -k /Library/Keychains/System.keychain "$work/ca.pem"
+          cargo run --example tls_probe -- --url https://127.0.0.1:9443/ --expect reject 2>&1 \
+            | tee tls-evidence/distrusted-root-keychain.txt
+
+      # ---------------------------------------------------------------------
+      # Windows: CryptoAPI/CNG verifier. Trust and distrust the generated CA in
+      # the machine store; the Disallowed case is the one native-roots-only
+      # cannot reproduce.
+      # ---------------------------------------------------------------------
+      - name: Windows probe
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          New-Item -ItemType Directory -Force tls-evidence | Out-Null
+
+          function Invoke-Probe([string[]]$CargoArgs, [string]$Evidence) {
+            & cargo @CargoArgs 2>&1 | Tee-Object -FilePath $Evidence
+            if ($LASTEXITCODE -ne 0) {
+              throw "cargo $($CargoArgs -join ' ') failed with exit $LASTEXITCODE"
+            }
+          }
+
+          & {
+            [System.Environment]::OSVersion.VersionString
+            $env:PROCESSOR_ARCHITECTURE
+            rustc --version
+            cargo --version
+          } 2>&1 | Out-File -Encoding utf8 tls-evidence/environment.txt
+
+          Invoke-Probe @("test", "provider::tls", "--", "--nocapture") "tls-evidence/tests.txt"
+          Invoke-Probe @("run", "--example", "tls_probe", "--", "--url", "https://example.com", "--expect", "accept") "tls-evidence/system-roots.txt"
+          Invoke-Probe @("run", "--example", "tls_probe", "--", "--self-signed", "--expect", "reject") "tls-evidence/self-signed.txt"
+          Invoke-Probe @("run", "--example", "tls_probe", "--", "--enterprise-ca", "--expect", "accept") "tls-evidence/enterprise-ca-extra-root.txt"
+
+          $openssl = "C:\Program Files\Git\usr\bin\openssl.exe"
+          if (-not (Test-Path $openssl)) { $openssl = (Get-Command openssl).Source }
+          $work = Join-Path $env:RUNNER_TEMP "tls-probe"
+          New-Item -ItemType Directory -Force $work | Out-Null
+
+          & $openssl req -x509 -newkey rsa:2048 -nodes -keyout "$work\ca.key" -out "$work\ca.pem" -days 1 -subj "/CN=TLS Probe Enterprise CA" 2>$null
+          & $openssl req -newkey rsa:2048 -nodes -keyout "$work\leaf.key" -out "$work\leaf.csr" -subj "/CN=127.0.0.1" 2>$null
+          "subjectAltName=IP:127.0.0.1`nbasicConstraints=CA:FALSE`nextendedKeyUsage=serverAuth" |
+            Out-File -Encoding ascii "$work\leaf.ext"
+          & $openssl x509 -req -in "$work\leaf.csr" -CA "$work\ca.pem" -CAkey "$work\ca.key" -CAcreateserial -out "$work\leaf.pem" -days 1 -extfile "$work\leaf.ext" 2>$null
+          & $openssl x509 -in "$work\ca.pem" -outform der -out "$work\ca.cer"
+
+          Push-Location $work
+          $server = Start-Process -FilePath $openssl -PassThru -ArgumentList @(
+            "s_server", "-accept", "127.0.0.1:9443", "-cert", "leaf.pem",
+            "-key", "leaf.key", "-www", "-quiet")
+          Pop-Location
+          Start-Sleep -Seconds 2
+
+          try {
+            Invoke-Probe @("run", "--example", "tls_probe", "--", "--url", "https://127.0.0.1:9443/", "--expect", "reject") "tls-evidence/untrusted-root.txt"
+            $ca = Import-Certificate -FilePath "$work\ca.cer" -CertStoreLocation Cert:\LocalMachine\Root
+            Invoke-Probe @("run", "--example", "tls_probe", "--", "--url", "https://127.0.0.1:9443/", "--expect", "accept") "tls-evidence/enterprise-ca-machine-store.txt"
+            Import-Certificate -FilePath "$work\ca.cer" -CertStoreLocation Cert:\LocalMachine\Disallowed | Out-Null
+            Invoke-Probe @("run", "--example", "tls_probe", "--", "--url", "https://127.0.0.1:9443/", "--expect", "reject") "tls-evidence/distrusted-root-machine-store.txt"
+          }
+          finally {
+            Stop-Process -Id $server.Id -ErrorAction SilentlyContinue
+            if ($ca) { Remove-Item "Cert:\LocalMachine\Root\$($ca.Thumbprint)" -ErrorAction SilentlyContinue }
+            certutil -delstore Disallowed "TLS Probe Enterprise CA" 2>$null
+          }
+
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tls-evidence-${{ matrix.platform }}
+          path: tls-evidence
+          if-no-files-found: warn
