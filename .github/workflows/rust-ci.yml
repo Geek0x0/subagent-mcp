@@ -1,0 +1,38 @@
+name: Rust CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: fmt / clippy / test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins 1.94.1 with rustfmt + clippy. Install it up
+      # front so the pinned components are present on every runner.
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # Differential tests are cfg-gated to Linux x86_64; on macOS/Windows they
+      # report zero differential tests instead of trying to run the Linux
+      # reference binary.
+      - name: tests
+        run: cargo test --all-targets

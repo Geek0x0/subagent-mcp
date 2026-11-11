@@ -1,0 +1,77 @@
+[package]
+name = "subagent-mcp"
+version = "0.14.0"
+edition = "2024"
+
+[lib]
+name = "subagent_mcp"
+path = "src/lib.rs"
+
+[[bin]]
+name = "subagent-mcp"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "unwind"
+strip = "symbols"
+
+[dependencies]
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "io-util",
+    "process",
+    "sync",
+    "time",
+    "net",
+    "fs",
+    "signal",
+] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures-util = "0.3"
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+toml = "0.9"
+toml_edit = "0.23"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-manual-roots",
+    "http2",
+    "stream",
+    "json",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
+rustls-native-certs = "0.8"
+rustls-platform-verifier = "0.7"
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+regex = "1"
+libc = "0.2"
+rustix = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = "0.61"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
+tempfile = "3"
+rcgen = { version = "0.14", default-features = false, features = [
+    "ring",
+    "pem",
+] }
+rustls = { version = "0.23", default-features = false, features = [
+    "ring",
+    "std",
+    "tls12",
+] }
