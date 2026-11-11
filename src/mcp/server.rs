@@ -675,9 +675,13 @@ impl McpServer {
         });
         self.state.begin(prepared.key.clone(), handle.clone());
 
-        let progress = prepared
-            .progress_token
-            .map(|token| ProgressSink::new(Some(token), out.clone(), self.state.dropped.clone()));
+        // Go emits `subagent/event` for every call; the progress token only
+        // controls whether `notifications/progress` is sent alongside it.
+        let progress = Some(ProgressSink::new(
+            prepared.progress_token,
+            out.clone(),
+            self.state.dropped.clone(),
+        ));
         let ctx = CallContext {
             cancel: handle.cancel.clone(),
             request_id: Some(id.clone()),

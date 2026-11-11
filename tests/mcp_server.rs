@@ -1120,6 +1120,50 @@ async fn progress_notifications_via_tools_call_are_scoped_to_the_call() {
 }
 
 #[tokio::test]
+async fn events_without_a_progress_token_are_emitted() {
+    let mut server = Harness::start(FakeHandler::new());
+    // The same seven-event sequence Go's TestNoProgressNotificationsWithoutToken
+    // drives: every event must reach the client, with no progress frames.
+    let call = json!({
+        "jsonrpc": "2.0",
+        "id": 43,
+        "method": "tools/call",
+        "params": {
+            "name": "emit",
+            "arguments": {
+                "threadId": "t-43",
+                "events": [
+                    {"type": "task_started"},
+                    {"type": "provider_request"},
+                    {"type": "exec_command_begin", "command": "echo hi"},
+                    {"type": "exec_command_end"},
+                    {"type": "provider_request"},
+                    {"type": "agent_message", "message": "done"},
+                    {"type": "task_complete"}
+                ]
+            }
+        }
+    });
+    server.send_frame(&call.to_string()).await;
+    let frames = collect_until_response(&mut server, 43).await;
+
+    assert_eq!(frames.last().unwrap()["result"]["emitted"], 7);
+    let events: Vec<&Value> = frames
+        .iter()
+        .filter(|frame| frame["method"] == "subagent/event")
+        .collect();
+    assert_eq!(events.len(), 7, "token-less calls must still emit events");
+    for frame in &events {
+        assert_eq!(frame["params"]["threadId"], "t-43");
+    }
+    let progress = frames
+        .iter()
+        .filter(|frame| frame["method"] == "notifications/progress")
+        .count();
+    assert_eq!(progress, 0, "no progress frames without a token");
+}
+
+#[tokio::test]
 async fn approval_sends_the_exact_elicitation_message() {
     let (tx, mut rx) = mpsc::channel(8);
     let approver = ElicitationApprover::new(tx);
@@ -1316,6 +1360,24 @@ async fn approval_times_out_after_five_minutes() {
 }
 
 #[tokio::test(start_paused = true)]
+async fn approval_times_out_at_a_short_run_deadline() {
+    let (tx, _rx) = mpsc::channel(8);
+    let approver = ElicitationApprover::new(tx);
+    let ctx = RunContext {
+        cancel: CancellationToken::new(),
+        deadline: Some(tokio::time::Instant::now() + Duration::from_secs(60)),
+    };
+    let start = tokio::time::Instant::now();
+
+    assert!(!approver.approve(&ctx, approval_request()).await);
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_secs(60),
+        "the run deadline must win over the five-minute cap"
+    );
+}
+
+#[tokio::test(start_paused = true)]
 async fn approval_times_out_while_the_client_is_not_reading() {
     let (tx, mut rx) = mpsc::channel(1);
     tx.try_send("occupied".to_string())
@@ -1380,4 +1442,19 @@ async fn request_approval_times_out_after_five_minutes() {
     let start = tokio::time::Instant::now();
     assert!(!request_approval(&NeverApproves, &ctx, approval_request()).await);
     assert_eq!(start.elapsed(), Duration::from_secs(5 * 60));
+}
+
+#[tokio::test(start_paused = true)]
+async fn request_approval_denies_at_a_short_run_deadline() {
+    let ctx = RunContext {
+        cancel: CancellationToken::new(),
+        deadline: Some(tokio::time::Instant::now() + Duration::from_secs(60)),
+    };
+    let start = tokio::time::Instant::now();
+    assert!(!request_approval(&NeverApproves, &ctx, approval_request()).await);
+    assert_eq!(
+        start.elapsed(),
+        Duration::from_secs(60),
+        "approval must deny at the earlier run deadline, not wait five minutes"
+    );
 }

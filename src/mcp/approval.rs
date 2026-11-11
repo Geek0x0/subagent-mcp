@@ -110,8 +110,9 @@ impl Approver for ElicitationApprover {
             },
         });
         // Go's timeout wraps the whole request (send plus wait), not just the
-        // response wait.
-        let deadline = tokio::time::Instant::now() + self.timeout;
+        // response wait. A parent run deadline shorter than five minutes wins,
+        // exactly as `context.WithTimeout` inherits an earlier parent deadline.
+        let deadline = approval_deadline(ctx, self.timeout);
         tokio::select! {
             sent = self.out.send(frame.to_string()) => {
                 if sent.is_err() {
@@ -130,21 +131,34 @@ impl Approver for ElicitationApprover {
     }
 }
 
-/// Runs one approval with a five-minute cap and parent-cancellation denial.
+/// Runs one approval with the earlier of a five-minute cap and the run
+/// deadline, and denies on parent cancellation.
 pub async fn request_approval(
     approver: &dyn Approver,
     ctx: &RunContext,
     req: ApprovalRequest,
 ) -> bool {
+    let deadline = approval_deadline(ctx, APPROVAL_TIMEOUT);
     let wait = async {
         tokio::select! {
             decision = approver.approve(ctx, req) => decision,
             _ = ctx.cancel.cancelled() => false,
         }
     };
-    tokio::time::timeout(APPROVAL_TIMEOUT, wait)
+    tokio::time::timeout_at(deadline, wait)
         .await
         .unwrap_or(false)
+}
+
+/// The approval deadline: five minutes, or the run deadline when it is
+/// earlier. Go's `context.WithTimeout(ctx, 5*time.Minute)` inherits a parent
+/// deadline, so the effective wait is `min(5m, run deadline)`.
+fn approval_deadline(ctx: &RunContext, cap: Duration) -> tokio::time::Instant {
+    let deadline = tokio::time::Instant::now() + cap;
+    match ctx.deadline {
+        Some(run_deadline) => deadline.min(run_deadline),
+        None => deadline,
+    }
 }
 
 fn approval_message(req: &ApprovalRequest) -> String {
