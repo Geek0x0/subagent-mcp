@@ -65,6 +65,13 @@ fn set_mode(path: &Path, mode: u32) {
     fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
 }
 
+// tests/config.rs convention: Unix gets the real mode change, non-Unix a no-op
+// so unguarded calls still compile. `get_mode` has no portable counterpart, so
+// the assertions that read a mode are gated with `#[cfg(unix)]` at their call
+// sites instead. Unix coverage is unchanged; all other tests run everywhere.
+#[cfg(not(unix))]
+fn set_mode(_path: &Path, _mode: u32) {}
+
 #[cfg(unix)]
 fn get_mode(path: &Path) -> u32 {
     use std::os::unix::fs::PermissionsExt;
@@ -605,6 +612,7 @@ fn commit_failure_leaves_every_file_untouched() {
             "{name}: disturbed step should fail"
         );
         assert_eq!(read_file(&a), bytes("one\ntwo\n"), "{name}: a.txt restored");
+        #[cfg(unix)]
         assert_eq!(get_mode(&a), 0o600, "{name}: a.txt mode preserved");
         assert!(
             !dir.path().join("deep").exists(),
@@ -672,6 +680,7 @@ fn delete_unreadable_file_and_its_rollback() {
         commit_fs(&OS, &changes).is_err(),
         "second delete should fail"
     );
+    #[cfg(unix)]
     assert_eq!(
         get_mode(&locked),
         0o000,
