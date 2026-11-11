@@ -3,7 +3,12 @@
 //! Task 14 covers the shell lexer and allowlist. Task 15 extends this file with
 //! the decision matrix and path-confinement cases.
 
+use std::path::{Path, PathBuf};
+
 use subagent_mcp::policy::lexer::analyze_shell;
+use subagent_mcp::policy::path::{bound_path, evaluate, evaluate_with_reason, inside_relative};
+use subagent_mcp::policy::{ApprovalPolicy, Decision, PolicyRequest, Sandbox, ToolKind};
+use subagent_mcp::util::fs::same_file;
 
 fn allowed(command: &str) -> bool {
     analyze_shell(command).is_ok_and(|analysis| analysis.allowed)
@@ -492,4 +497,565 @@ fn lexer_error_reasons_are_exact() {
     assert_eq!(lex_error("ls &&"), "empty command after separator");
     assert_eq!(lex_error("ls ||"), "empty command after separator");
     assert_eq!(lex_error("ls |"), "empty command after separator");
+}
+
+fn request(
+    tool: ToolKind,
+    command: Option<&str>,
+    path: Option<&Path>,
+    cwd: &Path,
+) -> PolicyRequest {
+    PolicyRequest {
+        tool,
+        command: command.map(str::to_string),
+        path: path.map(|path| path.to_string_lossy().into_owned()),
+        cwd: cwd.to_path_buf(),
+        bound_cwd: None,
+    }
+}
+
+struct MatrixCase {
+    name: &'static str,
+    sandbox: Sandbox,
+    approval: ApprovalPolicy,
+    tool: ToolKind,
+    command: Option<&'static str>,
+    path: Option<PathBuf>,
+    want: Decision,
+}
+
+#[test]
+fn decision_matrix_matches_go() {
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path();
+    let inside = cwd.join("inside.txt");
+    std::fs::write(&inside, b"inside").unwrap();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("outside.txt");
+    std::fs::write(&outside, b"outside").unwrap();
+
+    // Every case from Go TestEvaluate. The shared Rust enums have no invalid
+    // variant, so Go's "unknown approval policy" row cannot be represented;
+    // the exhaustive match in `evaluate` fails closed by construction.
+    let cases = [
+        MatrixCase {
+            name: "read-only on-request read file",
+            sandbox: Sandbox::ReadOnly,
+            approval: ApprovalPolicy::OnRequest,
+            tool: ToolKind::ReadFile,
+            command: None,
+            path: Some(inside.clone()),
+            want: Decision::Allow,
+        },
+        MatrixCase {
+            name: "read-only on-request whitelisted shell",
+            sandbox: Sandbox::ReadOnly,
+            approval: ApprovalPolicy::OnRequest,
+            tool: ToolKind::Shell,
+            command: Some("ls"),
+            path: None,
+            want: Decision::Allow,
+        },
+        MatrixCase {
+            name: "read-only on-request non-whitelisted shell",
+            sandbox: Sandbox::ReadOnly,
+            approval: ApprovalPolicy::OnRequest,
+            tool: ToolKind::Shell,
+            command: Some("rm x"),
+            path: None,
+            want: Decision::AskApproval,
+        },
+        MatrixCase {
+            name: "read-only on-request write inside cwd",
+            sandbox: Sandbox::ReadOnly,
+            approval: ApprovalPolicy::OnRequest,
+            tool: ToolKind::WriteFile,
+            command: None,
+            path: Some(inside.clone()),
+            want: Decision::AskApproval,
+        },
+        MatrixCase {
+            name: "read-only never non-whitelisted shell",
+            sandbox: Sandbox::ReadOnly,
+            approval: ApprovalPolicy::Never,
+            tool: ToolKind::Shell,
+            command: Some("rm x"),
+            path: None,
+            want: Decision::Deny,
+        },
+        MatrixCase {
+            name: "read-only never write file",
+            sandbox: Sandbox::ReadOnly,
+            approval: ApprovalPolicy::Never,
+            tool: ToolKind::WriteFile,
+            command: None,
+            path: Some(inside.clone()),
+            want: Decision::Deny,
+        },
+        MatrixCase {
+            name: "read-only untrusted whitelisted shell",
+            sandbox: Sandbox::ReadOnly,
+            approval: ApprovalPolicy::Untrusted,
+            tool: ToolKind::Shell,
+            command: Some("ls"),
+            path: None,
+            want: Decision::Allow,
+        },
+        MatrixCase {
+            name: "read-only untrusted non-whitelisted shell",
+            sandbox: Sandbox::ReadOnly,
+            approval: ApprovalPolicy::Untrusted,
+            tool: ToolKind::Shell,
+            command: Some("rm x"),
+            path: None,
+            want: Decision::AskApproval,
+        },
+        MatrixCase {
+            name: "workspace-write on-request arbitrary shell",
+            sandbox: Sandbox::WorkspaceWrite,
+            approval: ApprovalPolicy::OnRequest,
+            tool: ToolKind::Shell,
+            command: Some("rm x"),
+            path: None,
+            want: Decision::Allow,
+        },
+        MatrixCase {
+            name: "workspace-write on-request write inside cwd",
+            sandbox: Sandbox::WorkspaceWrite,
+            approval: ApprovalPolicy::OnRequest,
+            tool: ToolKind::WriteFile,
+            command: None,
+            path: Some(inside.clone()),
+            want: Decision::Allow,
+        },
+        MatrixCase {
+            name: "workspace-write on-request write outside cwd",
+            sandbox: Sandbox::WorkspaceWrite,
+            approval: ApprovalPolicy::OnRequest,
+            tool: ToolKind::WriteFile,
+            command: None,
+            path: Some(outside.clone()),
+            want: Decision::AskApproval,
+        },
+        MatrixCase {
+            name: "workspace-write never write outside cwd",
+            sandbox: Sandbox::WorkspaceWrite,
+            approval: ApprovalPolicy::Never,
+            tool: ToolKind::WriteFile,
+            command: None,
+            path: Some(outside.clone()),
+            want: Decision::Deny,
+        },
+        MatrixCase {
+            name: "workspace-write untrusted write inside cwd",
+            sandbox: Sandbox::WorkspaceWrite,
+            approval: ApprovalPolicy::Untrusted,
+            tool: ToolKind::WriteFile,
+            command: None,
+            path: Some(inside.clone()),
+            want: Decision::AskApproval,
+        },
+        MatrixCase {
+            name: "workspace-write untrusted read file",
+            sandbox: Sandbox::WorkspaceWrite,
+            approval: ApprovalPolicy::Untrusted,
+            tool: ToolKind::ReadFile,
+            command: None,
+            path: Some(outside.clone()),
+            want: Decision::Allow,
+        },
+        MatrixCase {
+            name: "workspace-write on-failure write outside cwd",
+            sandbox: Sandbox::WorkspaceWrite,
+            approval: ApprovalPolicy::OnFailure,
+            tool: ToolKind::WriteFile,
+            command: None,
+            path: Some(outside.clone()),
+            want: Decision::AskApproval,
+        },
+        MatrixCase {
+            name: "danger-full-access never arbitrary shell",
+            sandbox: Sandbox::DangerFullAccess,
+            approval: ApprovalPolicy::Never,
+            tool: ToolKind::Shell,
+            command: Some("rm -rf /tmp/x"),
+            path: None,
+            want: Decision::Allow,
+        },
+        MatrixCase {
+            name: "danger-full-access untrusted non-whitelisted shell",
+            sandbox: Sandbox::DangerFullAccess,
+            approval: ApprovalPolicy::Untrusted,
+            tool: ToolKind::Shell,
+            command: Some("rm x"),
+            path: None,
+            want: Decision::AskApproval,
+        },
+    ];
+
+    for case in cases {
+        let req = request(case.tool, case.command, case.path.as_deref(), cwd);
+        let decision = evaluate(&req, case.sandbox, case.approval, cwd);
+        assert_eq!(decision, case.want, "{}", case.name);
+
+        let (detailed, reason) = evaluate_with_reason(&req, case.sandbox, case.approval, cwd);
+        assert_eq!(detailed, case.want, "{} (detailed)", case.name);
+        if case.want == Decision::Allow {
+            assert_eq!(reason, "", "{} returned a reason for Allow", case.name);
+        } else {
+            assert!(
+                !reason.is_empty(),
+                "{} returned no reason for {decision:?}",
+                case.name
+            );
+        }
+    }
+}
+
+#[test]
+fn sandbox_and_approval_reasons_are_exact() {
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path();
+    let inside = cwd.join("inside.txt");
+    std::fs::write(&inside, b"inside").unwrap();
+
+    let req = request(ToolKind::Shell, Some("rm x"), None, cwd);
+    let (decision, reason) =
+        evaluate_with_reason(&req, Sandbox::ReadOnly, ApprovalPolicy::OnRequest, cwd);
+    assert_eq!(decision, Decision::AskApproval);
+    assert_eq!(
+        reason,
+        "operation is not permitted by the read-only sandbox"
+    );
+
+    let req = request(ToolKind::Other("custom".into()), None, None, cwd);
+    let (decision, reason) = evaluate_with_reason(
+        &req,
+        Sandbox::WorkspaceWrite,
+        ApprovalPolicy::OnRequest,
+        cwd,
+    );
+    assert_eq!(decision, Decision::AskApproval);
+    assert_eq!(
+        reason,
+        "tool \"custom\" is not permitted by the workspace-write sandbox"
+    );
+
+    let req = request(ToolKind::WriteFile, None, Some(&inside), cwd);
+    let (decision, reason) = evaluate_with_reason(
+        &req,
+        Sandbox::WorkspaceWrite,
+        ApprovalPolicy::Untrusted,
+        cwd,
+    );
+    assert_eq!(decision, Decision::AskApproval);
+    assert_eq!(
+        reason,
+        "untrusted policy requires approval for non-whitelisted operations"
+    );
+
+    // A non-whitelisted shell keeps the sandbox reason under `untrusted`.
+    let req = request(ToolKind::Shell, Some("rm x"), None, cwd);
+    let (decision, reason) =
+        evaluate_with_reason(&req, Sandbox::ReadOnly, ApprovalPolicy::Untrusted, cwd);
+    assert_eq!(decision, Decision::AskApproval);
+    assert_eq!(
+        reason,
+        "operation is not permitted by the read-only sandbox"
+    );
+}
+
+#[test]
+fn parent_directory_components_are_rejected_before_resolution() {
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path();
+    let targets = [
+        PathBuf::from(".."),
+        PathBuf::from("../outside.txt"),
+        PathBuf::from("a/../b"),
+        PathBuf::from("inside/../../outside.txt"),
+        cwd.join("..").join("outside.txt"),
+    ];
+
+    for target in targets {
+        let err = inside_relative(cwd, &target).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("contains a parent-directory component"),
+            "inside_relative({target:?}) = {err}"
+        );
+        let err = bound_path(cwd, &target).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("contains a parent-directory component"),
+            "bound_path({target:?}) = {err}"
+        );
+    }
+}
+
+#[test]
+fn missing_tails_are_reattached() {
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path();
+
+    assert_eq!(
+        inside_relative(cwd, Path::new("a/b/c/new.txt")).unwrap(),
+        PathBuf::from("a/b/c/new.txt")
+    );
+    assert_eq!(
+        inside_relative(cwd, &cwd.join("a/b/c/new.txt")).unwrap(),
+        PathBuf::from("a/b/c/new.txt")
+    );
+    assert_eq!(inside_relative(cwd, cwd).unwrap(), PathBuf::from("."));
+}
+
+#[test]
+fn absolute_paths_outside_cwd_are_rejected() {
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("outside.txt");
+    std::fs::write(&outside, b"outside").unwrap();
+
+    let err = inside_relative(cwd, &outside).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("resolves outside working directory"),
+        "{err}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_resolution_matches_go_path_table() {
+    use std::os::unix::fs::symlink;
+
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path();
+
+    let inside_file = cwd.join("inside.txt");
+    std::fs::write(&inside_file, b"inside").unwrap();
+
+    symlink(outside, cwd.join("outside-directory")).unwrap();
+    std::fs::write(
+        cwd.join("outside-directory").join("escaped.txt"),
+        b"escaped",
+    )
+    .unwrap();
+
+    let outside_file = outside.join("outside.txt");
+    std::fs::write(&outside_file, b"outside").unwrap();
+    symlink(&outside_file, cwd.join("outside-file")).unwrap();
+
+    let inside_directory = cwd.join("inside-directory");
+    std::fs::create_dir(&inside_directory).unwrap();
+    symlink(&inside_directory, cwd.join("inside-directory-link")).unwrap();
+
+    // Relative and absolute spellings of a real file inside cwd.
+    assert_eq!(
+        inside_relative(cwd, Path::new("inside.txt")).unwrap(),
+        PathBuf::from("inside.txt")
+    );
+    assert_eq!(
+        inside_relative(cwd, &inside_file).unwrap(),
+        PathBuf::from("inside.txt")
+    );
+
+    // A file below a directory symlink that leaves cwd.
+    let escaped = cwd.join("outside-directory").join("escaped.txt");
+    let err = inside_relative(cwd, &escaped).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("resolves outside working directory"),
+        "{err}"
+    );
+
+    // A symlink to a file outside cwd.
+    let err = inside_relative(cwd, &cwd.join("outside-file")).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("resolves outside working directory"),
+        "{err}"
+    );
+
+    // A symlink followed by a parent-directory component is rejected before
+    // resolution, even though the lexical result could land back in cwd.
+    let dot_dot_escape = cwd.join("outside-directory").join("..").join("evil");
+    let err = inside_relative(cwd, &dot_dot_escape).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("contains a parent-directory component"),
+        "{err}"
+    );
+
+    // A missing tail below an inside symlink is resolved through the link.
+    let new_file = cwd.join("inside-directory-link").join("newfile.txt");
+    assert_eq!(
+        inside_relative(cwd, &new_file).unwrap(),
+        PathBuf::from("inside-directory/newfile.txt")
+    );
+
+    // A missing tail below an outside symlink is re-checked after resolution.
+    let escape_tail = cwd
+        .join("outside-directory")
+        .join("missing")
+        .join("new.txt");
+    let err = inside_relative(cwd, &escape_tail).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("resolves outside working directory"),
+        "{err}"
+    );
+}
+
+#[test]
+fn trusted_shell_uses_the_lexer_allowed_flag() {
+    use subagent_mcp::policy::path::is_whitelisted_shell;
+
+    assert!(is_whitelisted_shell("ls -la"));
+    assert!(!is_whitelisted_shell("rm x"));
+    // A lexical hazard is not trusted even though it is not an allowlist
+    // denial with a reason.
+    assert!(!is_whitelisted_shell("echo $HOME"));
+    assert!(!is_whitelisted_shell(""));
+}
+
+#[test]
+fn unbound_bound_path_reports_the_go_error() {
+    let err = bound_path(Path::new(""), Path::new("inside.txt")).unwrap_err();
+    assert_eq!(err.to_string(), "working directory is not bound");
+}
+
+#[test]
+fn bound_paths_join_under_the_root() {
+    let root_dir = tempfile::tempdir().unwrap();
+    let root = root_dir.path();
+    std::fs::write(root.join("inside.txt"), b"inside").unwrap();
+    std::fs::create_dir(root.join("sub")).unwrap();
+
+    assert_eq!(
+        bound_path(root, Path::new("inside.txt")).unwrap().path,
+        root.join("inside.txt")
+    );
+    assert_eq!(
+        bound_path(root, Path::new("sub/new.txt")).unwrap().path,
+        root.join("sub/new.txt")
+    );
+    assert_eq!(bound_path(root, Path::new(".")).unwrap().path, root);
+
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path().join("outside.txt");
+    std::fs::write(&outside, b"outside").unwrap();
+    assert!(bound_path(root, &outside).is_err());
+    assert!(bound_path(root, Path::new("../outside.txt")).is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn same_file_dedupes_bound_and_linked_paths() {
+    use std::os::unix::fs::symlink;
+
+    let root_dir = tempfile::tempdir().unwrap();
+    let root = root_dir.path();
+    let file = root.join("a.txt");
+    std::fs::write(&file, b"a").unwrap();
+    symlink(&file, root.join("link.txt")).unwrap();
+    std::fs::hard_link(&file, root.join("hard.txt")).unwrap();
+    std::fs::write(root.join("b.txt"), b"b").unwrap();
+
+    let bound_file = bound_path(root, Path::new("a.txt")).unwrap();
+    let bound_link = bound_path(root, Path::new("link.txt")).unwrap();
+    let bound_hard = bound_path(root, Path::new("hard.txt")).unwrap();
+    let bound_other = bound_path(root, Path::new("b.txt")).unwrap();
+
+    assert!(same_file(&bound_file.path, &bound_link.path).unwrap());
+    assert!(same_file(&bound_file.path, &bound_hard.path).unwrap());
+    assert!(!same_file(&bound_file.path, &bound_other.path).unwrap());
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_write_rejects_symlink_escape_with_inside_lexical_path() {
+    use std::os::unix::fs::symlink;
+
+    let cwd_dir = tempfile::tempdir().unwrap();
+    let cwd = cwd_dir.path();
+    let outside_dir = tempfile::tempdir().unwrap();
+    let outside = outside_dir.path();
+    std::fs::write(outside.join("evil.txt"), b"evil").unwrap();
+    symlink(outside, cwd.join("escape")).unwrap();
+
+    // The lexical path is inside cwd, but its parent symlink escapes.
+    let lexical_escape = cwd.join("escape").join("evil.txt");
+    let req = request(ToolKind::WriteFile, None, Some(&lexical_escape), cwd);
+    let (decision, reason) = evaluate_with_reason(
+        &req,
+        Sandbox::WorkspaceWrite,
+        ApprovalPolicy::OnRequest,
+        cwd,
+    );
+    assert_eq!(decision, Decision::AskApproval);
+    assert!(
+        reason.contains("resolves outside working directory"),
+        "{reason}"
+    );
+    assert_eq!(
+        evaluate(&req, Sandbox::WorkspaceWrite, ApprovalPolicy::Never, cwd),
+        Decision::Deny
+    );
+
+    // A missing tail below the escaping symlink is also rejected.
+    let lexical_new = cwd.join("escape").join("new.txt");
+    let req_new = request(ToolKind::WriteFile, None, Some(&lexical_new), cwd);
+    assert_eq!(
+        evaluate(
+            &req_new,
+            Sandbox::WorkspaceWrite,
+            ApprovalPolicy::OnRequest,
+            cwd
+        ),
+        Decision::AskApproval
+    );
+
+    // A real file inside cwd is allowed.
+    let inside = cwd.join("inside.txt");
+    std::fs::write(&inside, b"inside").unwrap();
+    let req_inside = request(ToolKind::WriteFile, None, Some(&inside), cwd);
+    assert_eq!(
+        evaluate(
+            &req_inside,
+            Sandbox::WorkspaceWrite,
+            ApprovalPolicy::OnRequest,
+            cwd
+        ),
+        Decision::Allow
+    );
+
+    // Workspace-write containment is measured against the bound root, not the
+    // lexical cwd string.
+    let mut bound_outside = request(ToolKind::WriteFile, None, Some(&inside), cwd);
+    bound_outside.bound_cwd = Some(outside.to_path_buf());
+    assert_eq!(
+        evaluate(
+            &bound_outside,
+            Sandbox::WorkspaceWrite,
+            ApprovalPolicy::OnRequest,
+            cwd
+        ),
+        Decision::AskApproval
+    );
+
+    let mut bound_inside = request(ToolKind::WriteFile, None, Some(&inside), cwd);
+    bound_inside.bound_cwd = Some(cwd.to_path_buf());
+    assert_eq!(
+        evaluate(
+            &bound_inside,
+            Sandbox::WorkspaceWrite,
+            ApprovalPolicy::OnRequest,
+            cwd
+        ),
+        Decision::Allow
+    );
 }

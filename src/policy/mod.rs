@@ -1,13 +1,17 @@
 //! Policy types and behavior.
 //!
 //! This module owns the shared enums, request struct and error type so that
-//! the lexer and the later matrix/path task can add behavior without a type
-//! dependency between them. The shell lexer lives in [`lexer`]; evaluation and
-//! path resolution are added by Task 15.
+//! the lexer and path modules can add behavior without a type dependency
+//! between them. The shell lexer lives in [`lexer`]; the decision matrix and
+//! path confinement live in [`path`].
 
 pub mod lexer;
+pub mod path;
 
 pub use lexer::{LexError, ShellAnalysis, analyze_shell};
+pub use path::{
+    BoundPath, bound_path, evaluate, evaluate_with_reason, inside_relative, within_sandbox,
+};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Sandbox {
