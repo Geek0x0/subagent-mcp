@@ -26,8 +26,10 @@ pub const INTERNAL_ERROR: i32 = -32603;
 ///
 /// `raw` is the value exactly as it appeared on the wire and is echoed back in
 /// the response. `canonical` is the Go `canonicalRequestID` key used to match
-/// `notifications/cancelled` to the in-flight call; it is `None` for values Go
-/// cannot key (`null` never reaches this type because it is a notification).
+/// `notifications/cancelled` to the in-flight call; it is `None` for non-string,
+/// non-number IDs (bool, object, array), which mcp-go accepts and echoes but
+/// cannot key for cancellation. `null` never reaches this type because it is a
+/// notification.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RequestId {
     pub raw: Value,
@@ -162,8 +164,9 @@ struct RawFrame {
 ///
 /// A missing or `null` `id` yields [`Frame::Notification`], matching mcp-go;
 /// the caller must not write a response for it (a `tools/call` notification is
-/// still scheduled through the worker path). A non-null `id` with a `method`
-/// is a request, and one with `result` or `error` instead of a method is a
+/// still scheduled through the worker path). Any non-null `id` with a `method`
+/// is a request — bool/object/array IDs included, matching mcp-go's server
+/// dispatch — and one with `result` or `error` instead of a method is a
 /// response. Frame-level failures carry a [`PARSE_ERROR`] or
 /// [`INVALID_REQUEST`] code and the mcp-go message text.
 pub fn parse_frame(line: &str) -> Result<Frame, JsonRpcError> {
@@ -196,12 +199,6 @@ pub fn parse_frame(line: &str) -> Result<Frame, JsonRpcError> {
             params,
         }));
     };
-    if !matches!(&raw_id, Value::String(_) | Value::Number(_)) {
-        return Err(
-            JsonRpcError::new(INVALID_REQUEST, format!("invalid request id: {raw_id}"))
-                .with_id(RequestId::new(raw_id)),
-        );
-    }
     let id = RequestId::new(raw_id);
 
     Ok(match method {
@@ -225,9 +222,11 @@ fn parse_error() -> JsonRpcError {
 }
 
 fn invalid_version(id: Option<RequestId>) -> JsonRpcError {
-    let mut error = JsonRpcError::new(INVALID_REQUEST, "Invalid JSON-RPC version");
-    error.id = id;
-    error
+    let error = JsonRpcError::new(INVALID_REQUEST, "Invalid JSON-RPC version");
+    match id {
+        Some(id) => error.with_id(id),
+        None => error,
+    }
 }
 
 #[cfg(test)]
@@ -510,31 +509,39 @@ mod tests {
     }
 
     #[test]
-    fn non_scalar_ids_are_rejected() {
-        for line in [
-            r#"{"jsonrpc":"2.0","id":true,"method":"x"}"#,
-            r#"{"jsonrpc":"2.0","id":{"a":1},"method":"x"}"#,
-            r#"{"jsonrpc":"2.0","id":[1],"method":"x"}"#,
-        ] {
-            let err = parse_error(line);
-            assert_eq!(err.code, INVALID_REQUEST, "line={line}");
-            assert!(
-                err.message.starts_with("invalid request id: "),
-                "message={}",
-                err.message
+    fn non_scalar_ids_are_accepted_and_echoed_raw() {
+        // mcp-go's server dispatch never decodes the top-level id through
+        // RequestId (mcp.Request has no ID field), so bool/object/array ids are
+        // accepted as requests and echoed unchanged. They cannot be keyed for
+        // cancellation, so canonical stays None.
+        let cases = [
+            (r#"{"jsonrpc":"2.0","id":true,"method":"x"}"#, json!(true)),
+            (
+                r#"{"jsonrpc":"2.0","id":{"a":1},"method":"x"}"#,
+                json!({"a":1}),
+            ),
+            (r#"{"jsonrpc":"2.0","id":[1],"method":"x"}"#, json!([1])),
+            (
+                r#"{"jsonrpc":"2.0","id":true,"method":"tools/call","params":{"name":"start"}}"#,
+                json!(true),
+            ),
+        ];
+        for (line, want) in cases {
+            let request = parse_request(line);
+            assert_eq!(request.id.raw, want, "line={line}");
+            assert!(request.id.canonical.is_none(), "line={line}");
+            assert_eq!(
+                serde_json::to_string(&request.id).unwrap(),
+                serde_json::to_string(&want).unwrap(),
+                "raw echo must be preserved for {line}"
             );
         }
+    }
 
-        // mcp-go's RequestId.UnmarshalJSON text for a bool id is exactly this.
-        // Note: mcp-go's server dispatch never decodes the top-level id through
-        // RequestId (mcp.Request has no ID field), so it accepts and echoes
-        // these ids; the plan restricts RequestId to string/number/null, so the
-        // frame layer rejects them here (reported as a known divergence).
-        let err = parse_error(r#"{"jsonrpc":"2.0","id":true,"method":"x"}"#);
-        assert_eq!(err.message, "invalid request id: true");
-        let id = err.id.expect("rejected id should still be echoed");
-        assert_eq!(id.raw, json!(true));
-        assert!(id.canonical.is_none());
+    #[test]
+    fn non_scalar_ids_still_cannot_be_cancelled() {
+        let request = parse_request(r#"{"jsonrpc":"2.0","id":{"a":1},"method":"tools/call"}"#);
+        assert_eq!(canonical_request_id(&request.id.raw), None);
     }
 
     #[test]
