@@ -335,24 +335,37 @@ fn build_request_body(
     serde_json::Value::Object(body)
 }
 
+/// Go `json.Unmarshal` treats an explicit `null` for a non-pointer struct field
+/// as "no effect" (the zero value: nil map, `""`, `0`) and produces no error.
+/// serde's `#[serde(default)]` only covers a *missing* field, so route these
+/// fields through a helper that collapses `null` into `T::default()` while
+/// leaving real values intact; `#[serde(default)]` still handles the absent case.
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[derive(Deserialize)]
 struct SystemOneResponse {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     model: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     answers: BTreeMap<String, ChoiceAnswer>,
     usage: Option<SystemOneUsage>,
 }
 
 #[derive(Deserialize)]
 struct ChoiceAnswer {
-    #[serde(rename = "type", default)]
+    #[serde(rename = "type", default, deserialize_with = "null_default")]
     kind: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     choice: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     confidence: f64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     probabilities: BTreeMap<String, f64>,
 }
 

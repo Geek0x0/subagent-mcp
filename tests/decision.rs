@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use subagent_mcp::config::AutoConfig;
-use subagent_mcp::decision::{Candidate, DecisionClient};
+use subagent_mcp::decision::{Candidate, DecisionClient, JevDecision};
 use subagent_mcp::util::run::RunContext;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -199,6 +199,22 @@ fn candidates() -> Vec<Candidate> {
             description: String::new(),
         },
     ]
+}
+
+/// Port of Go `chooseAgainst`: run `choose` against a canned 200 response and
+/// return the decision or the exact error message.
+async fn choose_against(response: &str) -> Result<JevDecision, String> {
+    let (base, _, rx) = spawn_mock(Reply::Response {
+        status: 200,
+        body: response.to_string(),
+    })
+    .await;
+    let client = make_client(&auto_config(&base));
+    let result = client
+        .choose(&plain_ctx(), "task", Path::new("/repo"), &candidates())
+        .await;
+    let _ = recorded(rx).await;
+    result.map_err(|e| e.message)
 }
 
 // ---------------------------------------------------------------------------
@@ -535,4 +551,91 @@ async fn choose_honors_run_cancellation() {
         .await
         .unwrap_err();
     assert_eq!(err.message, "systemone: request: context canceled");
+}
+
+// ---------------------------------------------------------------------------
+// Explicit `null` in response fields (review finding I1)
+//
+// Go `json.Unmarshal` treats `null` for a non-pointer struct field as "no
+// effect" (the zero value), not a type error: map -> nil, string -> "", float
+// -> 0. `#[serde(default)]` only handles a *missing* field, so these tests
+// pin the required acceptance of explicit `null`.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn choose_accepts_null_answers_as_no_answer() {
+    // Go: answer.Answers is nil -> "returned no answer for question".
+    let response =
+        r#"{"model":"jev-1.14.0","answers":null,"usage":{"input_tokens":10,"output_tokens":1}}"#;
+    let err = choose_against(response)
+        .await
+        .expect_err("expected a no-answer error");
+    assert_eq!(
+        err,
+        "systemone: model \"jev-1.14.0\" returned no answer for question \"model\""
+    );
+}
+
+#[tokio::test]
+async fn choose_accepts_null_type_as_non_choice() {
+    // Go: choice.Type is "" -> "answer type \"\" is not \"choice\"".
+    let response = r#"{"model":"jev-1.14.0","answers":{"model":{"type":null,"choice":"c1"}}}"#;
+    let err = choose_against(response)
+        .await
+        .expect_err("expected a non-choice error");
+    assert_eq!(
+        err,
+        "systemone: model \"jev-1.14.0\" answer type \"\" is not \"choice\""
+    );
+}
+
+#[tokio::test]
+async fn choose_accepts_null_choice_as_unknown() {
+    // Go: choice.Choice is "" -> "chose unknown choice \"\"".
+    let response = r#"{"model":"jev-1.14.0","answers":{"model":{"type":"choice","choice":null}}}"#;
+    let err = choose_against(response)
+        .await
+        .expect_err("expected an unknown-choice error");
+    assert_eq!(
+        err,
+        "systemone: model \"jev-1.14.0\" chose unknown choice \"\""
+    );
+}
+
+#[tokio::test]
+async fn choose_accepts_null_confidence_as_zero() {
+    // Go: choice.Confidence is 0 -> valid selection with confidence 0.
+    let response = r#"{"model":"jev-1.14.0","answers":{"model":{"type":"choice","choice":"c1","confidence":null,"probabilities":{}}},"usage":{"input_tokens":10,"output_tokens":1}}"#;
+    let decision = choose_against(response)
+        .await
+        .expect("expected a valid selection");
+    assert!(decision.confidence.abs() < 1e-9, "{}", decision.confidence);
+    assert_eq!(decision.provider, "alpha");
+}
+
+#[tokio::test]
+async fn choose_accepts_null_probabilities_as_valid_selection() {
+    // Go: `if choice.Probabilities != nil` guard skips nil -> empty result map.
+    let response = r#"{"model":"jev-1.14.0","answers":{"model":{"type":"choice","choice":"c1","confidence":0.9,"probabilities":null}},"usage":{"input_tokens":12,"output_tokens":2}}"#;
+    let decision = choose_against(response)
+        .await
+        .expect("expected a valid selection");
+    assert_eq!(decision.provider, "alpha");
+    assert_eq!(decision.model, "m-fast");
+    assert_eq!(decision.probabilities.len(), 0);
+    assert_eq!(decision.input_tokens, Some(12));
+    assert_eq!(decision.output_tokens, Some(2));
+}
+
+#[tokio::test]
+async fn choose_accepts_null_model_as_empty() {
+    // Go: answer.Model is "" -> no-answer error quoting the empty model.
+    let response = r#"{"model":null,"answers":null}"#;
+    let err = choose_against(response)
+        .await
+        .expect_err("expected a no-answer error");
+    assert_eq!(
+        err,
+        "systemone: model \"\" returned no answer for question \"model\""
+    );
 }
