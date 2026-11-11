@@ -7,7 +7,7 @@
 //! wait. A descendant that escapes the group with `setsid` can survive — the
 //! same limitation Go documents.
 
-use crate::tools::process::{CommandSpec, build_command, cancelled_error};
+use crate::tools::process::{CommandSpec, LimitedBuffer, build_command, cancelled_error};
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
@@ -40,8 +40,9 @@ pub fn run_managed_command(
         set_nonblocking(s.as_raw_fd())?;
     }
 
-    let mut out_buf = Vec::new();
-    let mut err_buf = Vec::new();
+    // Single Go-style limited buffer: both pipes feed it, capping during
+    // draining (never buffering unbounded output) and counting the true total.
+    let mut limited = LimitedBuffer::new();
     let mut out_eof = stdout.is_none();
     let mut err_eof = stderr.is_none();
     let mut status: Option<ExitStatus> = None;
@@ -51,8 +52,8 @@ pub fn run_managed_command(
 
     loop {
         poll_once(&stdout, &stderr, out_eof, err_eof, POLL_INTERVAL_MS);
-        drain(&mut stdout, &mut out_buf, &mut out_eof)?;
-        drain(&mut stderr, &mut err_buf, &mut err_eof)?;
+        drain(&mut stdout, &mut limited, &mut out_eof)?;
+        drain(&mut stderr, &mut limited, &mut err_eof)?;
 
         if status.is_none()
             && let Some(s) = child.try_wait()?
@@ -97,13 +98,16 @@ pub fn run_managed_command(
     drop(stdout);
     drop(stderr);
 
+    // The captured/truncated bytes travel with the cancellation error so the
+    // shell tool can still return them as `output` (Go keeps `out` on error).
+    let captured = limited.finish();
     if killed {
-        return Err(cancelled_error());
+        return Err(cancelled_error(captured));
     }
     Ok(Output {
         status,
-        stdout: out_buf,
-        stderr: err_buf,
+        stdout: captured,
+        stderr: Vec::new(),
     })
 }
 
@@ -154,8 +158,14 @@ fn poll_once(
     }
 }
 
-/// Drain all currently available bytes from a non-blocking pipe read end.
-fn drain(reader: &mut Option<impl Read>, buf: &mut Vec<u8>, eof: &mut bool) -> io::Result<()> {
+/// Drain all currently available bytes from a non-blocking pipe read end into
+/// the capped buffer. Reading continues even after the cap is reached so the
+/// child never blocks on a full pipe; surplus bytes are counted and discarded.
+fn drain(
+    reader: &mut Option<impl Read>,
+    buf: &mut LimitedBuffer,
+    eof: &mut bool,
+) -> io::Result<()> {
     let Some(r) = reader.as_mut() else {
         *eof = true;
         return Ok(());
@@ -170,7 +180,7 @@ fn drain(reader: &mut Option<impl Read>, buf: &mut Vec<u8>, eof: &mut bool) -> i
                 *eof = true;
                 break;
             }
-            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Ok(n) => buf.push(&chunk[..n]),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e),

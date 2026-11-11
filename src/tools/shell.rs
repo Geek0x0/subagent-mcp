@@ -27,14 +27,23 @@ pub const MAX_SHELL_TIMEOUT: Duration = Duration::from_secs(600);
 /// Go `cmd.WaitDelay = time.Second`: bounds inherited-pipe waits.
 pub const WAIT_DELAY: Duration = Duration::from_secs(1);
 
-/// Rust port of Go's `(out string, exitCode int, err error)`. Go's `err` carries
-/// a message that `ShellResult` has no dedicated field for; `is_error` records
-/// `err != nil` and, on those error paths, `output` carries the exact Go error
-/// message (Go's `out` is empty on every error path this tool exercises). On
-/// success and on non-zero exits, `output` is the combined, capped stdout/stderr.
+/// Rust port of Go's `(out string, exitCode int, err error)`.
+/// - `output` is ALWAYS the captured/truncated command output (Go's `out`),
+///   including bytes produced before a timeout/cancellation/error.
+/// - `exit_code` is Go's `exitCode`: 0, N, or -1 (also -1 whenever `error`
+///   is Some).
+/// - `error` is Go's `err` text: `command timed out after <duration>`,
+///   `context canceled`, or a spawn/I/O error; `None` on success.
+/// - `is_error` mirrors `error.is_some()`.
+///
+/// Task 23B composes the final tool text exactly as Go's `execToolCall` does:
+/// `exit code: <code>\n<output>` plus `\n[error: <error>]` when `error` is Some.
+/// This `error` field is an intentional interface extension (Task 17 fix I-4)
+/// so that composition is exact and the captured output is never lost.
 pub struct ShellResult {
     pub output: String,
     pub exit_code: i32,
+    pub error: Option<String>,
     pub is_error: bool,
 }
 
@@ -220,26 +229,6 @@ pub fn effective_timeout(timeout: Option<Duration>) -> Duration {
     }
 }
 
-/// Go `limitedBuffer`: keep the first `MaxOutputBytes` bytes of the merged
-/// stdout/stderr stream and append a truncation marker reporting the total.
-/// Rust captures the two pipes separately, so stdout precedes stderr; Go uses a
-/// single merged pipe. Total byte count and the cap are identical.
-fn cap_output(stdout: &[u8], stderr: &[u8]) -> String {
-    let total = stdout.len() + stderr.len();
-    let mut combined = Vec::with_capacity(total.min(MAX_OUTPUT_BYTES));
-    let from_stdout = stdout.len().min(MAX_OUTPUT_BYTES);
-    combined.extend_from_slice(&stdout[..from_stdout]);
-    if from_stdout < MAX_OUTPUT_BYTES {
-        let from_stderr = stderr.len().min(MAX_OUTPUT_BYTES - from_stdout);
-        combined.extend_from_slice(&stderr[..from_stderr]);
-    }
-    let mut out = String::from_utf8_lossy(&combined).into_owned();
-    if total > MAX_OUTPUT_BYTES {
-        out.push_str(&format!("\n[output truncated: {total} bytes total]"));
-    }
-    out
-}
-
 #[derive(Clone, Copy)]
 enum Reason {
     /// Shell timeout or parent run deadline (`context.DeadlineExceeded`).
@@ -276,6 +265,12 @@ async fn watchdog(ctx: &RunContext, effective: Duration, child: &CancellationTok
 }
 
 /// Map the managed-command outcome to the exact Go `RunShell` result.
+///
+/// Go returns `(out, exitCode, err)`: `out` is the captured/truncated output on
+/// EVERY path, `exitCode` is 0/N/-1, and `err` is the timeout/cancellation/spawn
+/// text. `run_managed_command` already produced the capped/merged/truncation-
+/// marked bytes (in `Output.stdout`, or attached to the cancellation error), so
+/// this just splits them into `output` and `error`.
 fn assemble(
     result: io::Result<Output>,
     effective: Duration,
@@ -289,52 +284,44 @@ fn assemble(
             Reason::Deadline
         }
     });
-    match result {
-        // The runner had to kill a live direct child: this is the timeout /
-        // cancellation path (Go checks `runCtx.Err()` before `*ExitError`).
+
+    let (output, exit_code, error): (String, i32, Option<String>) = match result {
+        // The runner killed a still-live direct child. The cancellation error
+        // carries the output captured before the kill, so `out` is preserved
+        // (I-4). Go checks `runCtx.Err()` before `*ExitError` -> error path.
         Err(e) if process::is_cancelled(&e) => {
-            let output = match why {
+            let bytes = process::cancelled_output(&e);
+            let text = match why {
                 Reason::Deadline => {
                     format!("command timed out after {}", format_go_duration(effective))
                 }
                 Reason::Canceled => "context canceled".to_string(),
             };
-            ShellResult {
-                output,
-                exit_code: -1,
-                is_error: true,
-            }
+            (String::from_utf8_lossy(&bytes).into_owned(), -1, Some(text))
         }
-        // A genuine spawn / I/O failure (Go: `return out, -1, runErr`).
-        Err(e) => ShellResult {
-            output: e.to_string(),
-            exit_code: -1,
-            is_error: true,
-        },
+        // Genuine spawn / I/O failure: Go's `out` is empty (nothing captured).
+        Err(e) => (String::new(), -1, Some(e.to_string())),
         Ok(output) => {
-            let combined = cap_output(&output.stdout, &output.stderr);
+            // `Output.stdout` holds the capped/merged/truncation-marked bytes
+            // from `LimitedBuffer::finish()`; stderr is already merged in.
+            let combined = String::from_utf8_lossy(&output.stdout).into_owned();
             // Go: `ErrWaitDelay`/nil -> 0; `*ExitError` -> ExitCode; a signal
             // kill not caused by cancellation reports -1 with no error.
-            if output.status.success() {
-                ShellResult {
-                    output: combined,
-                    exit_code: 0,
-                    is_error: false,
-                }
-            } else if let Some(code) = output.status.code() {
-                ShellResult {
-                    output: combined,
-                    exit_code: code,
-                    is_error: false,
-                }
+            let exit_code = if output.status.success() {
+                0
             } else {
-                ShellResult {
-                    output: combined,
-                    exit_code: -1,
-                    is_error: false,
-                }
-            }
+                output.status.code().unwrap_or(-1)
+            };
+            (combined, exit_code, None)
         }
+    };
+
+    let is_error = error.is_some();
+    ShellResult {
+        output,
+        exit_code,
+        error,
+        is_error,
     }
 }
 

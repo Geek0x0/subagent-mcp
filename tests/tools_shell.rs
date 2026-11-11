@@ -1,9 +1,16 @@
+#![cfg(unix)]
+
 //! Shell tool integration tests (Task 17).
 //!
 //! Port of the Go shell cases in `internal/tools/tools_test.go`,
 //! `internal/tools/git_vectors_test.go`, and the shell-facing cases in
 //! `cmd/subagent-mcp/main_test.go`. The bash wrapper is asserted byte-for-byte
 //! against an independent golden copied verbatim from `internal/tools/tools.go`.
+//!
+//! The whole target is Unix-only: the tests invoke Unix-only tools and libc
+//! (`bash`, `sleep`, `setsid`, `/dev/zero`, `head`, `tr`, `/bin/sh`,
+//! `.bash_profile`, `kill`, `/proc/{pid}/stat`). Gating the file keeps every
+//! target compiling while leaving Unix coverage unchanged (Task 17 fix I-1).
 //!
 //! Every test takes `SERIAL` because the Go baseline keeps the scrub
 //! configuration and `HOME` in process-global state; the Rust port mirrors that
@@ -154,15 +161,8 @@ async fn run(cwd: &Path, command: &str, timeout: Duration) -> ShellResult {
 }
 
 fn chmod_exec(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
 /// Snapshot and restore process-global env vars (serialized by `SERIAL`).
@@ -379,6 +379,7 @@ async fn runs_command_in_working_directory() {
     let cwd = tempfile::tempdir().unwrap();
     let r = run(cwd.path(), "echo hello; pwd", Duration::from_secs(2)).await;
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0);
     let lines: Vec<&str> = r.output.trim().split('\n').collect();
     assert_eq!(lines.len(), 2, "output = {:?}", r.output);
@@ -395,6 +396,7 @@ async fn nonzero_exit_without_error() {
     let tmp = tempfile::tempdir().unwrap();
     let r = run(tmp.path(), "exit 3", Duration::from_secs(2)).await;
     assert!(!r.is_error);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 3);
     assert_eq!(r.output, "");
 }
@@ -410,6 +412,7 @@ async fn merges_stdout_and_stderr() {
     )
     .await;
     assert!(!r.is_error);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0);
     assert!(r.output.contains("out"), "{:?}", r.output);
     assert!(r.output.contains("err"), "{:?}", r.output);
@@ -424,9 +427,29 @@ async fn kills_process_group_on_timeout() {
     let elapsed = start.elapsed();
     assert!(r.is_error);
     assert_eq!(r.exit_code, -1);
-    assert_eq!(r.output, "command timed out after 100ms");
-    assert!(r.output.contains("timed out"));
+    // `sleep 5` produces no output; the timeout text now lives in `error`.
+    assert_eq!(r.output, "");
+    assert_eq!(r.error.as_deref(), Some("command timed out after 100ms"));
     assert!(elapsed < Duration::from_secs(1), "elapsed = {elapsed:?}");
+}
+
+/// I-4: Go returns `(out, code, err)` on timeout — the bytes produced before
+/// the kill are preserved in `output`, the timeout text moves to `error`, and
+/// `is_error` mirrors `error.is_some()`.
+#[tokio::test]
+async fn timeout_preserves_output_before_kill() {
+    let _g = SERIAL.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let r = run(
+        tmp.path(),
+        "echo BEFORE_OUTPUT; sleep 5",
+        Duration::from_millis(300),
+    )
+    .await;
+    assert_eq!(r.output, "BEFORE_OUTPUT\n");
+    assert_eq!(r.exit_code, -1);
+    assert_eq!(r.error.as_deref(), Some("command timed out after 300ms"));
+    assert!(r.is_error);
 }
 
 #[tokio::test]
@@ -444,6 +467,7 @@ async fn returns_success_when_background_process_holds_pipe() {
     let child_pid = read_pid(&cwd.path().join("child.pid"));
     let _guard = KillGuard(child_pid);
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0);
     assert!(r.output.contains("done"), "{:?}", r.output);
     assert!(elapsed < Duration::from_secs(2), "elapsed = {elapsed:?}");
@@ -467,7 +491,8 @@ async fn grandchild_timeout_bounds_inherited_pipe_wait() {
     let _guard = KillGuard(escaped_pid);
     assert!(r.is_error);
     assert_eq!(r.exit_code, -1);
-    assert_eq!(r.output, "command timed out after 200ms");
+    assert_eq!(r.output, "");
+    assert_eq!(r.error.as_deref(), Some("command timed out after 200ms"));
     assert!(elapsed < Duration::from_secs(2), "elapsed = {elapsed:?}");
     // The in-group grandchild is killed by the process-group sweep.
     assert!(wait_for_process_exit(child_pid, Duration::from_secs(1)));
@@ -493,6 +518,7 @@ async fn setsid_escape_descendant_may_survive() {
     let escaped_pid = read_pid(&cwd.path().join("escaped.pid"));
     let _guard = KillGuard(escaped_pid);
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0);
     assert!(r.output.contains("started"), "{:?}", r.output);
     // WaitDelay (1s) bounds the drain of the inherited pipe.
@@ -518,6 +544,7 @@ async fn nonzero_exit_precedence_when_pipes_held() {
     let escaped_pid = read_pid(&cwd.path().join("escaped.pid"));
     let _guard = KillGuard(escaped_pid);
     assert!(!r.is_error);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 7);
     assert_eq!(r.output, "");
     assert!(elapsed >= WAIT_DELAY / 2, "elapsed = {elapsed:?}");
@@ -535,6 +562,7 @@ async fn truncates_output_at_16k() {
     )
     .await;
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0);
     let len = r.output.len();
     assert!(
@@ -563,6 +591,7 @@ async fn scrubbed_env_configurable() {
     let tmp = tempfile::tempdir().unwrap();
     let r = run(tmp.path(), "env", Duration::from_secs(5)).await;
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert!(!r.output.contains("secret-1"));
     assert!(!r.output.contains("SUBAGENT_MCP_CONFIG"));
     assert!(r.output.contains("KEEP_ME=kept"), "{:?}", r.output);
@@ -598,6 +627,7 @@ async fn scrubs_login_profile_provider_key_keeps_path() {
     )
     .await;
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert!(
         !r.output.contains("profile-provider-secret"),
         "{:?}",
@@ -629,6 +659,7 @@ async fn scrubs_login_profile_subagent_environment() {
     )
     .await;
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert_eq!(r.output, "subagent=unset\n");
     set_scrubbed_env(vec![], vec!["SUBAGENT_MCP_".into()]);
 }
@@ -648,6 +679,7 @@ async fn disables_profile_aliases_and_functions() {
     let tmp = tempfile::tempdir().unwrap();
     let r = run(tmp.path(), "echo safe", Duration::from_secs(5)).await;
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0);
     assert_eq!(r.output, "safe\n");
 }
@@ -727,6 +759,7 @@ async fn git_function_does_not_break_commit() {
     )
     .await;
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0, "output = {:?}", r.output);
     assert!(repo.join(".git/objects").exists());
 }
@@ -744,6 +777,7 @@ async fn git_wrapper_honours_global_config() {
     fs::write(home.join("global-config"), "[core]\n\tabbrev = 9\n").unwrap();
     let r = run(&repo, "git rev-parse --short HEAD", Duration::from_secs(10)).await;
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0, "output = {:?}", r.output);
     assert_eq!(r.output.trim().len(), 9, "output = {:?}", r.output);
 }
@@ -790,6 +824,7 @@ async fn safe_git_neutralizes_repository_diff_external() {
     let _ = fs::remove_file(&marker);
     let r = run(&repo, "git diff", Duration::from_secs(10)).await;
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0, "output = {:?}", r.output);
     assert!(
         !marker.exists(),
@@ -835,6 +870,7 @@ async fn fake_sandbox_launcher_wraps_command() {
     .await;
     assert!(launcher.called.load(Ordering::SeqCst));
     assert!(!r.is_error, "err: {:?}", r.output);
+    assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0);
     assert!(r.output.starts_with("SANDBOX_WRAPPED"), "{:?}", r.output);
     assert!(r.output.contains("REAL"), "{:?}", r.output);
