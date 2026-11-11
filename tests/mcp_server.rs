@@ -18,6 +18,7 @@ use tokio::time::timeout;
 struct RecordedCall {
     name: String,
     args: Value,
+    meta: Option<Value>,
     canonical: Option<String>,
 }
 
@@ -27,6 +28,7 @@ struct FakeInner {
     started: AtomicUsize,
     calls: Mutex<Vec<RecordedCall>>,
     release: Notify,
+    inline_release: Notify,
 }
 
 #[derive(Clone)]
@@ -43,6 +45,7 @@ impl FakeHandler {
                 started: AtomicUsize::new(0),
                 calls: Mutex::new(Vec::new()),
                 release: Notify::new(),
+                inline_release: Notify::new(),
             }),
         }
     }
@@ -57,6 +60,12 @@ impl FakeHandler {
 
     fn release_one(&self) {
         self.inner.release.notify_one();
+    }
+
+    /// Releases only the call that ran inline in the read loop. Releasing a
+    /// pooled worker would not unblock the read loop.
+    fn release_inline(&self) {
+        self.inner.inline_release.notify_one();
     }
 
     fn calls(&self) -> Vec<RecordedCall> {
@@ -144,6 +153,7 @@ impl ToolHandler for FakeHandler {
         self.inner.calls.lock().unwrap().push(RecordedCall {
             name: name.to_string(),
             args: args.clone(),
+            meta: ctx.meta.clone(),
             canonical: ctx.request_id.as_ref().and_then(|id| id.canonical.clone()),
         });
 
@@ -161,8 +171,12 @@ impl ToolHandler for FakeHandler {
                     _ = self.inner.release.notified() => Ok(json!({"ok": true})),
                 }
             }
-            "slow" | "inline" => {
+            "slow" => {
                 self.inner.release.notified().await;
+                Ok(json!({"ok": true}))
+            }
+            "inline" => {
+                self.inner.inline_release.notified().await;
                 Ok(json!({"ok": true}))
             }
             "queued" => Ok(json!({"ok": true})),
@@ -350,12 +364,30 @@ async fn tools_list_includes_schemas_and_annotations() {
 
 #[tokio::test]
 async fn tools_call_returns_the_handler_result() {
-    let mut server = Harness::start(FakeHandler::new());
+    let handler = FakeHandler::new();
+    let mut server = Harness::start(handler.clone());
     let response = server
         .request("tools/call", json!({"name": "echo", "arguments": {"x": 1}}))
         .await;
     assert_eq!(response["result"]["name"], "echo");
-    assert_eq!(response["result"]["args"]["x"], 1);
+    assert_eq!(response["result"]["args"], json!({"x": 1}));
+
+    // The server must not leak its request-id bookkeeping into the tool's
+    // arguments. Go writes it to `params._meta`, never `arguments`.
+    let args = &response["result"]["args"];
+    assert!(
+        args.get("_meta").is_none(),
+        "arguments must not gain a _meta object: {args}"
+    );
+    assert!(
+        args.get("subagent-mcp/requestId").is_none(),
+        "arguments must not gain the request-id key: {args}"
+    );
+
+    // The handler itself also saw the arguments unchanged.
+    let calls = handler.calls();
+    assert_eq!(calls[0].args, json!({"x": 1}));
+    assert!(calls[0].args.get("_meta").is_none());
 }
 
 #[tokio::test]
@@ -404,21 +436,94 @@ async fn malformed_frames_use_the_mcp_go_frame_errors() {
 }
 
 #[tokio::test]
-async fn request_id_is_injected_into_meta_and_cancels_the_call() {
+async fn request_id_is_injected_into_params_meta_and_cancels_the_call() {
     let handler = FakeHandler::new();
     let mut server = Harness::start(handler.clone());
 
-    server.send_call_with_raw_id("7", "wait").await;
+    // The client sends its own params._meta; the server must preserve it and
+    // add the canonical request id next to it.
+    server
+        .send_frame(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"wait","arguments":{"x":1},"_meta":{"client":"value"}}}"#,
+        )
+        .await;
     server.wait_started(&handler, 1).await;
 
     let calls = handler.calls();
     assert_eq!(calls[0].name, "wait");
-    assert_eq!(
-        calls[0].args["_meta"]["subagent-mcp/requestId"], "int64:7",
-        "the canonical request id must be injected into _meta"
-    );
     assert_eq!(calls[0].canonical.as_deref(), Some("int64:7"));
 
+    // (a) params._meta reaches the handler with the injected key.
+    let meta = calls[0]
+        .meta
+        .as_ref()
+        .expect("params._meta must reach the handler");
+    assert_eq!(
+        meta["subagent-mcp/requestId"], "int64:7",
+        "the canonical request id must be injected into params._meta"
+    );
+    assert_eq!(
+        meta["client"], "value",
+        "the client's own params._meta must be preserved"
+    );
+
+    // (b) arguments are byte/value-unchanged and carry no _meta.
+    assert_eq!(
+        calls[0].args,
+        json!({"x": 1}),
+        "the handler must see the client's arguments unchanged"
+    );
+    assert!(
+        calls[0].args.get("_meta").is_none(),
+        "arguments must never gain a _meta object"
+    );
+
+    server
+        .send_frame(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
+        )
+        .await;
+    let response = server.recv().await;
+    assert_eq!(response["id"], 7);
+    assert_eq!(response["result"]["cancelled"], true);
+}
+
+#[tokio::test]
+async fn client_supplied_arguments_meta_does_not_drive_cancellation() {
+    let handler = FakeHandler::new();
+    let mut server = Harness::start(handler.clone());
+
+    // The client tries to key the call through `arguments._meta` with a forged
+    // request id that does not match the JSON-RPC id.
+    server
+        .send_frame(
+            r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"wait","arguments":{"_meta":{"subagent-mcp/requestId":"int64:8"}}}}"#,
+        )
+        .await;
+    server.wait_started(&handler, 1).await;
+
+    let calls = handler.calls();
+    assert_eq!(calls[0].canonical.as_deref(), Some("int64:7"));
+    assert_eq!(
+        calls[0].args["_meta"]["subagent-mcp/requestId"], "int64:8",
+        "arguments are passed through unchanged, forged key included"
+    );
+
+    // A cancellation for the forged key must not cancel the call.
+    server
+        .send_frame(
+            r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":8}}"#,
+        )
+        .await;
+    assert!(
+        server
+            .recv_within(Duration::from_millis(100))
+            .await
+            .is_none(),
+        "a forged arguments._meta key must not register the call"
+    );
+
+    // The real key is still the JSON-RPC request id.
     server
         .send_frame(
             r#"{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":7}}"#,
@@ -565,10 +670,20 @@ async fn queue_full_runs_inline_and_stops_reading() {
     for _ in 0..100 {
         server.send_call("queued").await;
     }
-    server.send_call("inline").await;
+    // The 133rd call cannot enter the full queue, so mcp-go runs it inline in
+    // the read loop and stops reading frames until it finishes.
+    server.send_call_with_raw_id("9000", "inline").await;
     server.wait_started(&handler, 33).await;
-
     assert_eq!(handler.max_active(), 33, "the 133rd call runs inline");
+
+    // Send a frame behind the blocked inline call. A read loop that had not
+    // stopped reading would answer this immediately.
+    let ping_id = 9001;
+    server
+        .send_frame(&format!(
+            r#"{{"jsonrpc":"2.0","id":{ping_id},"method":"ping"}}"#
+        ))
+        .await;
     assert!(
         server
             .recv_within(Duration::from_millis(50))
@@ -577,11 +692,16 @@ async fn queue_full_runs_inline_and_stops_reading() {
         "the read loop must stop while the inline call runs"
     );
 
-    handler.release_one();
-    assert!(
-        server.recv_within(Duration::from_secs(1)).await.is_some(),
-        "reads must resume after a worker is released"
-    );
+    // Release only the inline call. Releasing a pooled worker would prove
+    // nothing: the inline call — and therefore the read loop — would stay
+    // blocked while an unrelated `slow` worker answered.
+    handler.release_inline();
+    let inline = server.recv().await;
+    assert_eq!(inline["id"], 9000);
+    assert_eq!(inline["result"]["ok"], true);
+    let pong = server.recv().await;
+    assert_eq!(pong["id"], ping_id);
+    assert_eq!(pong["result"], json!({}));
 }
 
 #[tokio::test]

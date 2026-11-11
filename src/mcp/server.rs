@@ -60,6 +60,14 @@ pub struct ToolDefinition {
 pub struct CallContext {
     pub cancel: CancellationToken,
     pub request_id: Option<RequestId>,
+    /// The `tools/call` params `_meta` object, with the canonical JSON-RPC
+    /// request ID injected under `subagent-mcp/requestId`.
+    ///
+    /// This mirrors mcp-go's before-call-tool hook, which writes
+    /// `request.Params.Meta.AdditionalFields` — a sibling of `arguments`, never
+    /// inside it. `None` when the client sent no `_meta` and the ID cannot be
+    /// canonicalized.
+    pub meta: Option<Value>,
     pub progress: Option<ProgressSink>,
     pub approver: Arc<dyn Approver>,
 }
@@ -275,6 +283,7 @@ struct WorkItem {
 struct PreparedCall {
     name: String,
     args: Value,
+    meta: Option<Value>,
     key: Option<String>,
     progress_token: Option<Value>,
 }
@@ -291,6 +300,8 @@ impl PreparedCall {
             .unwrap_or_default()
             .to_string();
 
+        // The handler receives the client's arguments exactly as sent; the
+        // server never injects bookkeeping into the tool's argument object.
         let mut args = params
             .get("arguments")
             .cloned()
@@ -298,38 +309,40 @@ impl PreparedCall {
         if args.is_null() {
             args = json!({});
         }
-        let Some(args_object) = args.as_object_mut() else {
+        if !args.is_object() {
             return Err(unparsable("arguments must be an object"));
-        };
+        }
 
-        let progress_token = params
-            .get("_meta")
-            .and_then(|meta| meta.get("progressToken"))
+        // Go's hook writes `request.Params.Meta`, so `_meta` is a sibling of
+        // `arguments`. A `null` `_meta` behaves like an absent one.
+        let mut meta = match params.get("_meta") {
+            None | Some(Value::Null) => Map::new(),
+            Some(Value::Object(meta)) => meta.clone(),
+            Some(_) => return Err(unparsable("_meta must be an object")),
+        };
+        let progress_token = meta
+            .get("progressToken")
             .filter(|token| !token.is_null())
             .cloned();
 
-        // mcp-go's before-call-tool hook stores the canonical ID in `_meta`;
-        // the handler path reads it back for cancellation.
-        if let Some(canonical) = &id.canonical {
-            let meta = args_object
-                .entry("_meta")
-                .or_insert_with(|| Value::Object(Map::new()));
-            let Some(meta) = meta.as_object_mut() else {
-                return Err(unparsable("_meta must be an object"));
-            };
+        // The canonical key always comes from the JSON-RPC request id, never
+        // from a client-supplied `_meta` (neither `params._meta` nor
+        // `arguments._meta`). A non-scalar id cannot be keyed, so nothing is
+        // injected, matching Go's early return.
+        let key = id.canonical.clone().filter(|key| !key.is_empty());
+        if let Some(canonical) = &key {
             meta.insert(REQUEST_ID_META_KEY.to_string(), json!(canonical));
         }
-
-        let key = args_object
-            .get("_meta")
-            .and_then(|meta| meta.get(REQUEST_ID_META_KEY))
-            .and_then(Value::as_str)
-            .filter(|key| !key.is_empty())
-            .map(str::to_string);
+        let meta = if meta.is_empty() {
+            None
+        } else {
+            Some(Value::Object(meta))
+        };
 
         Ok(Self {
             name,
             args,
+            meta,
             key,
             progress_token,
         })
@@ -632,7 +645,7 @@ impl McpServer {
         params: Option<Value>,
         out: &mpsc::Sender<String>,
     ) {
-        let prepared = match PreparedCall::new(&id, params) {
+        let mut prepared = match PreparedCall::new(&id, params) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.send_error(out, Some(id), error.code, error.message)
@@ -668,6 +681,7 @@ impl McpServer {
         let ctx = CallContext {
             cancel: handle.cancel.clone(),
             request_id: Some(id.clone()),
+            meta: prepared.meta.take(),
             progress,
             approver: self.state.approver(),
         };
