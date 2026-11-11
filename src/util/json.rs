@@ -55,21 +55,25 @@ pub fn go_quote(s: &str) -> String {
     out
 }
 
-/// Go `strconv.IsPrint` for the ASCII range plus an approximation for
-/// non-ASCII. Go keeps categories L, M, N, P, S (and ASCII space) literal and
-/// escapes the C* categories and non-ASCII separators. Rust's std has no
-/// general-category table, so use "not a control and not a whitespace". This is
-/// exact for every approval golden case; exotic format/private-use/unassigned
-/// runes are the only approximation.
+/// Exact Go-compatible `unicode.IsPrint` (the predicate `strconv.Quote` uses),
+/// evaluated by binary search over the generated `GO_PRINT_RANGES` table. This
+/// replaces the earlier Rust heuristic, which wrongly treated Cf/Co/Cn/Zs
+/// runes (bidi controls, zero-width chars, private-use, unassigned, non-ASCII
+/// spaces) as printable and emitted them literally — a prompt-injection vector
+/// in approval fields.
 fn is_print(c: char) -> bool {
     let u = c as u32;
-    if u < 0x20 || u == 0x7f {
-        return false;
-    }
-    if u < 0x7f {
-        return true;
-    }
-    !c.is_control() && !c.is_whitespace()
+    super::print_ranges::GO_PRINT_RANGES
+        .binary_search_by(|&(start, end)| {
+            if u < start {
+                std::cmp::Ordering::Greater
+            } else if u > end {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Equal
+            }
+        })
+        .is_ok()
 }
 
 /// Truncate to `max` bytes on a UTF-8 boundary, appending `…` when it had to
@@ -212,5 +216,44 @@ mod tests {
         want.push_str(&"€".repeat(62));
         want.push('…');
         assert_eq!(truncate_utf8(&input, 200), want);
+    }
+
+    #[test]
+    fn go_quote_non_printable_unicode_matches_go() {
+        // Goldens captured from Go 1.26.6 `strconv.Quote`. Proves go_quote now
+        // matches Go's unicode.IsPrint exactly for Cf/Co/Cn/Zs runes (bidi RLO,
+        // zero-width, soft hyphen, BOM, private-use, unassigned, NBSP) while
+        // keeping ASCII space and printable Unicode literal. Also re-pins the
+        // quote/backslash/control behavior so this test is self-contained.
+        let cases: &[(&str, &str)] = &[
+            ("a\u{202e}b", "\"a\\u202eb\""), // rlo_u202e
+            ("a\u{200b}b", "\"a\\u200bb\""), // zwsp_u200b
+            ("a\u{ad}b", "\"a\\u00adb\""),   // shy_u00ad
+            ("a\u{feff}b", "\"a\\ufeffb\""), // bom_ufeff
+            ("a\u{e000}b", "\"a\\ue000b\""), // private_use_ue000
+            ("a\u{378}b", "\"a\\u0378b\""),  // unassigned_u0378
+            ("a b c", "\"a b c\""),          // ascii_space
+            ("a\u{a0}b", "\"a\\u00a0b\""),   // nbsp_u00a0
+            (
+                "caf\u{e9} \u{20ac} \u{4f60}\u{597d}",
+                "\"caf\u{e9} \u{20ac} \u{4f60}\u{597d}\"",
+            ), // printable_letter
+            ("\"", "\"\\\"\""),              // double_quote
+            ("\\", "\"\\\\\""),              // backslash
+            ("a\nb", "\"a\\nb\""),           // newline
+            ("a\tb", "\"a\\tb\""),           // tab
+            ("a\0b", "\"a\\x00b\""),         // nul
+            ("\u{7}\u{8}\u{c}\u{b}\r", "\"\\a\\b\\f\\v\\r\""), // ctrl_escapes
+            ("a\u{7f}b", "\"a\\x7fb\""),     // del
+            ("a\u{85}b", "\"a\\u0085b\""),   // latin1_ctrl
+            (
+                "run \u{202e} echo \u{200b} done",
+                "\"run \\u202e echo \\u200b done\"",
+            ), // mixed_rlo
+        ];
+        for &(input, want) in cases {
+            let got = go_quote(input);
+            assert_eq!(got.as_str(), want, "input={input:?}");
+        }
     }
 }
