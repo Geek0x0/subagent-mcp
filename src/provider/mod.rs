@@ -13,6 +13,7 @@
 //! only; provider-specific framing state machines belong to the later adapter
 //! tasks).
 
+pub mod codex;
 pub mod factory;
 pub mod sse;
 pub mod tls;
