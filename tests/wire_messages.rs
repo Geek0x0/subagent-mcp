@@ -9,7 +9,7 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde_json::{Value, json};
@@ -914,6 +914,9 @@ fn no_wait() -> RetryDelay {
     Arc::new(|_, _| Duration::ZERO)
 }
 
+/// Retry delays the seam was asked to apply: `(attempt, Retry-After)`.
+type RecordedDelays = Arc<Mutex<Vec<(usize, Option<Duration>)>>>;
+
 #[tokio::test]
 async fn retries_retryable_statuses_then_succeeds() {
     let mock = Mock::start(vec![
@@ -983,8 +986,8 @@ async fn retries_connection_errors() {
 
 #[tokio::test]
 async fn honors_retry_after_header() {
-    // Default retry delay: an absent Retry-After would wait 375-500 ms, so a
-    // sub-300 ms turn proves the header (0 ms) was honored end to end.
+    // The retry delay seam records what the SDK-style policy computed. The
+    // server's Retry-After-Ms must win over the ~500 ms exponential default.
     let mock = Mock::start(vec![
         ScriptMessage::http_error(429)
             .scripted()
@@ -993,15 +996,53 @@ async fn honors_retry_after_header() {
     ])
     .await;
 
-    let started = std::time::Instant::now();
-    let (result, _) = one_turn(&mock, 1000, request("claude-x", user_only())).await;
+    let recorded: RecordedDelays = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&recorded);
+    let mut provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+    provider.set_retry_delay(Arc::new(move |attempt, retry_after| {
+        recorder.lock().unwrap().push((attempt, retry_after));
+        Duration::ZERO
+    }));
+
+    let (result, _) = run_turn(&provider, request("claude-x", user_only())).await;
     assert_eq!(result.expect("429 retry").text, "after header");
     assert_eq!(mock.request_count(), 2);
-    assert!(
-        started.elapsed() < Duration::from_millis(300),
-        "Retry-After-Ms was ignored: waited {:?}",
-        started.elapsed()
+    assert_eq!(
+        *recorded.lock().unwrap(),
+        vec![(0, Some(Duration::ZERO))],
+        "the 429 Retry-After-Ms header must be parsed into the retry delay"
     );
+}
+
+#[tokio::test]
+async fn retry_does_not_read_a_stalled_error_body() {
+    // A retryable error whose body never finishes. Go closes the body unread
+    // before retrying; reading it here would block the turn on the stalled
+    // body and mask the retry delay (this is how `honors_retry_after_header`
+    // regressed in the integration merge). The timeout keeps a regression from
+    // hanging the suite for the mock's full stall.
+    let mock = Mock::start(vec![
+        Scripted::stall_status(
+            500,
+            br#"{"type":"error","error":{"type":"overloaded_error","message":"slow"}}"#.to_vec(),
+        ),
+        ScriptMessage::text("after stall").scripted(),
+    ])
+    .await;
+    let mut provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+    provider.set_retry_delay(no_wait());
+
+    let outcome = tokio::time::timeout(
+        Duration::from_secs(5),
+        run_turn(&provider, request("claude-x", user_only())),
+    )
+    .await;
+    let (result, _) = outcome.expect("the retry blocked on the retryable error body");
+    assert_eq!(
+        result.expect("retry past a stalled error body").text,
+        "after stall"
+    );
+    assert_eq!(mock.request_count(), 2);
 }
 
 #[tokio::test]
