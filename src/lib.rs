@@ -4,6 +4,8 @@ pub mod agent;
 pub mod cli;
 pub mod config;
 pub mod decision;
+/// MCP stdio server, the `subagent`/`subagent-reply` tool handlers, and auto
+/// model selection (Tasks 5–7, 24).
 pub mod mcp;
 pub mod patch;
 pub mod policy;
