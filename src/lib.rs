@@ -1,3 +1,5 @@
+/// System-prompt construction, in-memory session management, and the agent
+/// rollout payload builders (Task 22 / Go `internal/agent`).
 pub mod agent;
 pub mod cli;
 pub mod config;
