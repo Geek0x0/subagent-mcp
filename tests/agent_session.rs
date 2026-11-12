@@ -461,6 +461,62 @@ async fn cap_eviction_never_exceeds_256_idle_sessions() {
     }
 }
 
+/// Go `TestManagerSweepDoesNotCauseFalseBusy`. The eviction sweep must never
+/// make an idle, fresh session look busy: neither an acquire immediately after
+/// a sweep nor one racing a sweep concurrently may see a false `ErrBusy` from
+/// the sweep's `try_lock_owned` probe.
+///
+/// Determinism: no sleeps. In Rust `create` (which runs `evict_locked`) holds
+/// the manager lock for the whole sweep and drops every probe guard before
+/// releasing it; `acquire` also takes the manager lock before its own
+/// `try_lock_owned`, so the two are serialized. The outcome (busy == 0) is
+/// therefore guaranteed for every interleaving. Total sessions stay below the
+/// 256 cap so the target is never evicted (only false-busy is under test).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sweep_does_not_cause_false_busy() {
+    let manager = Arc::new(SessionManager::new());
+    let target = manager.create(options()).await.unwrap();
+    // Filler sessions give evict_locked real work to probe.
+    for _ in 0..80 {
+        manager.create(options()).await.unwrap();
+    }
+
+    // "Immediately after": a sweep directly before each acquire. Every probe
+    // guard must already be gone, so acquire of the idle target succeeds.
+    for _ in 0..10 {
+        manager.create(options()).await.unwrap();
+        assert!(
+            manager.acquire(&target.id).await.is_ok(),
+            "false Busy right after a sweep"
+        );
+    }
+
+    // "While an acquire is in flight": a sweeper task and an acquirer loop run
+    // on two worker threads, genuinely contending for the manager lock.
+    let sweep_manager = manager.clone();
+    let sweeper = tokio::spawn(async move {
+        let mut sweeps = 0u32;
+        for _ in 0..100 {
+            sweep_manager.create(options()).await.unwrap();
+            sweeps += 1;
+            tokio::task::yield_now().await;
+        }
+        sweeps
+    });
+
+    let mut busy = 0u32;
+    for _ in 0..1000 {
+        match manager.acquire(&target.id).await {
+            Ok(lease) => drop(lease),
+            Err(SessionError::Busy) => busy += 1,
+            Err(e) => panic!("unexpected acquire error: {e}"),
+        }
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(sweeper.await.unwrap(), 100, "sweeper must run every sweep");
+    assert_eq!(busy, 0, "acquire saw a false Busy {busy} times");
+}
+
 #[tokio::test]
 async fn close_cancels_token_and_clears_sessions() {
     let m = SessionManager::new();
@@ -497,6 +553,11 @@ async fn bound_cwd_is_set_and_missing_root_fails_closed() {
         assert!(lease.bind_err.is_none());
         assert!(lease.root_paths.iter().any(|p| p == &cwd));
         assert!(lease.root_paths.iter().any(|p| p == Path::new("/tmp")));
+        assert_eq!(
+            lease.bound_roots.len(),
+            lease.root_paths.len(),
+            "bound_roots and root_paths must be 1:1"
+        );
     }
 
     // A missing configured writable root fails closed with a bind error and no
@@ -510,6 +571,8 @@ async fn bound_cwd_is_set_and_missing_root_fails_closed() {
     {
         let lease = m.acquire(&s2.id).await.unwrap();
         assert!(lease.bound_cwd.is_none(), "bound cwd must be cleared");
+        assert!(lease.bound_roots.is_empty(), "held roots must be dropped");
+        assert!(lease.root_paths.is_empty(), "root_paths must be cleared");
         let err = lease.bind_err.as_deref().unwrap_or("");
         assert!(err.contains("bind writable root"), "bind_err: {err}");
     }
@@ -539,6 +602,161 @@ async fn bound_cwd_accepts_symlinked_cwd() {
     // The bound directory still names the original inode (Go `Check`).
     assert!(lease.bound_cwd.as_ref().unwrap().check().is_ok());
     assert!(lease.root_paths.iter().any(|p| p == &link));
+    assert_eq!(lease.bound_roots.len(), lease.root_paths.len());
+}
+
+// ---------------------------------------------------------------------------
+// I2: writable roots are HELD as fds, deduped by held inode identity, and a
+// root swapped after creation is detected (TOCTOU-free).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn bound_roots_are_held_and_match_root_paths() {
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = eval_dir(dir.path());
+    let extra = dir.path().join("extra");
+    std::fs::create_dir_all(&extra).unwrap();
+    let extra = eval_dir(&extra);
+
+    let m = SessionManager::new();
+    let mut opts = options();
+    opts.cwd = cwd.clone();
+    opts.sandbox = Sandbox::WorkspaceWrite;
+    opts.writable_roots = vec![extra.clone()];
+    let s = m.create(opts).await.unwrap();
+    let lease = m.acquire(&s.id).await.unwrap();
+
+    assert!(lease.bound_cwd.is_some());
+    assert!(lease.bind_err.is_none());
+    // bound_roots is 1:1 with root_paths (Go boundRoots/rootPaths).
+    assert_eq!(lease.bound_roots.len(), lease.root_paths.len());
+    assert!(lease.root_paths.contains(&cwd));
+    assert!(lease.root_paths.contains(&extra));
+    assert!(lease.root_paths.iter().any(|p| p == Path::new("/tmp")));
+
+    // Every root is a HELD handle, not a re-stat'able path. On Linux path() is
+    // /proc/self/fd/<fd>, which resolves only while that fd stays open.
+    #[cfg(target_os = "linux")]
+    {
+        for root in &lease.bound_roots {
+            assert!(
+                std::fs::metadata(root.path()).is_ok(),
+                "bound root fd is not held/open"
+            );
+            assert!(root.raw_fd() >= 0, "invalid held root fd");
+        }
+        // cwd reuse: bound_roots[0] shares the cwd handle (Go reuses boundCwd)
+        // — same raw fd, no second open, no double-close.
+        assert_eq!(
+            lease.bound_roots[0].raw_fd(),
+            lease.bound_cwd.as_ref().unwrap().raw_fd(),
+            "cwd was opened a second time instead of being reused"
+        );
+    }
+}
+
+#[tokio::test]
+async fn bound_roots_dedupe_by_held_identity() {
+    // A configured root with a different spelling of the cwd inode (a symlink)
+    // must collapse into ONE held root: dedup uses the held inodes, not a
+    // later re-stat of mutable path names.
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = eval_dir(dir.path());
+    let link = dir.path().join("cwd-link");
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&cwd, &link).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&cwd, &link).unwrap();
+
+    let m = SessionManager::new();
+    let mut opts = options();
+    opts.cwd = cwd.clone();
+    opts.sandbox = Sandbox::WorkspaceWrite;
+    // cwd spelled twice + a symlink to the same inode: all must dedup to one.
+    opts.writable_roots = vec![cwd.clone(), link.clone()];
+    let s = m.create(opts).await.unwrap();
+    let lease = m.acquire(&s.id).await.unwrap();
+
+    assert_eq!(lease.bound_roots.len(), lease.root_paths.len());
+    assert_eq!(
+        lease.root_paths.iter().filter(|p| *p == &cwd).count(),
+        1,
+        "cwd spelling deduped once"
+    );
+    assert!(
+        !lease.root_paths.contains(&link),
+        "symlink to the cwd inode must dedup away"
+    );
+    assert!(lease.root_paths.iter().any(|p| p == Path::new("/tmp")));
+    assert!(lease.root_paths.len() >= 2, "cwd + /tmp at minimum");
+    // cwd handle is shared, never opened a second time.
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        lease.bound_roots[0].raw_fd(),
+        lease.bound_cwd.as_ref().unwrap().raw_fd(),
+    );
+}
+
+#[tokio::test]
+async fn bound_root_swap_is_detected() {
+    // A writable root swapped (renamed + symlinked elsewhere) AFTER creation
+    // must be detected: the held fd still names the original inode, so
+    // check() fails and the swapped path is never silently trusted.
+    let dir = tempfile::tempdir().unwrap();
+    let base = eval_dir(dir.path());
+    let cwd = base.join("cwd");
+    let root = base.join("root");
+    let protected = base.join("protected");
+    for d in [&cwd, &root, &protected] {
+        std::fs::create_dir_all(d).unwrap();
+    }
+
+    let m = SessionManager::new();
+    let mut opts = options();
+    opts.cwd = cwd.clone();
+    opts.sandbox = Sandbox::WorkspaceWrite;
+    opts.writable_roots = vec![root.clone()];
+    let s = m.create(opts).await.unwrap();
+    let lease = m.acquire(&s.id).await.unwrap();
+
+    let idx = lease
+        .root_paths
+        .iter()
+        .position(|p| p == &root)
+        .expect("configured root present in root_paths");
+    let held = Arc::clone(&lease.bound_roots[idx]);
+    assert!(held.check().is_ok(), "fresh held root passes check()");
+
+    // On Linux, held.path() is a proc-fd magic link to the held inode; capture
+    // its identity before the swap to prove the fd does not follow the path.
+    #[cfg(target_os = "linux")]
+    let held_ino = {
+        use std::os::unix::fs::MetadataExt;
+        let st = std::fs::metadata(held.path()).unwrap();
+        (st.dev(), st.ino())
+    };
+
+    // Swap: rename root -> root.bak, then point `root` at `protected`.
+    std::fs::rename(&root, base.join("root.bak")).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&protected, &root).unwrap();
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(&protected, &root).unwrap();
+
+    // check() re-stats the original path name and must now MISMATCH the held
+    // inode: the swapped root is detected, not silently trusted.
+    assert!(held.check().is_err(), "swapped root must be detected");
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // The held fd still resolves to the ORIGINAL inode (TOCTOU-free).
+        let st = std::fs::metadata(held.path()).unwrap();
+        assert_eq!(
+            (st.dev(), st.ino()),
+            held_ino,
+            "held fd must not follow the swap"
+        );
+    }
 }
 
 #[test]

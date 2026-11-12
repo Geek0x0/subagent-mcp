@@ -75,13 +75,23 @@ pub struct SessionState {
     /// Attached by Task 24, not here.
     pub rollout: Option<RolloutRecorder>,
     pub last_used: Instant,
-    pub bound_cwd: Option<BoundDirectory>,
+    /// The held working-directory handle (Go `boundCwd`). Shared with
+    /// `bound_roots[0]` for workspace-write sessions so cwd is opened once.
+    pub bound_cwd: Option<Arc<BoundDirectory>>,
+    /// Held writable-root directory handles (Go `boundRoots`). Each effective
+    /// root is opened ONCE at creation and kept open, so Task 23B can pass the
+    /// fds to `--rw-fd` instead of re-stat'ing mutable paths (no TOCTOU).
+    /// `bound_roots` is 1:1 with `root_paths`; for workspace-write sessions
+    /// `bound_roots[0]` is the cwd, reused from `bound_cwd` (no second open,
+    /// no double-close). This and `bound_cwd` are `Arc` because
+    /// `BoundDirectory` is not `Clone` and Go reuses the same `boundCwd`
+    /// pointer inside `boundRoots[0]`.
+    pub bound_roots: Vec<Arc<BoundDirectory>>,
     pub bind_err: Option<String>,
-    /// Effective, `os.SameFile`-deduplicated workspace-write roots (Go
-    /// `rootPaths`). Computed and bound during creation; consumed by Task 23B
-    /// to build the path-based Landlock launcher. This is an intentional
-    /// extension of the listed `SessionState` fields needed for the Task 20/21
-    /// handoff ("Task 22 owns the real default workspace-write roots").
+    /// Effective, deduplicated workspace-write root display paths (Go
+    /// `rootPaths`), 1:1 with `bound_roots`. For Task 23B: prefer `bound_roots`
+    /// fds for `--rw-fd`; use `root_paths` only for the path-based `--rw`
+    /// fallback and display.
     pub root_paths: Vec<PathBuf>,
 }
 
@@ -123,7 +133,7 @@ impl SessionManager {
             opts.effort_sent = Some(opts.reasoning_effort.clone());
         }
 
-        let (bound_cwd, bind_err, root_paths) = bind_directories(&opts);
+        let bound = bind_directories(&opts);
 
         let session = Arc::new(Session {
             id: Uuid::new_v4().to_string(),
@@ -134,9 +144,10 @@ impl SessionManager {
                 total_usage: Usage::default(),
                 rollout: None,
                 last_used: Instant::now(),
-                bound_cwd,
-                bind_err,
-                root_paths,
+                bound_cwd: bound.bound_cwd,
+                bound_roots: bound.bound_roots,
+                bind_err: bound.bind_err,
+                root_paths: bound.root_paths,
             })),
         });
 
@@ -188,7 +199,11 @@ impl SessionManager {
             // Best-effort bound-directory release; a busy session keeps its
             // fd until its lease is dropped (RAII), which is still released.
             if let Ok(mut guard) = session.state.clone().try_lock_owned() {
+                // Go `closeDirectories`: drop every held handle (cwd + roots).
+                // `bound_roots[0]` shares the cwd `Arc`, so clearing both
+                // fields closes each fd exactly once via RAII (no double-close).
                 guard.bound_cwd = None;
+                guard.bound_roots.clear();
                 guard.bind_err = Some("session is closed".to_string());
                 guard.root_paths.clear();
             }
@@ -202,6 +217,15 @@ impl SessionManager {
 /// Go `Manager.evictLocked` + `evictIfIdleLocked`, adapted to owned tokio
 /// guards. `m.mu` (the manager lock) is held by the caller throughout; only
 /// sessions that can be `try_lock_owned`'d (idle) are ever removed.
+///
+/// False-busy invariant (Go `TestManagerSweepDoesNotCauseFalseBusy`): this
+/// sweep runs ONLY while the caller holds the manager lock, and every
+/// `try_lock_owned` probe guard is dropped before `evict_locked` returns —
+/// hence before that manager lock is released. `acquire` takes the manager lock
+/// before its own `try_lock_owned`, so the two are serialized: an acquirer can
+/// never observe a probe guard the sweep left behind, because by the time the
+/// acquirer gets the manager lock the sweep has already dropped all of them.
+/// A busy session (lease held) simply fails the probe and is never evicted.
 fn evict_locked(map: &mut HashMap<String, Arc<Session>>) -> Vec<Arc<dyn Thread>> {
     let now = Instant::now();
     let mut evicted_threads = Vec::new();
@@ -261,61 +285,145 @@ fn evict_locked(map: &mut HashMap<String, Arc<Session>>) -> Vec<Arc<dyn Thread>>
     evicted_threads
 }
 
-/// Go `Session.bindDirectories` (the Task 20/21 handoff).
-///
-/// Skips entirely for Codex-style sessions (`thread` present) or an empty cwd.
-/// Otherwise binds cwd into `bound_cwd` (via `sandbox::BoundDirectory`), and —
-/// only for `workspace-write` — computes the effective default writable roots
-/// (`cwd`, `/tmp`, an existing `$TMPDIR`, configured roots), validates each by
-/// binding it, deduplicates them with `os.SameFile` (`util::fs::same_file`), and
-/// stores the paths in `root_paths`. A bind failure fails closed: it clears the
-/// bound cwd and records `bind_err`.
-fn bind_directories(
-    opts: &SessionOptions,
-) -> (Option<BoundDirectory>, Option<String>, Vec<PathBuf>) {
-    if opts.thread.is_some() || opts.cwd.as_os_str().is_empty() {
-        return (None, None, Vec::new());
+/// Result of [`bind_directories`]: the held cwd, the held writable roots, their
+/// matching display paths, and any bind error. On any failure everything is
+/// dropped (fail closed), mirroring Go `closeDirectories`.
+struct BoundState {
+    bound_cwd: Option<Arc<BoundDirectory>>,
+    bound_roots: Vec<Arc<BoundDirectory>>,
+    root_paths: Vec<PathBuf>,
+    bind_err: Option<String>,
+}
+
+impl BoundState {
+    fn empty() -> Self {
+        Self {
+            bound_cwd: None,
+            bound_roots: Vec::new(),
+            root_paths: Vec::new(),
+            bind_err: None,
+        }
     }
 
-    let bound_cwd = match BoundDirectory::open(&opts.cwd) {
-        Ok(dir) => dir,
+    fn error(message: String) -> Self {
+        Self {
+            bind_err: Some(message),
+            ..Self::empty()
+        }
+    }
+}
+
+/// Inode identity (device, inode) of a HELD `BoundDirectory`, read from the
+/// held descriptor — never from the original path name. On Linux
+/// [`BoundDirectory::path`] is `/proc/self/fd/<fd>`, a magic symlink that
+/// resolves to the inode the fd points at (verified: `stat /proc/self/fd/N`
+/// equals `fstat(N)` for `O_PATH` fds, before AND after a rename/symlink swap).
+/// On non-Linux Unix the open `File` handle is stat'd directly. This is Go's
+/// `dir.File().Stat()` and is TOCTOU-free.
+#[cfg(unix)]
+fn held_identity(dir: &BoundDirectory) -> std::io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(target_os = "linux")]
+    let meta = std::fs::metadata(dir.path())?;
+    #[cfg(all(unix, not(target_os = "linux")))]
+    let meta = dir.file.metadata()?;
+    Ok((meta.dev(), meta.ino()))
+}
+
+/// Whether `new` names the same inode as an already-accepted HELD root. All
+/// comparisons use held descriptors, never a re-stat of a dropped path's name,
+/// so a symlink swap between validation and exec cannot change a dedup
+/// decision (Go `os.SameFile(info, boundInfo)` on held `Stat()` results).
+#[cfg(unix)]
+fn held_duplicate(new: &BoundDirectory, accepted: &[Arc<BoundDirectory>]) -> bool {
+    let Ok(id) = held_identity(new) else {
+        return false;
+    };
+    accepted.iter().any(|e| held_identity(e).ok() == Some(id))
+}
+
+/// Best-effort non-Unix fallback (no kernel sandbox off Linux): compare the
+/// held display paths with `same_file`.
+#[cfg(not(unix))]
+fn held_duplicate(new: &BoundDirectory, accepted: &[Arc<BoundDirectory>]) -> bool {
+    accepted
+        .iter()
+        .any(|e| same_file(&e.path(), &new.path()).unwrap_or(false))
+}
+
+/// Go `Session.bindDirectories` (the Task 20/21 handoff), now with HELD fds.
+///
+/// Skips entirely for Codex-style sessions (`thread` present) or an empty cwd.
+/// Otherwise opens cwd ONCE into `bound_cwd`. For `workspace-write` it builds
+/// the effective default roots (`cwd`, `/tmp`, existing `$TMPDIR`, configured
+/// roots) and opens each ONCE into a held `BoundDirectory`. The cwd path reuses
+/// the already-held `bound_cwd` (Go `dir = s.boundCwd`) — no second open, no
+/// double-close. Roots are deduplicated by the HELD inodes (not path re-stats),
+/// and `root_paths` stays 1:1 with `bound_roots`. A bind failure fails closed:
+/// every held handle is dropped and `bind_err` is set.
+///
+/// Task 23B contract: pass `bound_roots` fds as `--rw-fd` (kernel-enforced,
+/// immune to path swaps) and `bound_cwd`'s fd as `--cwd-fd`; use `root_paths`
+/// only for the path-based `--rw` fallback and display.
+fn bind_directories(opts: &SessionOptions) -> BoundState {
+    if opts.thread.is_some() || opts.cwd.as_os_str().is_empty() {
+        return BoundState::empty();
+    }
+
+    let cwd_dir = match BoundDirectory::open(&opts.cwd) {
+        Ok(dir) => Arc::new(dir),
         Err(e) => {
-            return (
-                None,
-                Some(format!("bind working directory {:?}: {e}", opts.cwd)),
-                Vec::new(),
-            );
+            return BoundState::error(format!("bind working directory {:?}: {e}", opts.cwd));
         }
     };
 
     if opts.sandbox != Sandbox::WorkspaceWrite {
-        return (Some(bound_cwd), None, Vec::new());
+        // Go returns early: cwd is bound, but no writable roots are collected.
+        return BoundState {
+            bound_cwd: Some(cwd_dir),
+            ..BoundState::empty()
+        };
     }
 
     let candidates = candidate_paths(&opts.cwd, &opts.writable_roots);
+    let mut bound_roots: Vec<Arc<BoundDirectory>> = Vec::new();
     let mut root_paths: Vec<PathBuf> = Vec::new();
     for path in &candidates {
-        // Go reuses `boundCwd` for the cwd path (string equality); bind every
-        // other root to validate it exists and is a directory.
-        if path != &opts.cwd
-            && let Err(e) = BoundDirectory::open(path)
-        {
-            drop(bound_cwd);
-            return (
-                None,
-                Some(format!("bind writable root {:?}: {e}", path)),
-                Vec::new(),
-            );
+        // Go: `dir := s.boundCwd` when `path == s.cwd` (reuse the held cwd),
+        // otherwise `BindDirectory(path)` once. Either way `dir` is HELD.
+        let dir: Arc<BoundDirectory> = if path == &opts.cwd {
+            cwd_dir.clone()
+        } else {
+            match BoundDirectory::open(path) {
+                Ok(dir) => Arc::new(dir),
+                Err(e) => {
+                    return BoundState::error(format!("bind writable root {:?}: {e}", path));
+                }
+            }
+        };
+
+        // Go `dir.File().Stat()` — validate the held handle is inspectable.
+        #[cfg(unix)]
+        if let Err(e) = held_identity(&dir) {
+            return BoundState::error(format!("inspect writable root {:?}: {e}", path));
         }
-        let duplicate = root_paths
-            .iter()
-            .any(|existing| same_file(path, existing).unwrap_or(false));
-        if !duplicate {
-            root_paths.push(path.clone());
+
+        // Dedup by HELD inode identity. A duplicate drops only this local
+        // handle: for a cwd reuse it is just an `Arc` clone, so `bound_cwd`
+        // (and `bound_roots[0]`) is never closed out from under us.
+        if held_duplicate(&dir, &bound_roots) {
+            continue;
         }
+        bound_roots.push(dir);
+        root_paths.push(path.clone());
     }
 
-    (Some(bound_cwd), None, root_paths)
+    BoundState {
+        bound_cwd: Some(cwd_dir),
+        bound_roots,
+        root_paths,
+        bind_err: None,
+    }
 }
 
 /// Go's default writable-root list: `cwd`, `/tmp`, an existing `$TMPDIR`, then
@@ -334,9 +442,13 @@ fn candidate_paths(cwd: &Path, configured: &[PathBuf]) -> Vec<PathBuf> {
     paths
 }
 
-/// Effective, `os.SameFile`-deduplicated workspace-write roots (Go
-/// `rootPaths`). Exposed so Task 23B can build the Landlock launcher from the
-/// same computation; the session stores the result in `SessionState::root_paths`.
+/// Effective, deduplicated workspace-write root display paths (Go
+/// `rootPaths`). This is the pure path-based helper for the `--rw` fallback and
+/// display only: it dedups by path `same_file`. The authoritative, TOCTOU-free
+/// computation is [`bind_directories`], which HOLDS each root in
+/// `SessionState::bound_roots` and dedups by held inode identity. At creation
+/// time (no swaps) both produce the same list; Task 23B must prefer the held
+/// `bound_roots` fds for `--rw-fd` over these paths.
 pub fn effective_writable_roots(cwd: &Path, configured: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
     for path in candidate_paths(cwd, configured) {
