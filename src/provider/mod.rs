@@ -5,3 +5,6 @@
 //! provider trait, the shared HTTP transport, and the SSE helpers.
 
 pub mod tls;
+pub mod types;
+
+pub use types::{ToolCall, Usage};
