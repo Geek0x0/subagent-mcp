@@ -11,8 +11,9 @@
 //! header-only timeout, debug capture, upstream recorder, bounded
 //! drain-on-drop, and JSON replay helpers), and [`sse`] (a byte/line reader
 //! only; provider-specific framing state machines belong to the later adapter
-//! tasks).
+//! tasks). Task 10 adds the first adapter, [`chat_completions`].
 
+pub mod chat_completions;
 pub mod factory;
 pub mod sse;
 pub mod tls;
@@ -22,6 +23,8 @@ pub mod types;
 // Package-level shutdown surface, matching Go `provider.Shutdown()` /
 // `provider.RegisterShutdown()` referenced by the EOF-cleanup design.
 pub use factory::{register_shutdown, shutdown};
+
+pub use chat_completions::ChatCompletions;
 
 pub use types::{
     Agent, AuthChecker, AuthStatus, DeltaSink, Message, ModelInfo, ModelLister, Provider,

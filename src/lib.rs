@@ -8,7 +8,8 @@ pub mod mcp;
 pub mod patch;
 pub mod policy;
 /// Provider layer: shared value types/traits, platform TLS transport, SSE byte
-/// reader, and the adapter registry/factory (Tasks 8–9).
+/// reader, the adapter registry/factory (Tasks 8–9), and the chat-completions
+/// adapter (Task 10).
 pub mod provider;
 pub mod repo;
 pub mod rollout;

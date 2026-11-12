@@ -1,0 +1,10 @@
+data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Let me "}}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{"content":"check."}}]}
+
+data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"c1","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":5,"total_tokens":12,"prompt_tokens_details":{"cached_tokens":3},"completion_tokens_details":{"reasoning_tokens":2}}}
+
+data: [DONE]
+
