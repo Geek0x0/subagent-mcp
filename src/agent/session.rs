@@ -66,6 +66,23 @@ pub struct Session {
     pub(crate) state: Arc<Mutex<SessionState>>,
 }
 
+/// Delegated-thread accounting shared with a provider's event callback.
+///
+/// Go's `recordThreadEvent` mutates the session from the emit callback. A Rust
+/// [`SessionLease`] is borrowed for the whole run, so the callback cannot touch
+/// [`SessionState`] directly; this cell holds the running total and the rollout
+/// recorder instead. It lives on the session (not the run) so a `token_count`
+/// event a provider emits after `Thread::run` returns is still accounted, just
+/// as Go's persistent session mutation would. The cell is authoritative between
+/// runs; [`SessionState::total_usage`] is refreshed at each run boundary.
+pub struct ThreadAccounting {
+    /// Cumulative usage, including turns from earlier runs.
+    pub total: Usage,
+    /// Codex owns its own rollout in production, so this is `None` there; the
+    /// cell keeps a recorder only when one was attached to the session.
+    pub rollout: Option<RolloutRecorder>,
+}
+
 /// Mutable per-session state. All fields are `pub` so the runner can mutate
 /// them through a [`SessionLease`]'s `DerefMut`.
 pub struct SessionState {
@@ -74,6 +91,11 @@ pub struct SessionState {
     pub total_usage: Usage,
     /// Attached by Task 24, not here.
     pub rollout: Option<RolloutRecorder>,
+    /// Delegated-thread accounting cell, created on the first delegated run so
+    /// its event callback can record usage and rollout lines while it runs. The
+    /// session's rollout recorder moves into the cell on that first run; Codex
+    /// sessions never attach one, so it stays `None` in production.
+    pub thread_accounting: Option<Arc<std::sync::Mutex<ThreadAccounting>>>,
     pub last_used: Instant,
     /// The held working-directory handle (Go `boundCwd`). Shared with
     /// `bound_roots[0]` for workspace-write sessions so cwd is opened once.
@@ -143,6 +165,7 @@ impl SessionManager {
                 history_bytes: 0,
                 total_usage: Usage::default(),
                 rollout: None,
+                thread_accounting: None,
                 last_used: Instant::now(),
                 bound_cwd: bound.bound_cwd,
                 bound_roots: bound.bound_roots,

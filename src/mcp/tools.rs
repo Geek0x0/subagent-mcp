@@ -107,10 +107,35 @@ fn register_adapters() {
 /// The optional `Agent` capability of a resolved provider. The design keeps
 /// `Agent` out of the provider god trait and uses a downcast; Codex is the only
 /// adapter that implements it.
+///
+/// Rust has no `dyn Any` -> `dyn Trait` downcast, so the capability is reached
+/// through the concrete adapter that implements it and returned as the
+/// `dyn Agent` trait object. [`ensure_agent_capable`] turns a provider that
+/// claims `codex-app-server` without that capability into a clear error instead
+/// of silently running the HTTP turn loop.
 fn codex_agent(adapter: &Arc<dyn Provider>) -> Option<&dyn Agent> {
     (adapter.as_ref() as &dyn Any)
         .downcast_ref::<CodexAdapter>()
         .map(|codex| codex as &dyn Agent)
+}
+
+/// Reject a `codex-app-server` provider whose adapter cannot start threads.
+///
+/// Returns whether the adapter exposes the `Agent` capability. Non-Codex APIs
+/// are never required to be agents.
+fn ensure_agent_capable(
+    name: &str,
+    cfg: &ProviderConfig,
+    adapter: &Arc<dyn Provider>,
+) -> Result<bool, String> {
+    let is_agent = codex_agent(adapter).is_some();
+    if cfg.api == Api::CodexAppServer && !is_agent {
+        return Err(format!(
+            "provider {} uses codex-app-server but its adapter does not implement the Agent capability",
+            go_quote(name)
+        ));
+    }
+    Ok(is_agent)
 }
 
 /// Register a constructor unless a caller (or a test dispatcher) already owns
@@ -389,7 +414,11 @@ impl SubagentTools {
             .map(str::to_string);
 
         let adapter = adapter.expect("provider resolved");
-        let is_agent = codex_agent(&adapter).is_some();
+        let provider_cfg = provider_cfg.expect("provider resolved");
+        let is_agent = match ensure_agent_capable(&provider_name, &provider_cfg, &adapter) {
+            Ok(is_agent) => is_agent,
+            Err(message) => return fail(message),
+        };
         // Codex receives its instructions through ThreadOptions; building the
         // HTTP prompt (default + AGENTS.md + developer) here would both waste
         // work and make a bad AGENTS.md fail a Codex start.
@@ -413,7 +442,6 @@ impl SubagentTools {
             .map(|value| value as usize)
             .unwrap_or(0);
 
-        let provider_cfg = provider_cfg.expect("provider resolved");
         let mut max_nudges = provider_cfg.max_nudges.unwrap_or(0);
         if let Some(value) = loose_config
             .get("max_nudges")
@@ -436,6 +464,12 @@ impl SubagentTools {
 
         // A Codex session delegates the whole thread: the adapter starts it
         // with the caller's instructions and owns persistence and rollout.
+        // Go passes the call context here, not the run deadline, which only
+        // bounds `RunLocked`.
+        let thread_ctx = RunContext {
+            cancel: run_ctx.cancel.clone(),
+            deadline: None,
+        };
         let thread: Option<Arc<dyn Thread>> = if let Some(agent) = codex_agent(&adapter) {
             let options = ThreadOptions {
                 model: model.clone(),
@@ -447,7 +481,7 @@ impl SubagentTools {
                 writable_roots: writable_roots.clone(),
                 ephemeral: false,
             };
-            match agent.start_thread(&run_ctx, options).await {
+            match agent.start_thread(&thread_ctx, options).await {
                 Ok(thread) => Some(Arc::from(thread)),
                 Err(error) => return fail(error.message),
             }
@@ -1404,5 +1438,59 @@ mod tests {
         assert_eq!(budgets.history_bytes, 64 << 20);
         assert_eq!(budgets.total_tokens, 0);
         assert_eq!(budgets.run_deadline, Duration::ZERO);
+    }
+
+    struct PlainProvider;
+
+    #[async_trait]
+    impl Provider for PlainProvider {
+        fn name(&self) -> &str {
+            "plain"
+        }
+
+        async fn turn(
+            &self,
+            _ctx: crate::util::run::RunContext,
+            _req: crate::provider::TurnRequest,
+            _on_delta: crate::provider::DeltaSink,
+        ) -> Result<crate::provider::TurnResult, crate::provider::ProviderError> {
+            Ok(crate::provider::TurnResult::default())
+        }
+    }
+
+    fn codex_provider_cfg() -> ProviderConfig {
+        ProviderConfig {
+            api: Api::CodexAppServer,
+            base_url: String::new(),
+            env_key: None,
+            key: None,
+            command: Some("codex-test".into()),
+            default_model: "gpt-6.1-terra".into(),
+            models: Vec::new(),
+            effort_map: Default::default(),
+            max_output_tokens: None,
+            max_nudges: None,
+            extra_body: None,
+        }
+    }
+
+    #[test]
+    fn codex_app_server_requires_the_agent_capability() {
+        let plain: Arc<dyn Provider> = Arc::new(PlainProvider);
+        let error = ensure_agent_capable("codex", &codex_provider_cfg(), &plain).unwrap_err();
+        assert!(error.contains("codex-app-server"), "{error}");
+        assert!(error.contains("Agent capability"), "{error}");
+
+        // Non-Codex APIs are never required to be agents.
+        let http = ProviderConfig {
+            api: Api::Responses,
+            ..codex_provider_cfg()
+        };
+        assert!(!ensure_agent_capable("http", &http, &plain).unwrap());
+
+        // The registered adapter exposes the capability.
+        let real: Arc<dyn Provider> =
+            Arc::new(CodexAdapter::new("codex", &codex_provider_cfg()).unwrap());
+        assert!(ensure_agent_capable("codex", &codex_provider_cfg(), &real).unwrap());
     }
 }

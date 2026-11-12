@@ -22,7 +22,7 @@ use serde_json::{Value, json};
 use tokio::time::Instant;
 use uuid::Uuid;
 
-use crate::agent::session::{AgentError, Emitter, SessionLease};
+use crate::agent::session::{AgentError, Emitter, SessionLease, ThreadAccounting};
 use crate::policy::{ApprovalPolicy, Sandbox};
 use crate::provider::{
     DeltaSink, Message, ProviderError, Role, ThreadCallbacks, ToolCall, ToolSpec, TurnRequest,
@@ -264,9 +264,53 @@ fn stop_cause(ctx: &RunContext, deadline_text: Option<&str>) -> Option<String> {
 }
 
 /// Go `recordThreadEvent`'s numeric reader: a token_count event from a
-/// delegated thread carries JSON numbers, never a typed [`Usage`].
+/// delegated thread carries JSON numbers, never a typed [`Usage`]. Go accepts
+/// both Go ints and JSON `float64`, so whole floats are truncated here too.
 fn int_field(event: &Value, key: &str) -> i64 {
-    event.get(key).and_then(Value::as_i64).unwrap_or(0)
+    match event.get(key) {
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .or_else(|| value.as_f64().map(|float| float as i64))
+            .unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// One delegated-thread `token_count` event as usage. Go's `recordThreadEvent`
+/// leaves cached/reasoning at zero: the event carries only these three fields.
+fn usage_from_event(event: &Value) -> Usage {
+    Usage {
+        input: int_field(event, "prompt_tokens"),
+        cached: 0,
+        output: int_field(event, "completion_tokens"),
+        reasoning: 0,
+        total: int_field(event, "total_tokens"),
+    }
+}
+
+/// Go `addUsage` for the delegated-thread path.
+fn add_usage(total: &mut Usage, last: &Usage) {
+    total.input += last.input;
+    total.cached += last.cached;
+    total.output += last.output;
+    total.reasoning += last.reasoning;
+    total.total += last.total;
+}
+
+/// Go `errors.Is(err, ctx.Err())` over the flattened [`ProviderError`] text.
+///
+/// Provider errors carry no cause chain, so the two context sentinels are
+/// matched as the whole message or as a Go `%w` suffix (`"<prefix>: ..."`).
+/// Cancellation wins over the deadline, matching `ctx.Err()` precedence.
+fn is_ctx_error(ctx: &RunContext, message: &str) -> bool {
+    let sentinel = if ctx.cancel.is_cancelled() {
+        "context canceled"
+    } else if ctx.deadline_reason().is_some() {
+        "context deadline exceeded"
+    } else {
+        return false;
+    };
+    message == sentinel || message.ends_with(&format!(": {sentinel}"))
 }
 
 /// The delegated-thread event sink. Named to keep the closure type out of the
@@ -341,6 +385,26 @@ impl Runner {
         let ctx = RunContext { cancel, deadline };
 
         if let Some(thread) = thread {
+            // The accounting cell lives on the session, so a token_count event
+            // a provider emits after `Thread::run` returns still lands, exactly
+            // as Go's `recordThreadEvent` mutates the persistent session.
+            if lease.thread_accounting.is_none() {
+                let cell = Arc::new(Mutex::new(ThreadAccounting {
+                    total: lease.total_usage.clone(),
+                    rollout: lease.rollout.take(),
+                }));
+                lease.thread_accounting = Some(cell);
+            }
+            let accounting = lease
+                .thread_accounting
+                .as_ref()
+                .expect("thread accounting cell")
+                .clone();
+            // Go checks the session total, which includes a token_count event a
+            // provider reported after the previous run returned.
+            let current = accounting.lock().unwrap().total.clone();
+            lease.total_usage = current.clone();
+
             // A delegated thread spends the same budget as the built-in loop,
             // so the check runs before the thread is handed the prompt. Both
             // ceilings are cumulative, which is why a thread that reaches one
@@ -349,28 +413,31 @@ impl Runner {
                 max_history_bytes,
                 lease.history_bytes,
                 max_total_tokens,
-                lease.total_usage.total,
+                current.total,
             ) {
                 hooks
                     .emitter
                     .emit(&thread_id, json!({"type": "error", "message": &msg}));
-                if let Some(r) = &mut lease.rollout {
+                if let Some(r) = &mut accounting.lock().unwrap().rollout {
                     r.record_error(&msg);
                 }
                 return Err(AgentError { message: msg });
             }
 
-            // A delegated thread reports usage through token_count events and
-            // has no TurnResult to take it from. Collect them while it runs,
-            // then account them (even on failure) so the token budget and any
-            // attached rollout stay complete.
-            let usage_events = Arc::new(Mutex::new(Vec::new()));
-            let recorded = usage_events.clone();
+            // Account and record usage as each event arrives, so rollout line
+            // ordering matches Go's callback-time `recordThreadEvent`.
+            let recorded = accounting.clone();
             let emitter = hooks.emitter.clone();
             let emit_thread_id = thread_id.clone();
             let emit: ThreadEmit = Arc::new(move |_kind, event| {
                 if event.get("type").and_then(Value::as_str) == Some("token_count") {
-                    recorded.lock().unwrap().push(event.clone());
+                    let last = usage_from_event(&event);
+                    let mut accounting = recorded.lock().unwrap();
+                    add_usage(&mut accounting.total, &last);
+                    let total = accounting.total.clone();
+                    if let Some(r) = &mut accounting.rollout {
+                        r.record_thread_token_count(&last, &total);
+                    }
                 }
                 emitter.emit(&emit_thread_id, event);
             });
@@ -390,29 +457,17 @@ impl Runner {
                 )
                 .await;
 
-            for event in usage_events.lock().unwrap().iter() {
-                let last = Usage {
-                    input: int_field(event, "prompt_tokens"),
-                    cached: 0,
-                    output: int_field(event, "completion_tokens"),
-                    reasoning: 0,
-                    total: int_field(event, "total_tokens"),
-                };
-                lease.total_usage.input += last.input;
-                lease.total_usage.cached += last.cached;
-                lease.total_usage.output += last.output;
-                lease.total_usage.reasoning += last.reasoning;
-                lease.total_usage.total += last.total;
-                let total = lease.total_usage.clone();
-                if let Some(r) = &mut lease.rollout {
-                    r.record_thread_token_count(&last, &total);
-                }
-            }
+            // Publish the running total to the lease. The cell stays attached
+            // to the session so late events keep landing.
+            lease.total_usage = accounting.lock().unwrap().total.clone();
 
             return match outcome {
                 Ok(text) => Ok(text),
                 Err(error) => {
-                    let message = if ctx.cancel.is_cancelled() || ctx.deadline_reason().is_some() {
+                    // Go replaces the error only when it *is* the context
+                    // error (`errors.Is(err, ctx.Err())`); a real provider
+                    // failure survives even when the context is already done.
+                    let message = if is_ctx_error(&ctx, &error.message) {
                         stop_cause(&ctx, deadline_text.as_deref()).unwrap_or(error.message)
                     } else {
                         error.message
@@ -420,9 +475,6 @@ impl Runner {
                     hooks
                         .emitter
                         .emit(&thread_id, json!({"type": "error", "message": &message}));
-                    if let Some(r) = &mut lease.rollout {
-                        r.record_error(&message);
-                    }
                     Err(AgentError { message })
                 }
             };
@@ -747,5 +799,50 @@ impl Runner {
             r.record_error(&msg);
         }
         Err(AgentError { message: msg })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio_util::sync::CancellationToken;
+
+    #[test]
+    fn int_field_accepts_go_ints_and_json_floats() {
+        assert_eq!(int_field(&json!({"n": 7}), "n"), 7);
+        assert_eq!(int_field(&json!({"n": 7.0}), "n"), 7);
+        assert_eq!(int_field(&json!({"n": "7"}), "n"), 0);
+        assert_eq!(int_field(&json!({}), "n"), 0);
+    }
+
+    #[test]
+    fn is_ctx_error_matches_only_the_context_sentinel() {
+        let ctx = RunContext {
+            cancel: CancellationToken::new(),
+            deadline: None,
+        };
+        assert!(!is_ctx_error(&ctx, "context canceled"));
+
+        ctx.cancel.cancel();
+        assert!(is_ctx_error(&ctx, "context canceled"));
+        assert!(is_ctx_error(&ctx, "turn/start: context canceled"));
+        assert!(!is_ctx_error(
+            &ctx,
+            "codex thread closed; start a new session"
+        ));
+    }
+
+    #[test]
+    fn is_ctx_error_matches_an_elapsed_deadline() {
+        let ctx = RunContext {
+            cancel: CancellationToken::new(),
+            deadline: Some(tokio::time::Instant::now()),
+        };
+        assert!(is_ctx_error(&ctx, "context deadline exceeded"));
+        assert!(is_ctx_error(&ctx, "turn/start: context deadline exceeded"));
+        assert!(!is_ctx_error(
+            &ctx,
+            "codex thread closed; start a new session"
+        ));
     }
 }
