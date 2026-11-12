@@ -5,8 +5,9 @@
 //! object returned to the caller and written into the rollout. Usage fields
 //! stay absent when the decision response omitted them; they are never zeroed.
 //!
-//! Task 24A deliberately excludes Codex candidates: `codex_available()` is
-//! false until Task 24B wires the `Agent`/`Thread` adapter.
+//! Task 24B integrates Codex candidates: the adapter is registered by
+//! [`super::tools::SubagentTools::new`], so [`codex_available`] is true and a
+//! configured `codex-app-server` provider is offered to the decision model.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -164,8 +165,9 @@ pub async fn resolve_auto(
 }
 
 /// List the models of every provider that can start a session. HTTP providers
-/// without their key are omitted with all their models; Codex providers are
-/// omitted in 24A because their adapter is not integrated yet.
+/// without their key are omitted with all their models; Codex providers
+/// authenticate out of band, so they are included whenever the adapter is
+/// registered in this build.
 fn auto_candidates(config: &Config) -> (Vec<Candidate>, Vec<String>) {
     let mut candidates = Vec::new();
     let mut omitted = Vec::new();
@@ -174,7 +176,7 @@ fn auto_candidates(config: &Config) -> (Vec<Candidate>, Vec<String>) {
         if provider.api == crate::config::Api::CodexAppServer {
             if !codex_available() {
                 omitted.push(format!(
-                    "{name}: codex-app-server is not available in this build"
+                    "{name}: codex-app-server adapter is not available in this build"
                 ));
                 continue;
             }

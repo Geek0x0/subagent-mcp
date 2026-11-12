@@ -7,6 +7,9 @@
 
 #![allow(clippy::await_holding_lock)] // process-global env lock, intentionally held in current-thread tests
 
+#[path = "support/codex_peer.rs"]
+mod codex_peer;
+
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -20,8 +23,10 @@ use subagent_mcp::mcp::jsonrpc::RequestId;
 use subagent_mcp::mcp::progress::ProgressSink;
 use subagent_mcp::mcp::server::{CallContext, ToolError, ToolHandler};
 use subagent_mcp::mcp::tools::SubagentTools;
+use subagent_mcp::policy::Sandbox;
+use subagent_mcp::provider::codex::CodexAdapter;
 use subagent_mcp::provider::{
-    DeltaSink, Provider, ProviderError, TurnRequest, TurnResult, factory,
+    AuthChecker, DeltaSink, ModelLister, Provider, ProviderError, TurnRequest, TurnResult, factory,
 };
 use subagent_mcp::util::approval::{ApprovalRequest, Approver};
 use subagent_mcp::util::run::RunContext;
@@ -244,6 +249,15 @@ fn tools(config: Config) -> SubagentTools {
 /// avoids deleting it before the async call starts.
 fn cwd() -> PathBuf {
     tempfile::tempdir().unwrap().keep()
+}
+
+/// A cwd inside a fake git repository, for the `session_meta.git` assertion.
+fn git_cwd() -> PathBuf {
+    let dir = cwd();
+    std::fs::create_dir_all(dir.join(".git/refs/heads")).unwrap();
+    std::fs::write(dir.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(dir.join(".git/refs/heads/main"), "abc123\n").unwrap();
+    dir
 }
 
 struct Allow;
@@ -1281,41 +1295,350 @@ async fn excessive_max_turns_falls_back_to_the_default() {
     assert_eq!(provider.requests().len(), 50);
 }
 
-#[tokio::test]
-async fn explicit_codex_provider_is_a_clear_internal_error() {
-    let _env = env_guard();
-    let config = Config {
+// ---------------------------------------------------------------------------
+// Codex integration
+// ---------------------------------------------------------------------------
+
+static NEXT_CODEX: AtomicUsize = AtomicUsize::new(0);
+
+fn unique_codex_command(prefix: &str) -> String {
+    format!("{prefix}-{}", NEXT_CODEX.fetch_add(1, Ordering::SeqCst) + 1)
+}
+
+struct InstalledCodex {
+    command: String,
+    log: Arc<codex_peer::PeerLog>,
+}
+
+impl Drop for InstalledCodex {
+    fn drop(&mut self) {
+        codex_peer::remove(&self.command);
+    }
+}
+
+fn install_codex(prefix: &str, config: codex_peer::PeerConfig) -> InstalledCodex {
+    let command = unique_codex_command(prefix);
+    let log = codex_peer::install(&command, config);
+    InstalledCodex { command, log }
+}
+
+fn codex_provider_config(command: &str) -> ProviderConfig {
+    ProviderConfig {
+        api: Api::CodexAppServer,
+        base_url: String::new(),
+        env_key: None,
+        key: None,
+        command: Some(command.to_string()),
+        default_model: "gpt-6.1-terra".into(),
+        models: vec![subagent_mcp::config::ModelConfig {
+            id: "gpt-6.1-terra".into(),
+            description: String::new(),
+        }],
+        effort_map: BTreeMap::from([("xhigh".to_string(), "max".to_string())]),
+        max_output_tokens: None,
+        max_nudges: None,
+        extra_body: None,
+    }
+}
+
+fn codex_config(command: &str) -> Config {
+    Config {
         path: PathBuf::from("/test/config.toml"),
-        providers: BTreeMap::from([(
-            "codex".to_string(),
-            ProviderConfig {
-                api: Api::CodexAppServer,
-                base_url: String::new(),
-                env_key: None,
-                key: None,
-                command: None,
-                default_model: "gpt-6.1-terra".into(),
-                models: vec![subagent_mcp::config::ModelConfig {
-                    id: "gpt-6.1-terra".into(),
-                    description: String::new(),
-                }],
-                effort_map: BTreeMap::new(),
-                max_output_tokens: None,
-                max_nudges: None,
-                extra_body: None,
-            },
-        )]),
+        providers: BTreeMap::from([("codex".to_string(), codex_provider_config(command))]),
         auto: None,
-    };
-    let tools = tools(config);
-    let (ctx, _rx) = call_context();
-    let error = tools
-        .call("subagent", json!({"prompt": "hello", "cwd": cwd()}), ctx)
+    }
+}
+
+struct RecordingApprover {
+    decision: bool,
+    requests: Mutex<Vec<ApprovalRequest>>,
+}
+
+impl RecordingApprover {
+    fn new(decision: bool) -> Self {
+        Self {
+            decision,
+            requests: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn requests(&self) -> Vec<ApprovalRequest> {
+        self.requests.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl Approver for RecordingApprover {
+    async fn approve(&self, _ctx: &RunContext, req: ApprovalRequest) -> bool {
+        self.requests.lock().unwrap().push(req);
+        self.decision
+    }
+}
+
+fn call_context_with_approver(
+    approver: Arc<dyn Approver>,
+) -> (CallContext, mpsc::Receiver<String>) {
+    let (tx, rx) = mpsc::channel(64);
+    (
+        CallContext {
+            cancel: CancellationToken::new(),
+            request_id: Some(RequestId::new(json!(1))),
+            meta: Some(json!({"subagent-mcp/requestId": "int64:1"})),
+            progress: Some(ProgressSink::new(None, tx, Arc::new(AtomicU64::new(0)))),
+            approver,
+        },
+        rx,
+    )
+}
+
+#[tokio::test]
+async fn codex_start_delegates_and_ignores_max_turns() {
+    let _env = env_guard();
+    let peer = install_codex("codex-live", codex_peer::PeerConfig::new("from codex"));
+    let home = tempfile::tempdir().unwrap();
+    unsafe {
+        std::env::set_var("CODEX_HOME", home.path());
+        std::env::set_var("SUBAGENT_MCP_ROLLOUT", "");
+    }
+    let cwd = cwd();
+    // A directory fails AGENTS.md loading even when tests run as root, so this
+    // proves a Codex start never builds the HTTP system prompt.
+    std::fs::create_dir(cwd.join("AGENTS.md")).unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let tools = tools(codex_config(&peer.command));
+
+    let result = call(
+        &tools,
+        "subagent",
+        json!({
+            "prompt": "hello",
+            "cwd": cwd,
+            "base-instructions": "B",
+            "developer-instructions": "D",
+            "sandbox": "workspace-write",
+            "approval-policy": "on-failure",
+            "reasoning-effort": "xhigh",
+            "config": {
+                "max_turns": 1,
+                "writable_roots": [root.path()]
+            }
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error(&result), "{}", text(&result));
+    assert_eq!(text(&result), "from codex");
+    assert_eq!(structured(&result)["provider"], "codex");
+    assert_eq!(structured(&result)["model"], "gpt-6.1-terra");
+    assert!(!text(&result).contains("turn limit"));
+
+    let starts = peer.log.requests("thread/start");
+    assert_eq!(starts.len(), 1, "one thread start");
+    let params = &starts[0]["params"];
+    assert_eq!(params["cwd"], cwd.display().to_string());
+    assert_eq!(params["model"], "gpt-6.1-terra");
+    assert_eq!(params["sandbox"], "workspace-write");
+    assert_eq!(params["approvalPolicy"], "on-request");
+    assert_eq!(params["baseInstructions"], "B");
+    assert_eq!(params["developerInstructions"], "D");
+    assert_eq!(params["ephemeral"], false);
+
+    let turns = peer.log.requests("turn/start");
+    assert_eq!(turns.len(), 1, "max_turns=1 does not end a delegated turn");
+    assert_eq!(turns[0]["params"]["threadId"], "thr-1");
+    assert_eq!(turns[0]["params"]["effort"], "max");
+    assert_eq!(
+        turns[0]["params"]["sandboxPolicy"]["writableRoots"],
+        json!([root.path().to_string_lossy()])
+    );
+
+    // Codex owns its own rollout: the server must not create a recorder.
+    assert_eq!(
+        std::fs::read_dir(home.path()).unwrap().count(),
+        0,
+        "Codex sessions must not write a server-owned rollout"
+    );
+
+    let id = thread_id(&result).to_string();
+    let reply = call(
+        &tools,
+        "subagent-reply",
+        json!({"threadId": id, "prompt": "keep going"}),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error(&reply), "{}", text(&reply));
+    assert_eq!(text(&reply), "from codex");
+    assert_eq!(peer.log.requests("thread/start").len(), 1);
+    assert_eq!(peer.log.requests("turn/start").len(), 2);
+}
+
+#[tokio::test]
+async fn codex_start_omits_empty_instructions() {
+    let _env = env_guard();
+    let peer = install_codex("codex-defaults", codex_peer::PeerConfig::new("from codex"));
+    let tools = tools(codex_config(&peer.command));
+    let result = call(&tools, "subagent", json!({"prompt": "hello", "cwd": cwd()}))
         .await
-        .unwrap_err();
-    assert_eq!(error.code, -32603);
-    assert!(error.message.contains("codex-app-server"));
-    assert!(error.message.contains("24B"));
+        .unwrap();
+    assert!(!is_error(&result), "{}", text(&result));
+    let params = &peer.log.requests("thread/start")[0]["params"];
+    assert_eq!(params["sandbox"], "read-only");
+    assert_eq!(params["approvalPolicy"], "on-request");
+    assert!(params.get("baseInstructions").is_none());
+    assert!(params.get("developerInstructions").is_none());
+    assert_eq!(
+        peer.log.requests("turn/start")[0]["params"]["effort"],
+        "high"
+    );
+}
+
+#[tokio::test]
+async fn codex_start_thread_error_is_a_tool_error() {
+    let _env = env_guard();
+    let command = unique_codex_command("codex-missing");
+    let tools = tools(codex_config(&command));
+    let result = call(&tools, "subagent", json!({"prompt": "hello", "cwd": cwd()}))
+        .await
+        .unwrap();
+    assert!(is_error(&result));
+    assert!(
+        text(&result).contains("start codex app-server"),
+        "unexpected error: {}",
+        text(&result)
+    );
+    assert!(result.get("structuredContent").is_none());
+
+    let reply = call(
+        &tools,
+        "subagent-reply",
+        json!({"threadId": "any-thread", "prompt": "retry"}),
+    )
+    .await
+    .unwrap();
+    assert!(is_error(&reply));
+    assert!(text(&reply).contains("unknown threadId"));
+    codex_peer::remove(&command);
+}
+
+#[tokio::test]
+async fn codex_approvals_use_the_session_thread_id() {
+    let _env = env_guard();
+    let peer = install_codex(
+        "codex-approval",
+        codex_peer::PeerConfig {
+            approval: true,
+            ..codex_peer::PeerConfig::new("from codex")
+        },
+    );
+    let tools = tools(codex_config(&peer.command));
+    let approver = Arc::new(RecordingApprover::new(true));
+    let (ctx, _rx) = call_context_with_approver(approver.clone());
+    let result = tools
+        .call(
+            "subagent",
+            json!({"prompt": "hello", "cwd": cwd(), "approval-policy": "on-request"}),
+            ctx,
+        )
+        .await
+        .unwrap();
+    assert!(!is_error(&result), "{}", text(&result));
+    let id = thread_id(&result).to_string();
+
+    let requests = approver.requests();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].thread_id, id);
+    assert_eq!(requests[0].tool, "shell");
+    assert_eq!(requests[0].command.as_deref(), Some("echo hi"));
+    assert_eq!(requests[0].reason, "need approval");
+
+    let responses = peer.log.responses();
+    if responses.is_empty() {
+        // The approval response is written by the thread and read by the peer
+        // asynchronously; give the peer loop a moment to record it.
+        for _ in 0..100 {
+            if !peer.log.responses().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    let responses = peer.log.responses();
+    assert!(
+        responses.iter().any(|response| {
+            response["id"] == "approval-1" && response["result"]["decision"] == "accept"
+        }),
+        "approval response = {responses:?}"
+    );
+}
+
+#[tokio::test]
+async fn codex_auth_and_list_are_reachable_through_the_factory() {
+    let _env = env_guard();
+    let peer = install_codex(
+        "codex-capabilities",
+        codex_peer::PeerConfig::new("from codex"),
+    );
+    let config = codex_config(&peer.command);
+    let _tools = tools(config.clone());
+
+    let adapter =
+        factory::new("codex", &config.providers["codex"], "").expect("registered Codex adapter");
+    let codex = (adapter.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<CodexAdapter>()
+        .expect("factory returns a CodexAdapter");
+
+    let status = codex.check_auth().await.unwrap();
+    assert_eq!(status.summary, "chatgpt (pro)");
+    assert_eq!(status.version.as_deref(), Some("codex-cli 0.156.1"));
+
+    let models = codex.list_models().await.unwrap();
+    let ids: Vec<&str> = models.iter().map(|model| model.id.as_str()).collect();
+    assert_eq!(ids, ["gpt-6.1-terra", "gpt-6.1-sol"]);
+}
+
+#[tokio::test]
+async fn codex_auth_reports_logged_out() {
+    let _env = env_guard();
+    let peer = install_codex(
+        "codex-logged-out",
+        codex_peer::PeerConfig {
+            auth: codex_peer::AuthScript::LoggedOut,
+            ..codex_peer::PeerConfig::new("from codex")
+        },
+    );
+    let config = codex_config(&peer.command);
+    let _tools = tools(config.clone());
+    let adapter = factory::new("codex", &config.providers["codex"], "").unwrap();
+    let codex = (adapter.as_ref() as &dyn std::any::Any)
+        .downcast_ref::<CodexAdapter>()
+        .unwrap();
+    let error = codex.check_auth().await.unwrap_err();
+    assert_eq!(error.message, "not logged in; run codex login");
+}
+
+#[test]
+fn factory_new_works_for_responses() {
+    let _env = env_guard();
+    let _tools = tools(test_config(vec![(
+        "deepseek",
+        Arc::new(StubProvider::new("deepseek")),
+    )]));
+    let cfg = ProviderConfig {
+        api: Api::Responses,
+        base_url: "https://example.invalid/v1".into(),
+        env_key: None,
+        key: Some("test-key".into()),
+        command: None,
+        default_model: "m".into(),
+        models: Vec::new(),
+        effort_map: BTreeMap::new(),
+        max_output_tokens: None,
+        max_nudges: None,
+        extra_body: None,
+    };
+    assert!(factory::new("responses", &cfg, "test-key").is_ok());
+    assert!(factory::lookup(Api::Responses.as_str()).is_some());
 }
 
 // ---------------------------------------------------------------------------
@@ -1510,10 +1833,15 @@ async fn writable_roots_are_validated() {
 }
 
 #[tokio::test]
-async fn writable_roots_are_accepted() {
+async fn writable_roots_reach_the_session() {
     let _env = env_guard();
     let provider = Arc::new(StubProvider::with_turns("deepseek", vec![text_turn("ok")]));
-    let tools = tools(test_config(vec![("deepseek", provider)]));
+    let manager = Arc::new(subagent_mcp::agent::SessionManager::new());
+    let tools = SubagentTools::new(
+        "subagent".into(),
+        Arc::new(test_config(vec![("deepseek", provider)])),
+        manager.clone(),
+    );
     let root = tempfile::tempdir().unwrap();
     let result = call(
         &tools,
@@ -1521,12 +1849,21 @@ async fn writable_roots_are_accepted() {
         json!({
             "prompt": "hello",
             "cwd": cwd(),
+            "sandbox": "workspace-write",
             "config": {"writable_roots": [root.path()]}
         }),
     )
     .await
     .unwrap();
-    assert!(!is_error(&result));
+    assert!(!is_error(&result), "{}", text(&result));
+
+    let id = thread_id(&result).to_string();
+    let lease = manager.acquire(&id).await.unwrap();
+    assert_eq!(lease.options().sandbox, Sandbox::WorkspaceWrite);
+    assert_eq!(
+        lease.options().writable_roots,
+        vec![root.path().to_path_buf()]
+    );
 }
 
 #[tokio::test]
@@ -1722,12 +2059,13 @@ async fn writes_session_meta_for_a_new_session() {
     }
     let provider = Arc::new(StubProvider::with_turns("deepseek", vec![text_turn("ok")]));
     let tools = tools(test_config(vec![("deepseek", provider)]));
+    let cwd = git_cwd();
     let result = call(
         &tools,
         "subagent",
         json!({
             "prompt": "hello",
-            "cwd": cwd(),
+            "cwd": cwd.clone(),
             "config": {"model_reasoning_effort": "xhigh"}
         }),
     )
@@ -1751,6 +2089,14 @@ async fn writes_session_meta_for_a_new_session() {
     let turn: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
     assert_eq!(meta["type"], "session_meta");
     assert_eq!(meta["payload"]["id"], id);
+    assert_eq!(meta["payload"]["session_id"], id);
+    assert_eq!(meta["payload"]["cwd"], cwd.display().to_string());
+    assert_eq!(
+        meta["payload"]["base_instructions"]["text"],
+        subagent_mcp::agent::prompt::DEFAULT_SYSTEM_PROMPT
+    );
+    assert_eq!(meta["payload"]["git"]["branch"], "main");
+    assert_eq!(meta["payload"]["git"]["commit_hash"], "abc123");
     assert_eq!(meta["payload"]["cli_version"], subagent_mcp::VERSION);
     assert_eq!(meta["payload"]["originator"], "subagent-mcp");
     assert_eq!(meta["payload"]["model_provider"], "deepseek");
@@ -1938,28 +2284,33 @@ async fn result_shapes_omit_empty_optionals() {
     assert_eq!(error["content"][0]["type"], "text");
 }
 
+// The request-id/meta boundary lives in the server, not this handler:
+// `tests/mcp_server.rs::request_id_is_injected_into_params_meta_and_cancels_the_call`
+// and `client_supplied_arguments_meta_does_not_drive_cancellation` assert it
+// non-vacuously. The handler deliberately has no request-id state of its own.
+
 #[tokio::test]
-async fn request_id_is_read_from_meta_not_arguments() {
+async fn result_omits_empty_provider_and_model() {
     let _env = env_guard();
-    // The handler must not treat an `arguments`-level request id as a JSON-RPC
-    // id; the only source is `CallContext.meta`. A start with such an argument
-    // still runs normally.
     let provider = Arc::new(StubProvider::with_turns("deepseek", vec![text_turn("ok")]));
-    let tools = tools(test_config(vec![("deepseek", provider)]));
-    let (ctx, _rx) = call_context();
-    let result = tools
-        .call(
-            "subagent",
-            json!({
-                "prompt": "hello",
-                "cwd": cwd(),
-                "requestId": "arguments-must-not-be-used"
-            }),
-            ctx,
-        )
+    let mut config = test_config(vec![("deepseek", provider)]);
+    config
+        .providers
+        .get_mut("deepseek")
+        .unwrap()
+        .default_model
+        .clear();
+    let tools = tools(config);
+    let result = call(&tools, "subagent", json!({"prompt": "hello", "cwd": cwd()}))
         .await
         .unwrap();
-    assert!(!is_error(&result));
+    assert!(!is_error(&result), "{}", text(&result));
+    let structured = structured(&result);
+    assert_eq!(structured["provider"], "deepseek");
+    assert!(
+        structured.get("model").is_none(),
+        "an empty model must be omitted: {structured:?}"
+    );
 }
 
 #[test]

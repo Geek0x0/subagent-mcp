@@ -6,10 +6,13 @@
 //! ordering. Tool execution is delegated to a fake `ToolExecutor`; this suite
 //! never implements tool bodies or policy.
 
+#![allow(clippy::await_holding_lock)] // process-global env lock, intentionally held in current-thread tests
+
 use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -22,8 +25,8 @@ use subagent_mcp::agent::{
 };
 use subagent_mcp::policy::{ApprovalPolicy, Sandbox};
 use subagent_mcp::provider::{
-    DeltaSink, Message, Provider, ProviderError, Role, ToolCall, ToolSpec, TurnRequest, TurnResult,
-    Usage,
+    DeltaSink, Message, Provider, ProviderError, Role, Thread, ThreadCallbacks, ToolCall, ToolSpec,
+    TurnRequest, TurnResult, Usage,
 };
 use subagent_mcp::rollout::RolloutRecorder;
 use subagent_mcp::util::approval::{ApprovalRequest, Approver};
@@ -1684,17 +1687,22 @@ async fn two_concurrent_runs_with_different_hooks_emit_to_own_sinks() {
 // Rollout: sandbox policy, user message, usage and task records survive
 // ---------------------------------------------------------------------------
 
+/// Serializes the tests that mutate process-global environment variables.
+static ENV_LOCK: Mutex<()> = Mutex::new(());
+
 struct EnvGuard {
     old: Option<String>,
+    _lock: MutexGuard<'static, ()>,
 }
 
 impl EnvGuard {
     fn new(home: &Path) -> Self {
+        let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let old = std::env::var("CODEX_HOME").ok();
-        // SAFETY: this is the only env-mutating test in this test binary; it
-        // runs in its own process. The guard restores the value on drop.
+        // SAFETY: the ENV_LOCK guard above serializes every env-mutating test
+        // in this binary; the guard restores the value on drop.
         unsafe { std::env::set_var("CODEX_HOME", home) };
-        EnvGuard { old }
+        EnvGuard { old, _lock: lock }
     }
 }
 
@@ -1794,4 +1802,444 @@ async fn rollout_records_turn_context_usage_and_messages() {
     assert_eq!(find("agent_message").unwrap()["message"], "done");
     assert!(find("provider_request").is_some());
     assert!(find("task_complete").is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Delegated threads (Go `session_budget_test.go`)
+// ---------------------------------------------------------------------------
+
+fn token_count(input: i64, output: i64, total: i64) -> Value {
+    json!({
+        "type": "token_count",
+        "prompt_tokens": input,
+        "completion_tokens": output,
+        "total_tokens": total,
+    })
+}
+
+fn rollout_lines(dir: &Path) -> Vec<Value> {
+    let mut files = vec![];
+    collect_jsonl(dir, &mut files);
+    assert_eq!(files.len(), 1, "one rollout file: {files:?}");
+    fs::read_to_string(&files[0])
+        .unwrap()
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect()
+}
+
+fn rollout_event(lines: &[Value], kind: &str) -> Vec<Value> {
+    lines
+        .iter()
+        .filter(|line| {
+            line.get("type").and_then(Value::as_str) == Some("event_msg")
+                && line
+                    .get("payload")
+                    .and_then(|p| p.get("type"))
+                    .and_then(Value::as_str)
+                    == Some(kind)
+        })
+        .map(|line| line["payload"].clone())
+        .collect()
+}
+
+/// A delegated thread that emits a fixed event script, then returns text.
+struct ScriptedThread {
+    runs: Arc<AtomicUsize>,
+    events: Vec<Value>,
+    text: String,
+}
+
+#[async_trait]
+impl Thread for ScriptedThread {
+    async fn run(
+        &self,
+        _ctx: RunContext,
+        _prompt: String,
+        _effort: Option<String>,
+        callbacks: ThreadCallbacks,
+    ) -> Result<String, ProviderError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        for event in &self.events {
+            (callbacks.emit)("thread", event.clone());
+        }
+        Ok(self.text.clone())
+    }
+
+    async fn close(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+}
+
+/// A delegated thread that fails with a fixed provider message.
+struct FailingThread {
+    message: &'static str,
+}
+
+#[async_trait]
+impl Thread for FailingThread {
+    async fn run(
+        &self,
+        _ctx: RunContext,
+        _prompt: String,
+        _effort: Option<String>,
+        _callbacks: ThreadCallbacks,
+    ) -> Result<String, ProviderError> {
+        Err(ProviderError {
+            message: self.message.to_string(),
+        })
+    }
+
+    async fn close(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+}
+
+/// A delegated thread that blocks until the run deadline fires, then returns
+/// the context error, like Go's stub in `TestThreadRunNamesTheRunDeadline`.
+struct DeadlineThread;
+
+#[async_trait]
+impl Thread for DeadlineThread {
+    async fn run(
+        &self,
+        ctx: RunContext,
+        _prompt: String,
+        _effort: Option<String>,
+        _callbacks: ThreadCallbacks,
+    ) -> Result<String, ProviderError> {
+        match ctx.deadline {
+            Some(deadline) => tokio::time::sleep_until(deadline).await,
+            None => ctx.cancel.cancelled().await,
+        }
+        Err(ProviderError {
+            message: "context deadline exceeded".into(),
+        })
+    }
+
+    async fn close(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+}
+
+/// Emits a usage event, reads the rollout file before returning, then emits a
+/// second one. Used to prove usage is recorded in the callback, not after the
+/// run, and that rollout lines keep event order.
+struct MidRunRolloutThread {
+    runs: Arc<AtomicUsize>,
+    rollout_path: PathBuf,
+    seen: Arc<Mutex<usize>>,
+}
+
+#[async_trait]
+impl Thread for MidRunRolloutThread {
+    async fn run(
+        &self,
+        _ctx: RunContext,
+        _prompt: String,
+        _effort: Option<String>,
+        callbacks: ThreadCallbacks,
+    ) -> Result<String, ProviderError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        (callbacks.emit)("thread", token_count(10, 0, 10));
+        let raw = fs::read_to_string(&self.rollout_path).unwrap();
+        *self.seen.lock().unwrap() = raw
+            .lines()
+            .filter(|l| l.contains("\"token_count\""))
+            .count();
+        (callbacks.emit)("thread", token_count(5, 0, 5));
+        Ok("done".into())
+    }
+
+    async fn close(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+}
+
+/// Keeps its callbacks so a test can emit an event after `run` returns, as a
+/// provider's background task could.
+struct RetainingThread {
+    runs: Arc<AtomicUsize>,
+    callbacks: Arc<Mutex<Option<ThreadCallbacks>>>,
+    events: Vec<Value>,
+}
+
+#[async_trait]
+impl Thread for RetainingThread {
+    async fn run(
+        &self,
+        _ctx: RunContext,
+        _prompt: String,
+        _effort: Option<String>,
+        callbacks: ThreadCallbacks,
+    ) -> Result<String, ProviderError> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        for event in &self.events {
+            (callbacks.emit)("thread", event.clone());
+        }
+        *self.callbacks.lock().unwrap() = Some(callbacks);
+        Ok("done".into())
+    }
+
+    async fn close(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+}
+
+fn thread_options(thread: Arc<dyn Thread>) -> SessionOptions {
+    let mut opts = options(Arc::new(StubProvider::new(vec![])));
+    opts.thread = Some(thread);
+    opts
+}
+
+fn runner() -> Runner {
+    Runner {
+        executor: stub_executor(),
+    }
+}
+
+#[tokio::test]
+async fn delegated_thread_honors_the_token_budget() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let thread = Arc::new(ScriptedThread {
+        runs: runs.clone(),
+        events: vec![token_count(4000, 1000, 5000)],
+        text: "done".into(),
+    });
+    let events = Events::new();
+    let mut opts = thread_options(thread);
+    opts.max_total_tokens = 100;
+    let mut l = lease(opts).await;
+    let hooks = hooks(&events);
+    let runner = runner();
+
+    runner
+        .run_locked(run_ctx(), &mut l, "first", &hooks)
+        .await
+        .unwrap();
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+    assert_eq!(l.total_usage.total, 5000);
+
+    let err = runner
+        .run_locked(run_ctx(), &mut l, "second", &hooks)
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("max_total_tokens"), "{}", err.message);
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn delegated_thread_honors_the_history_budget() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let thread = Arc::new(ScriptedThread {
+        runs: runs.clone(),
+        events: vec![],
+        text: "done".into(),
+    });
+    let events = Events::new();
+    let mut opts = thread_options(thread);
+    opts.max_history_bytes = 10;
+    let mut l = lease(opts).await;
+    l.history_bytes = 11;
+    let hooks = hooks(&events);
+    let runner = runner();
+
+    let err = runner
+        .run_locked(run_ctx(), &mut l, "prompt", &hooks)
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("max_history_bytes"), "{}", err.message);
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn delegated_thread_names_the_run_deadline() {
+    let events = Events::new();
+    let mut opts = thread_options(Arc::new(DeadlineThread));
+    opts.run_deadline = Some(Duration::from_millis(20));
+    let mut l = lease(opts).await;
+    let hooks = hooks(&events);
+    let runner = runner();
+
+    let err = runner
+        .run_locked(run_ctx(), &mut l, "prompt", &hooks)
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("run deadline"), "{}", err.message);
+}
+
+#[tokio::test]
+async fn delegated_thread_usage_reaches_the_rollout() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = EnvGuard::new(tmp.path());
+
+    let runs = Arc::new(AtomicUsize::new(0));
+    let thread = Arc::new(ScriptedThread {
+        runs: runs.clone(),
+        events: vec![token_count(400, 100, 500)],
+        text: "done".into(),
+    });
+    let events = Events::new();
+    let mut l = lease(thread_options(thread)).await;
+    let recorder =
+        RolloutRecorder::create("thread-usage", Path::new(""), "", "codex", "m", "high").unwrap();
+    l.rollout = Some(recorder);
+    let hooks = hooks(&events);
+    let runner = runner();
+
+    runner
+        .run_locked(run_ctx(), &mut l, "prompt", &hooks)
+        .await
+        .unwrap();
+    assert_eq!(l.total_usage.total, 500);
+
+    let lines = rollout_lines(tmp.path());
+    let counts = rollout_event(&lines, "token_count");
+    assert_eq!(counts.len(), 1);
+    assert_eq!(counts[0]["info"]["last_token_usage"]["total_tokens"], 500);
+    assert_eq!(counts[0]["info"]["total_token_usage"]["total_tokens"], 500);
+}
+
+#[tokio::test]
+async fn delegated_thread_maps_a_wrapped_context_error() {
+    let events = Events::new();
+    let mut l = lease(thread_options(Arc::new(FailingThread {
+        message: "turn/start: context canceled",
+    })))
+    .await;
+    let ctx = run_ctx();
+    ctx.cancel.cancel();
+    let hooks = hooks(&events);
+    let runner = runner();
+
+    let err = runner
+        .run_locked(ctx, &mut l, "prompt", &hooks)
+        .await
+        .unwrap_err();
+    assert_eq!(err.message, "context canceled");
+}
+
+#[tokio::test]
+async fn delegated_thread_preserves_a_real_error_after_cancellation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = EnvGuard::new(tmp.path());
+
+    let events = Events::new();
+    let mut l = lease(thread_options(Arc::new(FailingThread {
+        message: "codex thread closed; start a new session",
+    })))
+    .await;
+    let recorder =
+        RolloutRecorder::create("thread-error", Path::new(""), "", "codex", "m", "high").unwrap();
+    l.rollout = Some(recorder);
+    let ctx = run_ctx();
+    ctx.cancel.cancel();
+    let hooks = hooks(&events);
+    let runner = runner();
+
+    let err = runner
+        .run_locked(ctx, &mut l, "prompt", &hooks)
+        .await
+        .unwrap_err();
+    assert_eq!(err.message, "codex thread closed; start a new session");
+
+    // Go's delegated error path does not record a rollout error line.
+    let lines = rollout_lines(tmp.path());
+    assert!(
+        rollout_event(&lines, "error").is_empty(),
+        "rollout = {lines:?}"
+    );
+}
+
+#[tokio::test]
+async fn delegated_thread_records_usage_as_events_arrive() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = EnvGuard::new(tmp.path());
+
+    let mut files = vec![];
+    let recorder =
+        RolloutRecorder::create("thread-mid", Path::new(""), "", "codex", "m", "high").unwrap();
+    collect_jsonl(tmp.path(), &mut files);
+    assert_eq!(files.len(), 1, "rollout file is created up front");
+    let seen = Arc::new(Mutex::new(0));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let thread = Arc::new(MidRunRolloutThread {
+        runs: runs.clone(),
+        rollout_path: files[0].clone(),
+        seen: seen.clone(),
+    });
+    let events = Events::new();
+    let mut l = lease(thread_options(thread)).await;
+    l.rollout = Some(recorder);
+    let hooks = hooks(&events);
+    let runner = runner();
+
+    runner
+        .run_locked(run_ctx(), &mut l, "prompt", &hooks)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *seen.lock().unwrap(),
+        1,
+        "usage must be recorded while the thread runs, not after it returns"
+    );
+    let lines = rollout_lines(tmp.path());
+    let counts = rollout_event(&lines, "token_count");
+    assert_eq!(counts.len(), 2);
+    assert_eq!(counts[0]["info"]["total_token_usage"]["total_tokens"], 10);
+    assert_eq!(counts[1]["info"]["total_token_usage"]["total_tokens"], 15);
+    assert_eq!(l.total_usage.total, 15);
+}
+
+#[tokio::test]
+async fn delegated_thread_accounts_usage_emitted_after_the_run_returns() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _guard = EnvGuard::new(tmp.path());
+
+    let callbacks = Arc::new(Mutex::new(None));
+    let runs = Arc::new(AtomicUsize::new(0));
+    let thread = Arc::new(RetainingThread {
+        runs: runs.clone(),
+        callbacks: callbacks.clone(),
+        events: vec![token_count(10, 0, 10)],
+    });
+    let events = Events::new();
+    let mut opts = thread_options(thread);
+    opts.max_total_tokens = 12;
+    let mut l = lease(opts).await;
+    let recorder =
+        RolloutRecorder::create("thread-late", Path::new(""), "", "codex", "m", "high").unwrap();
+    l.rollout = Some(recorder);
+    let hooks = hooks(&events);
+    let runner = runner();
+
+    runner
+        .run_locked(run_ctx(), &mut l, "first", &hooks)
+        .await
+        .unwrap();
+    assert_eq!(l.total_usage.total, 10);
+
+    // A background provider task reports usage after the turn returned.
+    let retained = callbacks
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the thread keeps its callbacks");
+    (retained.emit)("thread", token_count(5, 0, 5));
+
+    // The next budget check sees the late event, as Go's session mutation does.
+    let err = runner
+        .run_locked(run_ctx(), &mut l, "second", &hooks)
+        .await
+        .unwrap_err();
+    assert!(err.message.contains("max_total_tokens"), "{}", err.message);
+    assert_eq!(runs.load(Ordering::SeqCst), 1);
+
+    let lines = rollout_lines(tmp.path());
+    let counts = rollout_event(&lines, "token_count");
+    assert_eq!(counts.len(), 2, "late usage is still recorded: {lines:?}");
+    assert_eq!(counts[1]["info"]["last_token_usage"]["total_tokens"], 5);
+    assert_eq!(counts[1]["info"]["total_token_usage"]["total_tokens"], 15);
 }
