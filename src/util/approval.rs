@@ -1,5 +1,6 @@
 use crate::util::run::RunContext;
 
+#[derive(Clone, Debug)]
 pub struct ApprovalRequest {
     /// The thread that requested approval. Go's `Server.Approve` takes this as
     /// a separate argument; the Rust `Approver` trait carries it on the request

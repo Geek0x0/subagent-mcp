@@ -173,6 +173,22 @@ impl RolloutRecorder {
         }
     }
 
+    /// Go `recordThreadEvent`'s rollout half: a delegated thread reports usage
+    /// through `token_count` events, so its rollout line is written here
+    /// instead of from [`Self::record_model_turn`].
+    pub fn record_thread_token_count(&mut self, last: &Usage, total: &Usage) {
+        self.write_line(
+            "event_msg",
+            json!({
+                "type": "token_count",
+                "info": {
+                    "total_token_usage": usage_payload(total),
+                    "last_token_usage": usage_payload(last),
+                },
+            }),
+        );
+    }
+
     /// Go `recordToolCall`: apply_patch becomes a custom_tool_call whose input
     /// is the `patch` field of the arguments; everything else a function_call.
     pub fn record_tool_call(&mut self, turn_id: &str, call: &ToolCall, tool: &str) {

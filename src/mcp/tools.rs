@@ -7,9 +7,12 @@
 //!
 //! [`Runner`] owns only the shared executor, so one `Arc<Runner>` serves every
 //! call; each call builds its own [`RunHooks`] from its [`CallContext`], which
-//! keeps progress and approvals per-call. Codex whole-thread sessions are Task
-//! 24B; [`codex_available`] is the seam that flips when that adapter lands.
+//! keeps progress and approvals per-call. Codex whole-thread sessions are
+//! integrated here: the adapter is registered with the factory and reached
+//! through an optional-capability downcast, the HTTP system prompt is skipped,
+//! and Codex owns its own rollout.
 
+use std::any::Any;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -26,7 +29,10 @@ use crate::mcp::auto::{AutoSelection, resolve_auto};
 use crate::mcp::progress::ProgressSink;
 use crate::mcp::server::{CallContext, ToolDefinition, ToolError, ToolHandler};
 use crate::policy::{ApprovalPolicy, Sandbox};
-use crate::provider::{ChatCompletions, Messages, Provider, Responses, factory};
+use crate::provider::codex::CodexAdapter;
+use crate::provider::{
+    Agent, ChatCompletions, Messages, Provider, Responses, Thread, ThreadOptions, factory,
+};
 use crate::repo;
 use crate::rollout::RolloutRecorder;
 use crate::util::duration::format_go_duration;
@@ -46,11 +52,6 @@ const MAX_TOTAL_TOKENS_LIMIT: u64 = 1_000_000_000;
 /// Go `maxRunDeadlineSeconds` (7 days).
 const MAX_RUN_DEADLINE_SECONDS: u64 = 7 * 24 * 60 * 60;
 
-/// The `_meta` key the server's before-call hook uses to hand over the
-/// canonical JSON-RPC request id. Read here only from `CallContext.meta`,
-/// never from tool arguments.
-const REQUEST_ID_META_KEY: &str = "subagent-mcp/requestId";
-
 const START_DESCRIPTION: &str = "Start a new subagent coding-agent thread.";
 const REPLY_DESCRIPTION: &str = "Continue an existing subagent coding-agent thread.";
 const PROMPT_DESCRIPTION: &str = "Task prompt to send to the new subagent thread.";
@@ -63,15 +64,15 @@ const AUTO_DESCRIPTION: &str =
     "Auto selection details, present when the model was selected by auto mode.";
 const CONFIG_DESCRIPTION: &str = "loose config map; recognized keys: max_turns (number from 1 to 100000), model_reasoning_effort (same values as reasoning-effort; the top-level argument wins), writable_roots (array of absolute directory paths the shell may also write under workspace-write), max_nudges (integer 0 to 10; how many times a reply without a tool call is answered with a continue prompt, overriding the provider default), max_history_bytes (integer ceiling on the history the thread replays; default 67108864, 0 disables), max_total_tokens (integer ceiling on the tokens the thread reports across all turns; default 0, off), run_deadline_seconds (integer wall-clock ceiling on one call; default 0, off); an unusable budget value is an error, other unknown keys are silently ignored";
 
-/// Whether the Codex whole-thread adapter is integrated. Task 24A ships the
-/// HTTP adapters only; Task 24B flips this to `true` together with the
-/// `Agent`/`Thread` implementation.
+/// Whether this build can run Codex whole-thread sessions. The adapter is
+/// registered by [`register_adapters`]; a test dispatcher may own the slot, in
+/// which case the registered constructor is still the availability signal.
 pub fn codex_available() -> bool {
-    false
+    factory::lookup(Api::CodexAppServer.as_str()).is_some()
 }
 
-/// Register the HTTP adapter constructors once. The factory's `Constructor`
-/// takes a resolved API key, while each adapter resolves its own key from
+/// Register the adapter constructors once. The factory's `Constructor` takes a
+/// resolved API key, while each adapter resolves its own key from
 /// `ProviderConfig`/env; the third argument is therefore ignored deliberately.
 fn register_adapters() {
     static ONCE: OnceLock<()> = OnceLock::new();
@@ -94,12 +95,51 @@ fn register_adapters() {
                 |name, cfg, _key| Ok(Arc::new(Messages::new(name, cfg)?) as Arc<dyn Provider>),
             ),
         );
-        // Codex registration belongs to Task 24B, after the Agent adapter.
+        register_if_absent(
+            Api::CodexAppServer.as_str(),
+            Arc::new(|name, cfg, _key| {
+                Ok(Arc::new(CodexAdapter::new(name, cfg)?) as Arc<dyn Provider>)
+            }),
+        );
     });
 }
 
+/// The optional `Agent` capability of a resolved provider. The design keeps
+/// `Agent` out of the provider god trait and uses a downcast; Codex is the only
+/// adapter that implements it.
+///
+/// Rust has no `dyn Any` -> `dyn Trait` downcast, so the capability is reached
+/// through the concrete adapter that implements it and returned as the
+/// `dyn Agent` trait object. [`ensure_agent_capable`] turns a provider that
+/// claims `codex-app-server` without that capability into a clear error instead
+/// of silently running the HTTP turn loop.
+fn codex_agent(adapter: &Arc<dyn Provider>) -> Option<&dyn Agent> {
+    (adapter.as_ref() as &dyn Any)
+        .downcast_ref::<CodexAdapter>()
+        .map(|codex| codex as &dyn Agent)
+}
+
+/// Reject a `codex-app-server` provider whose adapter cannot start threads.
+///
+/// Returns whether the adapter exposes the `Agent` capability. Non-Codex APIs
+/// are never required to be agents.
+fn ensure_agent_capable(
+    name: &str,
+    cfg: &ProviderConfig,
+    adapter: &Arc<dyn Provider>,
+) -> Result<bool, String> {
+    let is_agent = codex_agent(adapter).is_some();
+    if cfg.api == Api::CodexAppServer && !is_agent {
+        return Err(format!(
+            "provider {} uses codex-app-server but its adapter does not implement the Agent capability",
+            go_quote(name)
+        ));
+    }
+    Ok(is_agent)
+}
+
 /// Register a constructor unless a caller (or a test dispatcher) already owns
-/// the API slot. Production has no prior registration, so all three register.
+/// the API slot. Production has no prior registration, so all four register.
 fn register_if_absent(api: &str, constructor: factory::Constructor) {
     if factory::lookup(api).is_none() {
         factory::register(api, constructor);
@@ -137,18 +177,10 @@ impl SubagentTools {
     async fn handle_start(&self, args: Value, ctx: CallContext) -> Result<Value, ToolError> {
         let CallContext {
             cancel,
-            meta,
             progress,
             approver,
             ..
         } = ctx;
-        // The request id is deliberately read from `_meta`, never from the
-        // tool arguments; the server already keys cancellation by it.
-        let _request_id = meta
-            .as_ref()
-            .and_then(|meta| meta.get(REQUEST_ID_META_KEY))
-            .and_then(Value::as_str)
-            .map(str::to_string);
         let args = args.as_object().cloned().unwrap_or_default();
 
         let prompt = match require_string(&args, "prompt") {
@@ -194,7 +226,6 @@ impl SubagentTools {
                     adapter = Some(resolved.adapter);
                 }
                 Err(ResolveError::Tool(message)) => return fail(message),
-                Err(ResolveError::Internal(error)) => return Err(error),
             }
         }
 
@@ -373,11 +404,35 @@ impl SubagentTools {
             }
         }
 
-        let base = args.get("base-instructions").and_then(Value::as_str);
-        let developer = args.get("developer-instructions").and_then(Value::as_str);
-        let system_prompt = match crate::agent::prompt::system_prompt(base, developer, &cwd) {
-            Ok(prompt) => prompt,
-            Err(error) => return fail(error.message),
+        let base_instructions = args
+            .get("base-instructions")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let developer_instructions = args
+            .get("developer-instructions")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        let adapter = adapter.expect("provider resolved");
+        let provider_cfg = provider_cfg.expect("provider resolved");
+        let is_agent = match ensure_agent_capable(&provider_name, &provider_cfg, &adapter) {
+            Ok(is_agent) => is_agent,
+            Err(message) => return fail(message),
+        };
+        // Codex receives its instructions through ThreadOptions; building the
+        // HTTP prompt (default + AGENTS.md + developer) here would both waste
+        // work and make a bad AGENTS.md fail a Codex start.
+        let system_prompt = if is_agent {
+            String::new()
+        } else {
+            match crate::agent::prompt::system_prompt(
+                base_instructions.as_deref(),
+                developer_instructions.as_deref(),
+                &cwd,
+            ) {
+                Ok(prompt) => prompt,
+                Err(error) => return fail(error.message),
+            }
         };
 
         let max_turns = loose_config
@@ -387,7 +442,6 @@ impl SubagentTools {
             .map(|value| value as usize)
             .unwrap_or(0);
 
-        let provider_cfg = provider_cfg.expect("provider resolved");
         let mut max_nudges = provider_cfg.max_nudges.unwrap_or(0);
         if let Some(value) = loose_config
             .get("max_nudges")
@@ -408,9 +462,36 @@ impl SubagentTools {
             };
         }
 
+        // A Codex session delegates the whole thread: the adapter starts it
+        // with the caller's instructions and owns persistence and rollout.
+        // Go passes the call context here, not the run deadline, which only
+        // bounds `RunLocked`.
+        let thread_ctx = RunContext {
+            cancel: run_ctx.cancel.clone(),
+            deadline: None,
+        };
+        let thread: Option<Arc<dyn Thread>> = if let Some(agent) = codex_agent(&adapter) {
+            let options = ThreadOptions {
+                model: model.clone(),
+                cwd: cwd.clone(),
+                sandbox,
+                approval_policy: approval,
+                base_instructions: base_instructions.clone(),
+                developer_instructions: developer_instructions.clone(),
+                writable_roots: writable_roots.clone(),
+                ephemeral: false,
+            };
+            match agent.start_thread(&thread_ctx, options).await {
+                Ok(thread) => Some(Arc::from(thread)),
+                Err(error) => return fail(error.message),
+            }
+        } else {
+            None
+        };
+
         let options = SessionOptions {
-            provider: adapter.expect("provider resolved"),
-            thread: None,
+            provider: adapter,
+            thread,
             model: model.clone(),
             reasoning_effort: requested.clone(),
             effort_sent: Some(map_effort(&provider_cfg, &requested)),
@@ -439,15 +520,19 @@ impl SubagentTools {
             Err(error) => return Err(ToolError::internal(error.message())),
         };
 
+        // Codex owns its own rollout; only HTTP sessions get the server's
+        // recorder and `session_meta`.
         let created = SystemTime::now();
-        if let Ok(mut recorder) = RolloutRecorder::create(
-            &session.id,
-            &cwd,
-            &system_prompt,
-            &provider_name,
-            &model,
-            &requested,
-        ) {
+        if !is_agent
+            && let Ok(mut recorder) = RolloutRecorder::create(
+                &session.id,
+                &cwd,
+                &system_prompt,
+                &provider_name,
+                &model,
+                &requested,
+            )
+        {
             let meta = session_meta(
                 &session.id,
                 &cwd,
@@ -590,19 +675,8 @@ impl SubagentTools {
         };
 
         let key = api_key_for(&self.config, &name).map_err(ResolveError::Tool)?;
-        let adapter = if cfg.api == Api::CodexAppServer {
-            if !codex_available() {
-                return Err(ResolveError::Internal(ToolError::internal(format!(
-                    "codex-app-server provider {} is not available in this build yet (Task 24B)",
-                    go_quote(&name)
-                ))));
-            }
-            return Err(ResolveError::Internal(ToolError::internal(
-                "codex-app-server adapter is not registered",
-            )));
-        } else {
-            factory::new(&name, &cfg, &key).map_err(|error| ResolveError::Tool(error.message))?
-        };
+        let adapter =
+            factory::new(&name, &cfg, &key).map_err(|error| ResolveError::Tool(error.message))?;
 
         Ok(ResolvedProvider { name, cfg, adapter })
     }
@@ -655,8 +729,6 @@ struct ResolvedProvider {
 enum ResolveError {
     /// A user-facing tool error (Go's `NewToolResultError`).
     Tool(String),
-    /// A clear JSON-RPC internal error; currently only Codex-before-24B.
-    Internal(ToolError),
 }
 
 struct RunBudgets {
@@ -710,8 +782,12 @@ fn start_result(
     let mut structured = Map::new();
     structured.insert("threadId".into(), json!(thread_id));
     structured.insert("content".into(), json!(content));
-    structured.insert("provider".into(), json!(provider));
-    structured.insert("model".into(), json!(model));
+    if !provider.is_empty() {
+        structured.insert("provider".into(), json!(provider));
+    }
+    if !model.is_empty() {
+        structured.insert("model".into(), json!(model));
+    }
     if let Some(auto) = auto {
         structured.insert("auto".into(), auto.meta());
     }
@@ -728,8 +804,12 @@ fn reply_result(
     let mut structured = Map::new();
     structured.insert("threadId".into(), json!(thread_id));
     structured.insert("content".into(), json!(content));
-    structured.insert("provider".into(), json!(provider));
-    structured.insert("model".into(), json!(model));
+    if !provider.is_empty() {
+        structured.insert("provider".into(), json!(provider));
+    }
+    if !model.is_empty() {
+        structured.insert("model".into(), json!(model));
+    }
     tool_result(content, Some(Value::Object(structured)), is_error)
 }
 
@@ -1332,8 +1412,24 @@ mod tests {
     }
 
     #[test]
-    fn codex_is_unavailable_in_24a() {
-        assert!(!codex_available());
+    fn codex_is_available_in_24b() {
+        register_adapters();
+        assert!(codex_available());
+    }
+
+    #[test]
+    fn result_helpers_omit_empty_provider_and_model() {
+        let start = start_result("thread-1", "text", "", "", None, false);
+        let structured = start["structuredContent"].as_object().unwrap();
+        assert!(structured.get("provider").is_none());
+        assert!(structured.get("model").is_none());
+        assert_eq!(structured["threadId"], "thread-1");
+        assert_eq!(structured["content"], "text");
+
+        let reply = reply_result("thread-1", "text", "", "", false);
+        let structured = reply["structuredContent"].as_object().unwrap();
+        assert!(structured.get("provider").is_none());
+        assert!(structured.get("model").is_none());
     }
 
     #[test]
@@ -1342,5 +1438,59 @@ mod tests {
         assert_eq!(budgets.history_bytes, 64 << 20);
         assert_eq!(budgets.total_tokens, 0);
         assert_eq!(budgets.run_deadline, Duration::ZERO);
+    }
+
+    struct PlainProvider;
+
+    #[async_trait]
+    impl Provider for PlainProvider {
+        fn name(&self) -> &str {
+            "plain"
+        }
+
+        async fn turn(
+            &self,
+            _ctx: crate::util::run::RunContext,
+            _req: crate::provider::TurnRequest,
+            _on_delta: crate::provider::DeltaSink,
+        ) -> Result<crate::provider::TurnResult, crate::provider::ProviderError> {
+            Ok(crate::provider::TurnResult::default())
+        }
+    }
+
+    fn codex_provider_cfg() -> ProviderConfig {
+        ProviderConfig {
+            api: Api::CodexAppServer,
+            base_url: String::new(),
+            env_key: None,
+            key: None,
+            command: Some("codex-test".into()),
+            default_model: "gpt-6.1-terra".into(),
+            models: Vec::new(),
+            effort_map: Default::default(),
+            max_output_tokens: None,
+            max_nudges: None,
+            extra_body: None,
+        }
+    }
+
+    #[test]
+    fn codex_app_server_requires_the_agent_capability() {
+        let plain: Arc<dyn Provider> = Arc::new(PlainProvider);
+        let error = ensure_agent_capable("codex", &codex_provider_cfg(), &plain).unwrap_err();
+        assert!(error.contains("codex-app-server"), "{error}");
+        assert!(error.contains("Agent capability"), "{error}");
+
+        // Non-Codex APIs are never required to be agents.
+        let http = ProviderConfig {
+            api: Api::Responses,
+            ..codex_provider_cfg()
+        };
+        assert!(!ensure_agent_capable("http", &http, &plain).unwrap());
+
+        // The registered adapter exposes the capability.
+        let real: Arc<dyn Provider> =
+            Arc::new(CodexAdapter::new("codex", &codex_provider_cfg()).unwrap());
+        assert!(ensure_agent_capable("codex", &codex_provider_cfg(), &real).unwrap());
     }
 }

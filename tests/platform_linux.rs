@@ -23,10 +23,11 @@
 
 use std::ffi::OsString;
 use std::fs;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::symlink;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use subagent_mcp::patch::FS;
@@ -329,39 +330,58 @@ fn wait_delay_nonzero_exit_precedence_when_descendant_holds_pipes() {
 // SIGTERM with stdin open (Task 25 invariant, platform repeat)
 // ---------------------------------------------------------------------------
 
-/// SKELETON — ignored until Task 25 lands the serve lifecycle.
+/// A serving process whose stdin pipe is held open and idle must exit within
+/// the 10 s shutdown budget when it receives SIGTERM, and it must report
+/// success rather than the cancellation the serve loop ends with.
 ///
-/// A process whose stdin pipe is held open and idle must exit within the 10 s
-/// shutdown budget when it receives SIGTERM. The production serve loop that
-/// installs the handler is Task 25's `cli::serve`; until it exists there is no
-/// crate code on this path, so this test only pins the OS-level shell behavior
-/// and must not be claimed as a gate. Task 25 must replace the `sh` child with
-/// the real `subagent-mcp` server (open stdin, initialize, SIGTERM) and remove
-/// `#[ignore]`.
+/// The child is driven through an MCP `initialize` exchange first, so the
+/// signal cannot arrive before the server installed its handler: a fixed sleep
+/// would make this fail whenever a loaded machine needs longer to start.
 #[test]
-#[ignore = "requires Task 25 serve lifecycle"]
 fn sigterm_with_stdin_open_exits_within_budget() {
-    let mut child = std::process::Command::new("sh")
-        .args([
-            "-c",
-            "trap 'exit 0' TERM; echo ready; read line; echo after-read",
-        ])
+    let home = tempfile::tempdir().unwrap();
+    let config = write_server_config(home.path());
+    let mut child = std::process::Command::new(exe())
+        .env("SUBAGENT_MCP_CONFIG", &config)
+        .env("HOME", home.path())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn stdin-blocked child");
+        .expect("spawn subagent-mcp");
 
-    // Hold the write end open for the whole test: stdin is never written and
-    // never closed, which is the "client keeps the pipe open" case.
-    let stdin = child.stdin.take().expect("stdin is piped");
-    let mut stdout = child.stdout.take().expect("stdout is piped");
-    let mut ready = [0u8; 6];
-    stdout
-        .read_exact(&mut ready)
-        .expect("child never reached the blocking read");
-    assert_eq!(&ready, b"ready\n");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let (sender, lines) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdout.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if sender.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
 
+    stdin
+        .write_all(initialize_frame().as_bytes())
+        .expect("write initialize");
+    stdin.flush().expect("flush initialize");
+    let response = lines
+        .recv_timeout(Duration::from_secs(20))
+        .expect("server never answered initialize");
+    assert!(
+        response.contains("\"serverInfo\""),
+        "initialize response = {response:?}"
+    );
+
+    // Hold the write end open for the whole test: stdin is never written again
+    // and never closed, which is the "client keeps the pipe open" case.
     let start = Instant::now();
     let pid = i32::try_from(child.id()).expect("pid fits i32");
     // SAFETY: the child was started by this test and has not been reaped.
@@ -386,7 +406,7 @@ fn sigterm_with_stdin_open_exits_within_budget() {
 
     assert!(
         status.success(),
-        "child exited with {status:?}; the SIGTERM trap did not run"
+        "child exited with {status:?}; the serve loop did not shut down cleanly"
     );
     assert!(
         start.elapsed() < SHUTDOWN_BUDGET,
@@ -394,4 +414,32 @@ fn sigterm_with_stdin_open_exits_within_budget() {
         start.elapsed()
     );
     drop(stdin);
+    drop(lines);
+    let _ = reader.join();
+}
+
+/// The provider config the platform SIGTERM test starts: a valid chat
+/// completions provider whose key is unset, so startup never needs the network.
+fn write_server_config(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("config.toml");
+    fs::write(
+        &path,
+        r#"
+[providers.test]
+api = "chat-completions"
+env_key = "SUBAGENT_PLATFORM_TEST_KEY"
+default_model = "test-model"
+models = [{ id = "test-model" }]
+"#,
+    )
+    .unwrap();
+    path
+}
+
+fn initialize_frame() -> String {
+    concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"platform-test","version":"1"}}}"#,
+        "\n"
+    )
+    .to_string()
 }
