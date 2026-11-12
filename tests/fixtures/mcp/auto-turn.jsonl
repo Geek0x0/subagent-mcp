@@ -1,0 +1,8 @@
+{"id": 1, "jsonrpc": "2.0", "result": {"capabilities": {"tools": {}}, "protocolVersion": "2025-03-26", "serverInfo": {"name": "subagent-mcp", "version": "0.13.1"}}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"type": "task_started"}, "threadId": "3f73c73b-2c0c-41c4-a9e6-bb87b253e6f1"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"delta": "Let me check.", "type": "agent_message_delta"}, "threadId": "3f73c73b-2c0c-41c4-a9e6-bb87b253e6f1"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"duration_ms": 1, "model": "m-pro", "provider": "bravo", "ttft_ms": 1, "type": "provider_request"}, "threadId": "3f73c73b-2c0c-41c4-a9e6-bb87b253e6f1"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"completion_tokens": 5, "prompt_tokens": 7, "total_tokens": 12, "type": "token_count"}, "threadId": "3f73c73b-2c0c-41c4-a9e6-bb87b253e6f1"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"message": "Let me check.", "type": "agent_message"}, "threadId": "3f73c73b-2c0c-41c4-a9e6-bb87b253e6f1"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"type": "task_complete"}, "threadId": "3f73c73b-2c0c-41c4-a9e6-bb87b253e6f1"}}
+{"id": 2, "jsonrpc": "2.0", "result": {"content": [{"text": "Let me check.", "type": "text"}], "structuredContent": {"auto": {"confidence": 0.9, "input_tokens": 42, "judge_model": "jev-1.14.0", "output_tokens": 3, "probabilities": {"alpha/m-fast": 0.1, "bravo/m-pro": 0.9}}, "content": "Let me check.", "model": "m-pro", "provider": "bravo", "threadId": "3f73c73b-2c0c-41c4-a9e6-bb87b253e6f1"}}}

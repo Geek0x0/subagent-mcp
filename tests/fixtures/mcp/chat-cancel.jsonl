@@ -1,0 +1,5 @@
+{"id": 1, "jsonrpc": "2.0", "result": {"capabilities": {"tools": {}}, "protocolVersion": "2025-03-26", "serverInfo": {"name": "subagent-mcp", "version": "0.13.1"}}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"type": "task_started"}, "threadId": "0c9a39f4-2d89-4fb1-b251-f8a585a8ce7c"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"duration_ms": 0, "error": "context canceled", "model": "mock-model", "provider": "mock", "type": "provider_request"}, "threadId": "0c9a39f4-2d89-4fb1-b251-f8a585a8ce7c"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"message": "context canceled", "type": "error"}, "threadId": "0c9a39f4-2d89-4fb1-b251-f8a585a8ce7c"}}
+{"id": 2, "jsonrpc": "2.0", "result": {"content": [{"text": "error: context canceled", "type": "text"}], "isError": true, "structuredContent": {"content": "error: context canceled", "model": "mock-model", "provider": "mock", "threadId": "0c9a39f4-2d89-4fb1-b251-f8a585a8ce7c"}}}

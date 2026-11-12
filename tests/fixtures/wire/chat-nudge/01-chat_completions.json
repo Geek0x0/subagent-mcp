@@ -1,0 +1,144 @@
+{
+ "body": {
+  "messages": [
+   {
+    "content": "You are subagent-mcp, a coding agent. You work inside a fixed working directory using four tools:\n\n- shell: run a bash command in the working directory\n- read_file: read a file (relative paths resolve against the working directory)\n- write_file: create or overwrite a whole file (parent directories are created)\n- apply_patch: edit files with a *** Begin Patch / *** End Patch patch; prefer it for changing existing files\n\nWork autonomously on the task you are given: inspect what you need, make the smallest change that satisfies the request, and verify it when possible. Some calls may be denied by the sandbox policy or the user; when that happens, adapt your approach or explain the blocker instead of repeating the same call. When the task is done, reply WITHOUT any tool call: summarize what you did, list changed files, and how you verified the result.",
+    "role": "system"
+   },
+   {
+    "content": "tell me something",
+    "role": "user"
+   }
+  ],
+  "model": "mock-model",
+  "reasoning_effort": "high",
+  "stream": true,
+  "stream_options": {
+   "include_usage": true
+  },
+  "tools": [
+   {
+    "function": {
+     "description": "Run a bash command in the working directory. The sandbox policy may deny the call; providing justification helps if approval is required.",
+     "name": "shell",
+     "parameters": {
+      "properties": {
+       "command": {
+        "description": "Bash command to run.",
+        "type": "string"
+       },
+       "justification": {
+        "description": "Why this call is needed if approval is required.",
+        "type": "string"
+       },
+       "timeout_seconds": {
+        "description": "Optional timeout in seconds (clamped, max 600).",
+        "type": "integer"
+       }
+      },
+      "required": [
+       "command"
+      ],
+      "type": "object"
+     }
+    },
+    "type": "function"
+   },
+   {
+    "function": {
+     "description": "Read a file, resolving relative paths against the working directory. The sandbox policy may deny the call; providing justification helps if approval is required.",
+     "name": "read_file",
+     "parameters": {
+      "properties": {
+       "justification": {
+        "description": "Why this call is needed if approval is required.",
+        "type": "string"
+       },
+       "limit": {
+        "description": "maximum number of lines to return; defaults to all that fit in the 16 KiB output cap",
+        "type": "integer"
+       },
+       "offset": {
+        "description": "1-based line number to start reading from; defaults to 1",
+        "type": "integer"
+       },
+       "path": {
+        "description": "File path to read.",
+        "type": "string"
+       }
+      },
+      "required": [
+       "path"
+      ],
+      "type": "object"
+     }
+    },
+    "type": "function"
+   },
+   {
+    "function": {
+     "description": "Create or overwrite a whole file, creating parent directories as needed. The sandbox policy may deny the call; providing justification helps if approval is required.",
+     "name": "write_file",
+     "parameters": {
+      "properties": {
+       "content": {
+        "description": "Complete file content.",
+        "type": "string"
+       },
+       "justification": {
+        "description": "Why this call is needed if approval is required.",
+        "type": "string"
+       },
+       "path": {
+        "description": "File path to write.",
+        "type": "string"
+       }
+      },
+      "required": [
+       "path",
+       "content"
+      ],
+      "type": "object"
+     }
+    },
+    "type": "function"
+   },
+   {
+    "function": {
+     "description": "Edit files with a patch: '*** Begin Patch', then '*** Add File: <path>' (+lines), '*** Delete File: <path>', or '*** Update File: <path>' (optional '*** Move to: <path>') with '@@' chunks of ' ' context, '-' removed, and '+' added lines, then '*** End Patch'. Prefer this for editing existing files. The sandbox policy may deny the call; providing justification helps if approval is required.",
+     "name": "apply_patch",
+     "parameters": {
+      "properties": {
+       "justification": {
+        "description": "Why this call is needed if approval is required.",
+        "type": "string"
+       },
+       "patch": {
+        "description": "Complete patch text from *** Begin Patch to *** End Patch.",
+        "type": "string"
+       }
+      },
+      "required": [
+       "patch"
+      ],
+      "type": "object"
+     }
+    },
+    "type": "function"
+   }
+  ]
+ },
+ "headers": {
+  "accept": "text/event-stream",
+  "accept-encoding": "gzip",
+  "authorization": "Bearer mock-key",
+  "cache-control": "no-cache",
+  "connection": "keep-alive",
+  "content-length": "3596",
+  "content-type": "application/json",
+  "host": "127.0.0.1:33101",
+  "user-agent": "Go-http-client/1.1"
+ },
+ "method": "POST",
+ "path": "/chat/completions"
+}

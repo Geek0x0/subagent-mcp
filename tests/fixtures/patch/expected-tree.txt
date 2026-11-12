@@ -1,0 +1,4 @@
+f 0o644 a.txt
+f 0o644 hello.txt
+d 0o755 src
+f 0o644 src/b.txt

@@ -1,0 +1,30 @@
+{
+ "body": {
+  "model": "jev-latest",
+  "questions": {
+   "model": {
+    "criteria": {
+     "c1": "provider alpha (api chat-completions); model m-fast",
+     "c2": "provider bravo (api chat-completions); model m-pro"
+    },
+    "instructions": "Select the configured provider and model best suited to complete the task in state. Weigh the task's required reasoning depth, coding and tool needs, and the speed/cost implied by each candidate's description. Choose exactly one candidate.",
+    "type": "choice"
+   }
+  },
+  "state": {
+   "cwd": "/tmp/auto-turn-cwd-kz5j72g6",
+   "task": "fix the parser"
+  }
+ },
+ "headers": {
+  "accept-encoding": "gzip",
+  "authorization": "Bearer auto-key",
+  "content-length": "519",
+  "content-type": "application/json",
+  "host": "127.0.0.1:37013",
+  "typesafe-danger-zone-long-context": "true",
+  "user-agent": "Go-http-client/1.1"
+ },
+ "method": "POST",
+ "path": "/v1/systemone"
+}

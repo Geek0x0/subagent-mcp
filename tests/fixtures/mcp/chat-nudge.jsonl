@@ -1,0 +1,11 @@
+{"id": 1, "jsonrpc": "2.0", "result": {"capabilities": {"tools": {}}, "protocolVersion": "2025-03-26", "serverInfo": {"name": "subagent-mcp", "version": "0.13.1"}}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"type": "task_started"}, "threadId": "e0461b10-be5d-491c-9884-da79898be87b"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"duration_ms": 1, "model": "mock-model", "provider": "mock", "type": "provider_request"}, "threadId": "e0461b10-be5d-491c-9884-da79898be87b"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"completion_tokens": 0, "prompt_tokens": 7, "total_tokens": 7, "type": "token_count"}, "threadId": "e0461b10-be5d-491c-9884-da79898be87b"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"message": "Your last reply was empty: it had no text and no tool call, so any tool call you made may not have been delivered. If work remains, make the next tool call now, and keep it small and simple (for example split a large file write into several smaller calls). If the task is completely done, reply with your final summary.", "type": "agent_nudge"}, "threadId": "e0461b10-be5d-491c-9884-da79898be87b"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"delta": "Let me check.", "type": "agent_message_delta"}, "threadId": "e0461b10-be5d-491c-9884-da79898be87b"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"duration_ms": 42, "model": "mock-model", "provider": "mock", "ttft_ms": 42, "type": "provider_request"}, "threadId": "e0461b10-be5d-491c-9884-da79898be87b"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"completion_tokens": 5, "prompt_tokens": 7, "total_tokens": 12, "type": "token_count"}, "threadId": "e0461b10-be5d-491c-9884-da79898be87b"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"message": "Let me check.", "type": "agent_message"}, "threadId": "e0461b10-be5d-491c-9884-da79898be87b"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"type": "task_complete"}, "threadId": "e0461b10-be5d-491c-9884-da79898be87b"}}
+{"id": 2, "jsonrpc": "2.0", "result": {"content": [{"text": "Let me check.", "type": "text"}], "structuredContent": {"content": "Let me check.", "model": "mock-model", "provider": "mock", "threadId": "e0461b10-be5d-491c-9884-da79898be87b"}}}

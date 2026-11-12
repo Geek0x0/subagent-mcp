@@ -1,0 +1,6 @@
+data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: {"id":"c1","choices":[],"usage":{"prompt_tokens":7,"completion_tokens":0,"total_tokens":7}}
+
+data: [DONE]
+
