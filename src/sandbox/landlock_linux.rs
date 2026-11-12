@@ -199,13 +199,19 @@ pub(crate) fn run(args: &[OsString]) -> Result<(), Error> {
     restrict(&roots, &p)?;
 
     // Close the passed directory handles before exec; the rules hold the inodes.
-    for fd in &parsed.root_fds {
-        // SAFETY: fd is an owned child fd being released before exec.
-        unsafe { libc::close(*fd) };
-    }
+    // The bound cwd is also a writable root, so a `--rw-fd` may equal
+    // `--cwd-fd`; close each descriptor exactly once (no double close).
+    let mut to_close: Vec<i32> = parsed.root_fds.clone();
     if parsed.cwd_fd >= 0 {
-        // SAFETY: fd is an owned child fd being released before exec.
-        unsafe { libc::close(parsed.cwd_fd) };
+        to_close.push(parsed.cwd_fd);
+    }
+    to_close.sort_unstable();
+    to_close.dedup();
+    for fd in to_close {
+        if fd >= 0 {
+            // SAFETY: fd is an owned child fd being released before exec.
+            unsafe { libc::close(fd) };
+        }
     }
 
     // Go: exec.LookPath(argv[0]) + syscall.Exec. Rust `Command::exec` uses

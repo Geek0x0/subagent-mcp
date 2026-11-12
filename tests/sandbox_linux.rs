@@ -188,6 +188,7 @@ fn sandbox_wrap_rewrites_spec() {
         env: vec![(OsString::from("K"), OsString::from("V"))],
         stdout: Stdio::piped(),
         stderr: Stdio::piped(),
+        inherited_fds: Vec::new(),
     };
     sandbox.wrap(&mut spec);
     assert_eq!(spec.program, OsString::from("/bin/subagent-mcp"));

@@ -46,6 +46,7 @@ fn cmd_spec(command: &str) -> CommandSpec {
         env: scrubbed_env(),
         stdout: Stdio::piped(),
         stderr: Stdio::piped(),
+        inherited_fds: Vec::new(),
     }
 }
 
@@ -61,6 +62,7 @@ fn powershell_spec(script: &str) -> CommandSpec {
         env: scrubbed_env(),
         stdout: Stdio::piped(),
         stderr: Stdio::piped(),
+        inherited_fds: Vec::new(),
     }
 }
 

@@ -245,6 +245,48 @@ impl SandboxLauncher for Sandbox {
     }
 }
 
+/// Go `RunShellSandboxedBound`: the fd-based launcher. Instead of re-resolving
+/// `--rw` paths at exec time (TOCTOU), it hands the session's HELD directory
+/// descriptors to the helper via `--cwd-fd` / `--rw-fd` and arranges for those
+/// exact descriptors to be inherited by the child (clearing FD_CLOEXEC in
+/// `pre_exec`). `command_fd` builds the helper argv; `spec.cwd` is `/` because
+/// the helper `fchdir()`s into the held cwd via `--cwd-fd`.
+pub struct BoundSandbox {
+    pub self_exe: PathBuf,
+    pub cwd_fd: i32,
+    pub root_fds: Vec<i32>,
+}
+
+impl BoundSandbox {
+    pub fn new(self_exe: PathBuf, cwd_fd: i32, root_fds: Vec<i32>) -> Self {
+        Self {
+            self_exe,
+            cwd_fd,
+            root_fds,
+        }
+    }
+}
+
+impl SandboxLauncher for BoundSandbox {
+    fn wrap(&self, spec: &mut CommandSpec) {
+        let mut tail = Vec::with_capacity(1 + spec.args.len());
+        tail.push(spec.program.clone());
+        tail.extend(spec.args.iter().cloned());
+        let cmd = command_fd(&self.self_exe, self.cwd_fd, &self.root_fds, &tail);
+        spec.program = cmd.get_program().to_os_string();
+        spec.args = cmd.get_args().map(|a| a.to_os_string()).collect();
+        spec.cwd = Some(PathBuf::from("/"));
+        // Inherit the exact held descriptor numbers. The bound cwd is also a
+        // writable root, so `cwd_fd` can repeat in `root_fds`; dedupe so each
+        // descriptor is cleared (and later closed) exactly once.
+        let mut inherited = vec![self.cwd_fd];
+        inherited.extend(self.root_fds.iter().copied());
+        inherited.sort_unstable();
+        inherited.dedup();
+        spec.inherited_fds = inherited;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Helper argument parser
 // ---------------------------------------------------------------------------

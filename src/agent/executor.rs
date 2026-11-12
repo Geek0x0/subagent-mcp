@@ -21,6 +21,12 @@
 //! `ctx.cancel`/`ctx.deadline`, and an already-finished context short-circuits
 //! to `cancelled: not executed`. Nothing relies on the runner's before/after
 //! checks to bound an in-flight tool.
+//!
+//! Shell sandboxing: an unapproved call in a confining sandbox uses
+//! [`crate::sandbox::BoundSandbox`] to hand the session's HELD directory
+//! descriptors to the helper (`--cwd-fd` / `--rw-fd`), matching Go
+//! `RunShellSandboxedBound` and avoiding path re-resolution (TOCTOU). A granted
+//! approval omits the launcher entirely (Go's escalation).
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
@@ -42,17 +48,35 @@ use crate::policy::{
     Decision, PolicyError, PolicyRequest, Sandbox, ToolKind, bound_path, evaluate_with_reason,
 };
 use crate::provider::{ToolCall, ToolSpec};
-use crate::sandbox::{BoundDirectory, Sandbox as LandlockLauncher};
+use crate::sandbox::{BoundDirectory, BoundSandbox, Sandbox as LandlockLauncher};
 use crate::tools::files::read_file_range;
-use crate::tools::shell::{ShellResult, run_shell};
+use crate::tools::shell::{SandboxLauncher, ShellResult, run_shell};
 use crate::util::approval::{ApprovalRequest, Approver};
 use crate::util::json::truncate_utf8;
 use crate::util::run::RunContext;
 
-/// The executor the runner delegates to. A unit struct: all per-call state
-/// (progress and approval sinks) arrives through [`RunHooks`], never stored on
-/// the executor, so concurrent runs cannot share a sink.
-pub struct BuiltinToolExecutor;
+/// The executor the runner delegates to. All per-call state (progress and
+/// approval sinks, the run turn id) arrives through [`RunHooks`] / the
+/// `execute` arguments, never stored here, so concurrent runs cannot share a
+/// sink. `self_exe` is the binary hosting the Landlock helper
+/// (`__sandbox-exec`); it defaults to the running executable (the real
+/// `subagent-mcp` binary in production) and integration tests inject
+/// `CARGO_BIN_EXE_subagent-mcp` via [`BuiltinToolExecutor::new`].
+pub struct BuiltinToolExecutor {
+    self_exe: PathBuf,
+}
+
+impl BuiltinToolExecutor {
+    pub fn new(self_exe: PathBuf) -> Self {
+        Self { self_exe }
+    }
+}
+
+impl Default for BuiltinToolExecutor {
+    fn default() -> Self {
+        Self::new(std::env::current_exe().unwrap_or_default())
+    }
+}
 
 fn schema(raw: &str) -> Box<serde_json::value::RawValue> {
     serde_json::value::RawValue::from_string(raw.to_owned())
@@ -137,12 +161,13 @@ impl ToolExecutor for BuiltinToolExecutor {
         lease: &mut SessionLease,
         call: &ToolCall,
         hooks: &RunHooks,
+        turn_id: &str,
     ) -> ToolResult {
         // Go `safeExecToolCall`: recover a panic raised while the async tool
         // body is POLLING (including after `.await` points), not merely while
         // the future is created. `AssertUnwindSafe` is required because the
         // future borrows `&mut SessionLease`.
-        let future = self.exec_tool_call(ctx, lease, call, hooks);
+        let future = self.exec_tool_call(ctx, lease, call, hooks, turn_id);
         match AssertUnwindSafe(future).catch_unwind().await {
             Ok(result) => result,
             Err(payload) => ToolResult {
@@ -403,10 +428,36 @@ impl Drop for ExecEnd {
     }
 }
 
-/// The executor does not know the runner's per-run `turn_id` (a local of
-/// `RunLocked`), so `patch_apply_end` carries the empty string for that field;
-/// every other field matches Go `recordPatchApplied` exactly.
-const PATCH_APPLY_TURN_ID: &str = "";
+/// Build the shell launcher for a sandboxed (unapproved) call. On Unix the
+/// session holds `O_PATH` directory descriptors, so use Go's
+/// `RunShellSandboxedBound` fd form (`--cwd-fd` / `--rw-fd` with inherited
+/// fds) — no path re-resolution, no TOCTOU. Fall back to the path-based `--rw`
+/// launcher only when there is no held cwd (Go `RunShellSandboxed`).
+#[cfg(unix)]
+fn sandboxed_launcher(
+    self_exe: PathBuf,
+    bound_cwd: Option<&BoundDirectory>,
+    bound_roots: &[Arc<BoundDirectory>],
+    root_paths: &[PathBuf],
+) -> Box<dyn SandboxLauncher> {
+    if let Some(bc) = bound_cwd {
+        let root_fds: Vec<i32> = bound_roots.iter().map(|r| r.raw_fd()).collect();
+        Box::new(BoundSandbox::new(self_exe, bc.raw_fd(), root_fds))
+    } else {
+        Box::new(LandlockLauncher::new(self_exe, root_paths.to_vec()))
+    }
+}
+
+#[cfg(not(unix))]
+fn sandboxed_launcher(
+    self_exe: PathBuf,
+    _bound_cwd: Option<&BoundDirectory>,
+    _bound_roots: &[Arc<BoundDirectory>],
+    root_paths: &[PathBuf],
+) -> Box<dyn SandboxLauncher> {
+    // No kernel sandbox off Unix; the path-based launcher is the only form.
+    Box::new(LandlockLauncher::new(self_exe, root_paths.to_vec()))
+}
 
 impl BuiltinToolExecutor {
     #[allow(clippy::too_many_lines)]
@@ -416,6 +467,7 @@ impl BuiltinToolExecutor {
         lease: &mut SessionLease,
         call: &ToolCall,
         hooks: &RunHooks,
+        turn_id: &str,
     ) -> ToolResult {
         // Go `execToolCall`: an already-finished context never executes or asks.
         if ctx_expired(ctx) {
@@ -457,6 +509,7 @@ impl BuiltinToolExecutor {
             (o.sandbox, o.approval, o.cwd.clone())
         };
         let bound_cwd = lease.bound_cwd.clone();
+        let bound_roots = lease.bound_roots.clone();
         let root_paths = lease.root_paths.clone();
         let bind_err = lease.bind_err.clone();
         let thread_id = lease.id().to_string();
@@ -642,12 +695,20 @@ impl BuiltinToolExecutor {
                             is_error: true,
                         }
                     } else {
-                        let self_exe = std::env::current_exe().unwrap_or_default();
-                        let launcher = LandlockLauncher::new(self_exe, root_paths.clone());
-                        // An approved escalation omits the launcher entirely.
-                        run_shell(ctx, &cwd, &args.command, timeout, Some(&launcher)).await
+                        // Unapproved: fd-based (held-inode) launcher on Unix,
+                        // path-based --rw fallback when no cwd is held. An
+                        // approved escalation reaches the `else` below with no
+                        // launcher at all.
+                        let launcher = sandboxed_launcher(
+                            self.self_exe.clone(),
+                            bound_cwd.as_deref(),
+                            &bound_roots,
+                            &root_paths,
+                        );
+                        run_shell(ctx, &cwd, &args.command, timeout, Some(launcher.as_ref())).await
                     }
                 } else {
+                    // Approved escalation (or danger-full-access): unwrapped.
                     run_shell(ctx, &cwd, &args.command, timeout, None).await
                 };
                 end.exit_code = Some(sr.exit_code);
@@ -728,14 +789,7 @@ impl BuiltinToolExecutor {
                         let r = format!("error: {m}");
                         end.tool_err = Some(m);
                         if let Some(rollout) = lease.rollout.as_mut() {
-                            rollout.record_patch_applied(
-                                PATCH_APPLY_TURN_ID,
-                                &call.id,
-                                false,
-                                "",
-                                &r,
-                                &[],
-                            );
+                            rollout.record_patch_applied(turn_id, &call.id, false, "", &r, &[]);
                         }
                         ToolResult {
                             output: r,
@@ -745,14 +799,7 @@ impl BuiltinToolExecutor {
                     Ok(changes) => {
                         let r = summary(&changes);
                         if let Some(rollout) = lease.rollout.as_mut() {
-                            rollout.record_patch_applied(
-                                PATCH_APPLY_TURN_ID,
-                                &call.id,
-                                true,
-                                &r,
-                                "",
-                                &changes,
-                            );
+                            rollout.record_patch_applied(turn_id, &call.id, true, &r, "", &changes);
                         }
                         ToolResult {
                             output: r,

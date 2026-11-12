@@ -342,6 +342,7 @@ pub async fn run_shell(
         env: scrubbed_env(),
         stdout: Stdio::piped(),
         stderr: Stdio::piped(),
+        inherited_fds: Vec::new(),
     };
     if let Some(launcher) = sandbox {
         launcher.wrap(&mut spec);

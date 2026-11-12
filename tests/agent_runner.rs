@@ -373,6 +373,7 @@ impl ToolExecutor for StubExecutor {
         lease: &mut SessionLease,
         call: &ToolCall,
         hooks: &RunHooks,
+        _turn_id: &str,
     ) -> ToolResult {
         self.calls.lock().unwrap().push(call.clone());
         if self.use_approver {
@@ -435,6 +436,7 @@ impl ToolExecutor for GateExecutor {
         _lease: &mut SessionLease,
         call: &ToolCall,
         _hooks: &RunHooks,
+        _turn_id: &str,
     ) -> ToolResult {
         self.calls.lock().unwrap().push(call.clone());
         let result = self

@@ -10,8 +10,10 @@
 //! truncated-arguments cases). The in-repo Go tree is normative for exact
 //! errors, events and tool schemas.
 
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -27,10 +29,17 @@ use subagent_mcp::provider::{
     DeltaSink, Provider, ProviderError, Role, ToolCall, ToolSpec, TurnRequest, TurnResult,
 };
 use subagent_mcp::rollout::RolloutRecorder;
+use subagent_mcp::sandbox::BoundSandbox;
+use subagent_mcp::tools::process::CommandSpec;
+use subagent_mcp::tools::shell::SandboxLauncher;
 use subagent_mcp::util::approval::{ApprovalRequest, Approver};
 use subagent_mcp::util::run::RunContext;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+
+/// Turn id used by the executor helpers that call `execute` directly (i.e. not
+/// through `Runner`, which supplies its own generated `Uuid`).
+const TEST_TURN_ID: &str = "test-turn-23b";
 
 // ---------------------------------------------------------------------------
 // Shared recording sinks
@@ -287,10 +296,12 @@ fn tool_call(id: &str, name: &str, arguments: Value) -> ToolCall {
     }
 }
 
-/// Call the executor directly for one tool call.
+/// Call the executor directly for one tool call (libtest binary as helper).
 async fn exec(opts: SessionOptions, ctx: RunContext, call: ToolCall, h: &RunHooks) -> ToolResult {
     let mut l = lease(opts).await;
-    BuiltinToolExecutor.execute(&ctx, &mut l, &call, h).await
+    BuiltinToolExecutor::default()
+        .execute(&ctx, &mut l, &call, h, TEST_TURN_ID)
+        .await
 }
 
 /// Run several tool calls against the SAME session lease.
@@ -300,21 +311,55 @@ async fn exec_on(
     call: ToolCall,
     h: &RunHooks,
 ) -> ToolResult {
-    BuiltinToolExecutor.execute(&ctx, l, &call, h).await
+    BuiltinToolExecutor::default()
+        .execute(&ctx, l, &call, h, TEST_TURN_ID)
+        .await
 }
 
-/// Drive the full runner loop with the real built-in executor.
+/// An executor whose Landlock helper is the REAL `subagent-mcp` binary (the
+/// libtest harness does not dispatch `__sandbox-exec`). Needed for the
+/// end-to-end sandbox tests.
+fn real_executor() -> BuiltinToolExecutor {
+    BuiltinToolExecutor::new(PathBuf::from(env!("CARGO_BIN_EXE_subagent-mcp")))
+}
+
+/// Call the executor with the real helper binary for one tool call.
+async fn exec_real(
+    opts: SessionOptions,
+    ctx: RunContext,
+    call: ToolCall,
+    h: &RunHooks,
+) -> ToolResult {
+    let mut l = lease(opts).await;
+    real_executor()
+        .execute(&ctx, &mut l, &call, h, TEST_TURN_ID)
+        .await
+}
+
+/// Drive the full runner loop with the real built-in executor. The runner
+/// generates and passes the real per-run turn id into `execute`.
 async fn run_loop(
     opts: SessionOptions,
     ctx: RunContext,
     h: &RunHooks,
 ) -> (Result<String, AgentError>, SessionLease) {
+    run_loop_with(opts, ctx, h, None).await
+}
+
+/// `run_loop` variant that attaches a rollout recorder before the run.
+async fn run_loop_with(
+    opts: SessionOptions,
+    ctx: RunContext,
+    h: &RunHooks,
+    recorder: Option<RolloutRecorder>,
+) -> (Result<String, AgentError>, SessionLease) {
     let m = SessionManager::new();
     let s = m.create(opts).await.unwrap();
     let id = s.id.clone();
     let mut l = m.acquire(&id).await.unwrap();
+    l.rollout = recorder;
     let runner = Runner {
-        executor: Arc::new(BuiltinToolExecutor),
+        executor: Arc::new(BuiltinToolExecutor::default()),
     };
     let r = runner.run_locked(ctx, &mut l, "go", h).await;
     (r, l)
@@ -332,6 +377,24 @@ fn write(path: &Path, content: &[u8]) {
         fs::create_dir_all(parent).unwrap();
     }
     fs::write(path, content).unwrap();
+}
+
+/// A temp directory OUTSIDE every workspace-write root (cwd + /tmp + $TMPDIR),
+/// so a Landlock-confined write there is denied. Go uses `/var/tmp` for this.
+/// Returns None (test skips) when the kernel/sandbox or `/var/tmp` is missing.
+fn sandbox_test_dir() -> Option<tempfile::TempDir> {
+    if !subagent_mcp::sandbox::available() {
+        eprintln!("skip: landlock unavailable");
+        return None;
+    }
+    if !Path::new("/var/tmp").is_dir() {
+        eprintln!("skip: /var/tmp unavailable");
+        return None;
+    }
+    tempfile::Builder::new()
+        .prefix("subagent-mcp-23b-out-")
+        .tempdir_in("/var/tmp")
+        .ok()
 }
 
 // ===========================================================================
@@ -760,13 +823,21 @@ async fn approval_prompt_names_the_sandbox_escalation() {
 }
 
 /// "Approved shell escalation omitting the Landlock launcher": a human-approved
-/// command runs unwrapped (bash executes, marker appears); the same command in
-/// an unapproved, sandboxed session goes through the launcher and bash never
-/// runs (no marker).
+/// command runs unwrapped (no launcher), while the same unapproved command goes
+/// through the fd launcher whose helper is the REAL `subagent-mcp` binary, so
+/// bash ACTUALLY executes under Landlock: the echo marker appears but the write
+/// outside the held roots is denied. This is the end-to-end proof that the fd
+/// launcher is used (not a path-based `--rw` wrapper) and that escalation omits
+/// it entirely.
 #[tokio::test]
 async fn approved_shell_escalation_omits_launcher() {
-    let outside = tempfile::tempdir().unwrap();
+    let Some(outside) = sandbox_test_dir() else {
+        return;
+    };
     let outside_file = outside.path().join("approved-marker");
+    let outside_file2 = outside.path().join("never-marker");
+    let _ = fs::remove_file(&outside_file);
+    let _ = fs::remove_file(&outside_file2);
 
     // Approved (untrusted + granted) -> no launcher -> command runs directly.
     let cwd1 = tempfile::tempdir().unwrap();
@@ -774,7 +845,7 @@ async fn approved_shell_escalation_omits_launcher() {
     let h1 = hooks(recording_emitter(&events1), approver(true).0);
     let cmd =
         json!({"command": format!("echo RUN_MARKER_123 && touch {}", outside_file.display())});
-    let r1 = exec(
+    let r1 = exec_real(
         options(
             provider(vec![]),
             cwd1.path(),
@@ -782,7 +853,7 @@ async fn approved_shell_escalation_omits_launcher() {
             ApprovalPolicy::Untrusted,
         ),
         live_ctx(),
-        tool_call("c1", "shell", cmd.clone()),
+        tool_call("c1", "shell", cmd),
         &h1,
     )
     .await;
@@ -790,14 +861,14 @@ async fn approved_shell_escalation_omits_launcher() {
     assert!(r1.output.contains("RUN_MARKER_123"), "{:?}", r1.output);
     assert!(outside_file.exists(), "approved command ran unwrapped");
 
-    // Unapproved (never) -> sandboxed -> launcher wraps -> bash never runs.
-    let outside_file2 = outside.path().join("never-marker");
+    // Unapproved (never) -> fd launcher (real helper) -> bash actually runs
+    // under Landlock: echo works, the write outside held roots is DENIED.
     let cmd2 =
         json!({"command": format!("echo RUN_MARKER_456 && touch {}", outside_file2.display())});
     let cwd2 = tempfile::tempdir().unwrap();
     let events2 = Events::new();
     let h2 = hooks(recording_emitter(&events2), approver(true).0);
-    let r2 = exec(
+    let r2 = exec_real(
         options(
             provider(vec![]),
             cwd2.path(),
@@ -810,14 +881,122 @@ async fn approved_shell_escalation_omits_launcher() {
     )
     .await;
     assert!(
-        !r2.output.contains("RUN_MARKER_456"),
-        "launcher-wrapped command must not run bash: {:?}",
+        r2.output.contains("RUN_MARKER_456"),
+        "helper must actually exec bash: {:?}",
         r2.output
     );
     assert!(
         !outside_file2.exists(),
-        "wrapped command must not write outside roots"
+        "Landlock must deny writes outside held roots: {:?}",
+        r2.output
     );
+    assert!(
+        !r2.output.starts_with("exit code: 0"),
+        "the outside write must fail: {:?}",
+        r2.output
+    );
+
+    let _ = fs::remove_file(&outside_file);
+    let _ = fs::remove_file(&outside_file2);
+}
+
+/// Real integration test of the fd launcher: the executor hands the held
+/// `O_PATH` directory fds to the REAL binary's helper, which runs bash; a write
+/// INSIDE the held root succeeds and a write OUTSIDE is denied. Skips only when
+/// Landlock or /var/tmp is unavailable (Go `testutil.LandlockUnavailable`).
+#[tokio::test]
+async fn fd_launcher_runs_bash_and_confines_writes() {
+    let Some(outside) = sandbox_test_dir() else {
+        return;
+    };
+    let cwd = tempfile::tempdir().unwrap();
+    let inside_file = cwd.path().join("inside_ok");
+    let outside_file = outside.path().join("outside_bad");
+    let _ = fs::remove_file(&outside_file);
+
+    let events = Events::new();
+    let h = hooks(recording_emitter(&events), approver(true).0);
+    let command = format!(
+        "echo FD_LAUNCHER_RAN; touch {}; touch {}",
+        inside_file.display(),
+        outside_file.display()
+    );
+    let r = exec_real(
+        options(
+            provider(vec![]),
+            cwd.path(),
+            Sandbox::WorkspaceWrite,
+            ApprovalPolicy::Never,
+        ),
+        live_ctx(),
+        tool_call("c1", "shell", json!({"command": command})),
+        &h,
+    )
+    .await;
+
+    assert!(
+        r.output.contains("FD_LAUNCHER_RAN"),
+        "the fd helper must actually exec bash: {:?}",
+        r.output
+    );
+    assert!(
+        inside_file.exists(),
+        "write inside the held root must succeed: {:?}",
+        r.output
+    );
+    assert!(
+        !outside_file.exists(),
+        "write outside the held roots must be denied: {:?}",
+        r.output
+    );
+    assert!(
+        !r.output.starts_with("exit code: 0"),
+        "the outside write must fail: {:?}",
+        r.output
+    );
+    let _ = fs::remove_file(&outside_file);
+}
+
+/// Unit-level proof that the fd launcher builds `--cwd-fd` / `--rw-fd` argv and
+/// requests real fd inheritance (never path-based `--rw`).
+#[test]
+fn bound_sandbox_wrap_uses_fd_args_and_inherited_fds() {
+    let launcher = BoundSandbox::new(PathBuf::from("/bin/subagent-mcp"), 7, vec![7, 9, 7]);
+    let mut spec = CommandSpec {
+        program: OsString::from("bash"),
+        args: vec![OsString::from("-lc"), OsString::from("echo hi")],
+        cwd: Some(PathBuf::from("/work")),
+        env: vec![],
+        stdout: Stdio::piped(),
+        stderr: Stdio::piped(),
+        inherited_fds: Vec::new(),
+    };
+    launcher.wrap(&mut spec);
+
+    assert_eq!(spec.program, OsString::from("/bin/subagent-mcp"));
+    let args: Vec<String> = spec
+        .args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(args.first().map(String::as_str), Some("__sandbox-exec"));
+    assert!(args.contains(&"--cwd-fd".to_string()), "{args:?}");
+    assert!(args.contains(&"7".to_string()), "{args:?}");
+    assert_eq!(
+        args.iter().filter(|a| a.as_str() == "--rw-fd").count(),
+        3,
+        "{args:?}"
+    );
+    assert!(
+        !args.contains(&"--rw".to_string()),
+        "must not use path-based --rw: {args:?}"
+    );
+    assert!(args.contains(&"--".to_string()));
+    assert_eq!(args.last().map(String::as_str), Some("echo hi"));
+    // Held fds (cwd + roots) deduped and inherited by the child.
+    assert_eq!(spec.inherited_fds, vec![7, 9]);
+    // The helper fchdir()s into --cwd-fd; start from a stable dir.
+    assert_eq!(spec.cwd, Some(PathBuf::from("/")));
 }
 
 /// "workspace-write shell/read/write/patch": confined writes/patches go
@@ -889,9 +1068,10 @@ async fn workspace_write_read_write_patch_confined() {
     assert_eq!(fs::read(cwd.path().join("a.txt")).unwrap(), b"new\n");
 }
 
-/// "patch transaction failure" and rollout: `record_patch_applied` produces a
-/// single `patch_apply_end` per apply_patch (success AND failure), with exact
-/// stdout/stderr/changes, and no duplicate tool-call/output rollout records.
+/// "patch transaction failure" and rollout: driven through the RUNNER so the
+/// executor receives the real per-run turn id. `patch_apply_end` carries it
+/// (non-empty, equal to `turn_context.turn_id`), and the executor records no
+/// duplicate tool-call/output records. Exact stdout/stderr/changes preserved.
 #[tokio::test]
 async fn patch_end_rollout_and_transaction_failure() {
     let home = tempfile::tempdir().unwrap();
@@ -899,45 +1079,29 @@ async fn patch_end_rollout_and_transaction_failure() {
     let cwd = tempfile::tempdir().unwrap();
     let events = Events::new();
     let h = hooks(recording_emitter(&events), approver(true).0);
-
-    let mut l = lease(options(
-        provider(vec![]),
-        cwd.path(),
-        Sandbox::DangerFullAccess,
-        ApprovalPolicy::Never,
-    ))
-    .await;
-    l.rollout =
-        Some(RolloutRecorder::create("t23b", Path::new(""), "", "stub", "m", "high").unwrap());
+    let recorder = RolloutRecorder::create("t23b", Path::new(""), "", "stub", "m", "high").unwrap();
 
     let ok_patch = "*** Begin Patch\n*** Add File: ok.txt\n+hello\n*** End Patch";
-    let r_ok = exec_on(
-        &mut l,
-        live_ctx(),
-        tool_call("c-ok", "apply_patch", json!({"patch": ok_patch})),
-        &h,
-    )
-    .await;
-    assert!(!r_ok.is_error, "{:?}", r_ok.output);
-    assert_eq!(fs::read(cwd.path().join("ok.txt")).unwrap(), b"hello\n");
-
     // Two Add Files: the second's parent is the file created by the first, so
     // commit fails and rolls the first write back.
     let fail_patch = "*** Begin Patch\n*** Add File: blocker\n+x\n*** Add File: blocker/child\n+y\n*** End Patch";
-    let r_fail = exec_on(
-        &mut l,
-        live_ctx(),
+    let calls = vec![
+        tool_call("c-ok", "apply_patch", json!({"patch": ok_patch})),
         tool_call("c-fail", "apply_patch", json!({"patch": fail_patch})),
-        &h,
-    )
-    .await;
-    assert!(r_fail.is_error, "{:?}", r_fail.output);
-    assert!(r_fail.output.starts_with("error:"), "{:?}", r_fail.output);
+    ];
+    let opts = options(
+        provider(vec![tool_turn(calls), text_turn("done")]),
+        cwd.path(),
+        Sandbox::DangerFullAccess,
+        ApprovalPolicy::Never,
+    );
+    let (result, l) = run_loop_with(opts, live_ctx(), &h, Some(recorder)).await;
+    assert_eq!(result.unwrap(), "done");
+    assert_eq!(fs::read(cwd.path().join("ok.txt")).unwrap(), b"hello\n");
     assert!(
         !cwd.path().join("blocker").exists(),
         "failed commit rolled back"
     );
-
     drop(l);
 
     let mut files = Vec::new();
@@ -949,16 +1113,59 @@ async fn patch_end_rollout_and_transaction_failure() {
         .filter(|l| !l.trim().is_empty())
         .map(|l| serde_json::from_str(l).unwrap())
         .collect();
-    // Exactly two records, both patch_apply_end: the executor must not
-    // duplicate the runner's tool_call / tool_output records.
-    assert_eq!(lines.len(), 2, "only patch_apply_end records: {lines:?}");
-    for line in &lines {
-        assert_eq!(line["type"], "event_msg");
-        assert_eq!(line["payload"]["type"], "patch_apply_end");
-    }
-    let ok = lines
+
+    // The runner's real turn id (a UUID, not the executor's old "" sentinel).
+    let ctx = lines
         .iter()
-        .find(|l| l["payload"]["success"] == true)
+        .find(|l| l["type"].as_str() == Some("turn_context"))
+        .expect("turn_context record");
+    let turn_id = ctx["payload"]["turn_id"].as_str().unwrap();
+    assert!(turn_id.len() >= 30, "real turn id, not empty: {turn_id:?}");
+
+    // Exactly two patch_apply_end records, each carrying the REAL turn id.
+    let ends: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["payload"]["type"].as_str() == Some("patch_apply_end"))
+        .collect();
+    assert_eq!(
+        ends.len(),
+        2,
+        "one patch_apply_end per apply_patch call: {ends:?}"
+    );
+    for e in &ends {
+        assert!(e["payload"]["turn_id"].as_str().unwrap().len() >= 30);
+        assert_eq!(
+            e["payload"]["turn_id"].as_str(),
+            Some(turn_id),
+            "patch_apply_end uses the runner turn id"
+        );
+    }
+
+    // The runner records each tool call/output exactly once; the executor must
+    // not duplicate them.
+    let count = |t: &str| {
+        lines
+            .iter()
+            .filter(|l| {
+                l["type"].as_str() == Some("response_item")
+                    && l["payload"]["type"].as_str() == Some(t)
+            })
+            .count()
+    };
+    assert_eq!(
+        count("custom_tool_call"),
+        2,
+        "no duplicate tool_call records"
+    );
+    assert_eq!(
+        count("custom_tool_call_output"),
+        2,
+        "no duplicate tool_output records"
+    );
+
+    let ok = ends
+        .iter()
+        .find(|e| e["payload"]["success"] == true)
         .expect("success patch_apply_end");
     assert_eq!(ok["payload"]["call_id"], "c-ok");
     assert_eq!(ok["payload"]["stderr"], "");
@@ -974,9 +1181,9 @@ async fn patch_end_rollout_and_transaction_failure() {
             .unwrap()
             .contains_key(&cwd.path().join("ok.txt").display().to_string())
     );
-    let fail = lines
+    let fail = ends
         .iter()
-        .find(|l| l["payload"]["success"] == false)
+        .find(|e| e["payload"]["success"] == false)
         .expect("failure patch_apply_end");
     assert_eq!(fail["payload"]["call_id"], "c-fail");
     assert_eq!(fail["payload"]["stdout"], "");

@@ -15,6 +15,8 @@
 use crate::tools::shell::MAX_OUTPUT_BYTES;
 use std::ffi::OsString;
 use std::io;
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 #[cfg(unix)]
 use std::process::Command;
@@ -32,6 +34,12 @@ pub struct CommandSpec {
     pub env: Vec<(OsString, OsString)>,
     pub stdout: Stdio,
     pub stderr: Stdio,
+    /// Parent descriptors to inherit into the child (Go `cmd.ExtraFiles`).
+    /// These are the session's held `O_PATH` directory fds; on Unix the child
+    /// clears FD_CLOEXEC on them in `pre_exec` so the Landlock helper can use
+    /// the exact inode the session bound, not a re-resolved path. The parent
+    /// keeps ownership (no dup / no double close); empty for ordinary commands.
+    pub inherited_fds: Vec<i32>,
 }
 
 /// Go `limitedBuffer`. Both stdout and stderr feed the *same* buffer (Go reuses
@@ -137,6 +145,24 @@ pub(crate) fn build_command(spec: CommandSpec) -> Command {
     command.stdin(Stdio::null());
     command.stdout(spec.stdout);
     command.stderr(spec.stderr);
+    if !spec.inherited_fds.is_empty() {
+        let fds = spec.inherited_fds;
+        // SAFETY: `pre_exec` runs in the forked child before exec. The closure
+        // only calls the async-signal-safe `fcntl`, captures a `Vec<i32>` (no
+        // allocation/locking), and touches only the passed descriptors. Clearing
+        // FD_CLOEXEC lets the exact held fds survive into the helper process.
+        unsafe {
+            command.pre_exec(move || {
+                for fd in &fds {
+                    let flags = libc::fcntl(*fd, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(*fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
     command
 }
 

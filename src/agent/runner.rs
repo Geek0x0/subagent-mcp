@@ -72,6 +72,8 @@ pub struct RunHooks {
 }
 
 /// The tool surface the runner delegates to (Task 23B owns the real executor).
+/// `turn_id` is the per-run id generated in `run_inner`; the executor uses it
+/// for `patch_apply_end` rollout records (Go `s.turnID`).
 #[async_trait::async_trait]
 pub trait ToolExecutor: Send + Sync {
     fn tools(&self) -> Vec<ToolSpec>;
@@ -81,6 +83,7 @@ pub trait ToolExecutor: Send + Sync {
         lease: &mut SessionLease,
         call: &ToolCall,
         hooks: &RunHooks,
+        turn_id: &str,
     ) -> ToolResult;
 }
 
@@ -587,7 +590,10 @@ impl Runner {
                     r.record_tool_call(&turn_id, call, &call.name);
                 }
                 let child = ctx.child();
-                let result = self.executor.execute(&child, lease, call, hooks).await;
+                let result = self
+                    .executor
+                    .execute(&child, lease, call, hooks, &turn_id)
+                    .await;
                 let mut content = result.output;
                 if content.is_empty() {
                     content = EMPTY_TOOL_OUTPUT.into();
