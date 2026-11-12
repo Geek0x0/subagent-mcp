@@ -398,6 +398,14 @@ impl PooledResponse {
         self.upstream.lock().unwrap().name().map(str::to_string)
     }
 
+    /// HTTP status of the held response. Adapters need this to tell a
+    /// retryable 429/5xx stream-setup failure from a permanent 4xx one (Go's
+    /// `isFailureStatusCode` + `APIError.HTTPStatusCode`). Read-only: the
+    /// response body still streams lazily through [`PooledResponse::chunk`].
+    pub fn status(&self) -> Option<reqwest::StatusCode> {
+        self.inner.as_ref().map(|r| r.status())
+    }
+
     /// Explicitly finish the response with the bounded drain. Taking `inner`
     /// prevents the `Drop` impl from draining a second time.
     pub async fn close(mut self) {
