@@ -9,39 +9,60 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
+/// Go `json.Unmarshal` treats an explicit `null` for a non-pointer struct field
+/// as the zero value, while serde's `#[serde(default)]` only covers a *missing*
+/// field. Route non-optional fields through this helper so `null` collapses to
+/// `T::default()` and a notification the app-server padded with nulls is not
+/// dropped.
+fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 /// The subset of notification params the thread and event mapper consume.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct NotificationParams {
-    #[serde(rename = "threadId")]
+    #[serde(rename = "threadId", deserialize_with = "null_default")]
     pub thread_id: String,
-    #[serde(rename = "turnId")]
+    #[serde(rename = "turnId", deserialize_with = "null_default")]
     pub turn_id: String,
-    #[serde(rename = "itemId")]
+    #[serde(rename = "itemId", deserialize_with = "null_default")]
     pub item_id: String,
+    #[serde(deserialize_with = "null_default")]
     pub delta: String,
-    /// Approval requests carry the command to run.
+    /// Approval requests carry the command to run; `null` means absent.
     pub command: Option<String>,
+    #[serde(deserialize_with = "null_default")]
     pub item: CodexItem,
+    #[serde(deserialize_with = "null_default")]
     pub turn: TurnParams,
-    #[serde(rename = "tokenUsage")]
+    #[serde(rename = "tokenUsage", deserialize_with = "null_default")]
     pub token_usage: TokenUsage,
+    #[serde(deserialize_with = "null_default")]
     pub error: ErrorParams,
     /// Approval requests carry a human-readable reason.
+    #[serde(deserialize_with = "null_default")]
     pub reason: String,
-    #[serde(rename = "willRetry")]
+    #[serde(rename = "willRetry", deserialize_with = "null_default")]
     pub will_retry: bool,
-    #[serde(rename = "networkApprovalContext")]
+    #[serde(rename = "networkApprovalContext", deserialize_with = "null_default")]
     pub network_approval_context: NetworkApprovalContext,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct CodexItem {
+    #[serde(deserialize_with = "null_default")]
     pub id: String,
-    #[serde(rename = "type")]
+    #[serde(rename = "type", deserialize_with = "null_default")]
     pub kind: String,
+    #[serde(deserialize_with = "null_default")]
     pub text: String,
+    #[serde(deserialize_with = "null_default")]
     pub phase: String,
     /// `null` in a network-approval request; Go's `string` zero-values it.
     pub command: Option<String>,
@@ -63,49 +84,81 @@ impl CodexItem {
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct Change {
+    #[serde(deserialize_with = "null_default")]
     pub path: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct TurnParams {
+    #[serde(deserialize_with = "null_default")]
     pub id: String,
+    #[serde(deserialize_with = "null_default")]
     pub status: String,
+    #[serde(deserialize_with = "null_default")]
     pub error: ErrorParams,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct ErrorParams {
+    #[serde(deserialize_with = "null_default")]
     pub message: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct TokenUsage {
+    #[serde(deserialize_with = "null_default")]
     pub last: TokenLast,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct TokenLast {
-    #[serde(rename = "inputTokens")]
+    #[serde(rename = "inputTokens", deserialize_with = "null_default")]
     pub input_tokens: i64,
-    #[serde(rename = "outputTokens")]
+    #[serde(rename = "outputTokens", deserialize_with = "null_default")]
     pub output_tokens: i64,
-    #[serde(rename = "totalTokens")]
+    #[serde(rename = "totalTokens", deserialize_with = "null_default")]
     pub total_tokens: i64,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
 pub(crate) struct NetworkApprovalContext {
+    #[serde(deserialize_with = "null_default")]
     pub host: String,
+    #[serde(deserialize_with = "null_default")]
     pub protocol: String,
 }
 
-/// Parse raw notification params, tolerating unknown fields.
+/// The narrow shape of an approval request, matching Go `approvalParams`.
+///
+/// Approval params are parsed on their own so an unrelated malformed field
+/// (`item`, `turn`, `tokenUsage`, ...) cannot reject an otherwise valid request.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default)]
+pub(crate) struct ApprovalParams {
+    #[serde(rename = "turnId", deserialize_with = "null_default")]
+    pub turn_id: String,
+    #[serde(rename = "itemId", deserialize_with = "null_default")]
+    pub item_id: String,
+    /// `null` means absent, like Go's zero-valued string.
+    pub command: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    pub reason: String,
+    #[serde(rename = "networkApprovalContext", deserialize_with = "null_default")]
+    pub network_approval_context: NetworkApprovalContext,
+}
+
+/// Parse raw notification params, tolerating unknown and null fields.
 pub(crate) fn parse_params(params: Option<&RawValue>) -> Option<NotificationParams> {
+    serde_json::from_str(params?.get()).ok()
+}
+
+/// Parse raw approval params, ignoring unrelated notification fields.
+pub(crate) fn parse_approval(params: Option<&RawValue>) -> Option<ApprovalParams> {
     serde_json::from_str(params?.get()).ok()
 }
 

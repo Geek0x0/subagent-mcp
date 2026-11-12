@@ -314,12 +314,16 @@ impl CodexThread {
             Ok(result) => result,
             Err(error) => return Err(self.start_failed(ctx, conn, error).await),
         };
-        let turn_id = result
-            .get("turn")
-            .and_then(|turn| turn.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
+        let turn_id = match required_id(&result, "turn/start", "turn") {
+            Ok(turn_id) => turn_id,
+            Err(message) => {
+                // The server may still have started a turn, so record it as
+                // uncertain and let the stray-turn path settle it.
+                return Err(self
+                    .start_failed(ctx, conn, ClientError::message(message))
+                    .await);
+            }
+        };
         let (closed, late_interrupt) = {
             let mut inner = self.inner.lock().unwrap();
             let late = match inner.active.as_mut() {
@@ -424,7 +428,7 @@ impl CodexThread {
             return Ok(());
         };
         let method = message.method.as_deref().unwrap_or("");
-        let Some(params) = events::parse_params(message.params.as_deref()) else {
+        let Some(params) = events::parse_approval(message.params.as_deref()) else {
             return reject_request(conn, id).await;
         };
         if params.turn_id != self.active_id() || !approval_method(method) {
@@ -446,27 +450,15 @@ impl CodexThread {
             request.command = None;
             request.path = non_empty(paths.get(&params.item_id).cloned().unwrap_or_default());
         }
-        let mut decision = "decline";
-        // The approval context ends when the child dies or this thread closes,
-        // so a pending approval never outlives either.
-        let approve_ctx = ctx.child();
-        let mut future = Box::pin(callbacks.approve.approve(&approve_ctx, request));
         let client_done = conn.client.done();
-        let cancelled = tokio::select! {
-            approved = &mut future => {
-                if approved && ctx_error(&approve_ctx).is_none() {
-                    decision = "accept";
-                }
-                false
-            }
-            _ = client_done.cancelled() => true,
-            _ = self.closed_signal.cancelled() => true,
-            _ = wait_ctx(ctx) => true,
-        };
-        if cancelled {
-            approve_ctx.cancel.cancel();
-            let _ = future.await;
-        }
+        let decision = decide_approval(
+            ctx,
+            callbacks.approve.as_ref(),
+            request,
+            &client_done,
+            &self.closed_signal,
+        )
+        .await;
         conn.client.respond(id, json!({"decision": decision})).await
     }
 
@@ -810,14 +802,10 @@ pub async fn start_thread(
         Ok(result) => result,
         Err(error) => return Err(provider_error(conn.failure(error).await)),
     };
-    // A null/absent result zero-values in Go, so an id the server omitted is
-    // treated as empty rather than turning the whole call into a decode error.
-    let id = result
-        .get("thread")
-        .and_then(|thread| thread.get("id"))
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    // A required response that cannot name its thread is a protocol failure:
+    // continuing with an empty id would subscribe to nothing and accept any
+    // later notification.
+    let id = required_id(&result, "thread/start", "thread").map_err(message_error)?;
     let inner = Arc::new(Mutex::new(ThreadInner {
         conn: conn.clone(),
         completed: false,
@@ -868,7 +856,7 @@ async fn route_message(
         }
         let mut reject = inner.closed || !same_conn || inner.active.is_none();
         if message.id.is_some() && !reject {
-            reject = match events::parse_params(message.params.as_deref()) {
+            reject = match events::parse_approval(message.params.as_deref()) {
                 Some(params) => {
                     let active = inner.active.as_ref().expect("active turn is present");
                     !approval_method(message.method.as_deref().unwrap_or(""))
@@ -966,6 +954,40 @@ async fn reject_request(
         .await
 }
 
+/// Ask the approver only while the run is live, bounded by the child and thread
+/// lifetimes. Go skips the callback when `ctx.Err() != nil` and answers
+/// `decline`; a pending approval must not outlive a crash or `Close`.
+async fn decide_approval(
+    ctx: &RunContext,
+    approver: &dyn Approver,
+    request: ApprovalRequest,
+    client_done: &CancellationToken,
+    closed_signal: &CancellationToken,
+) -> &'static str {
+    if ctx_error(ctx).is_some() {
+        return "decline";
+    }
+    let approve_ctx = ctx.child();
+    let mut future = Box::pin(approver.approve(&approve_ctx, request));
+    let mut decision = "decline";
+    let cancelled = tokio::select! {
+        approved = &mut future => {
+            if approved && ctx_error(&approve_ctx).is_none() {
+                decision = "accept";
+            }
+            false
+        }
+        _ = client_done.cancelled() => true,
+        _ = closed_signal.cancelled() => true,
+        _ = wait_ctx(ctx) => true,
+    };
+    if cancelled {
+        approve_ctx.cancel.cancel();
+        let _ = future.await;
+    }
+    decision
+}
+
 async fn interrupt_turn(client: &Arc<Client>, thread_id: &str, turn_id: &str, timeout: Duration) {
     let ctx = RunContext {
         cancel: CancellationToken::new(),
@@ -1032,6 +1054,18 @@ fn non_empty(value: String) -> Option<String> {
     (!value.is_empty()).then_some(value)
 }
 
+/// Extract a required `<object>.id` from a response, matching the client's
+/// `decode <method> result` error prefix.
+fn required_id(result: &Value, method: &str, object: &str) -> Result<String, String> {
+    result
+        .get(object)
+        .and_then(|value| value.get("id"))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| format!("decode {method} result: missing {object} id"))
+}
+
 fn thread_settings(opts: &ThreadOptions) -> Map<String, Value> {
     let policy = match opts.approval_policy {
         ApprovalPolicy::OnFailure => "on-request",
@@ -1079,5 +1113,47 @@ struct Deny;
 impl Approver for Deny {
     async fn approve(&self, _ctx: &RunContext, _req: ApprovalRequest) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct CountingApprover(Arc<AtomicBool>);
+
+    #[async_trait::async_trait]
+    impl Approver for CountingApprover {
+        async fn approve(&self, _ctx: &RunContext, _req: ApprovalRequest) -> bool {
+            self.0.store(true, Ordering::SeqCst);
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_context_skips_approver() {
+        let ctx = RunContext {
+            cancel: CancellationToken::new(),
+            deadline: None,
+        };
+        ctx.cancel.cancel();
+        let called = Arc::new(AtomicBool::new(false));
+        let decision = decide_approval(
+            &ctx,
+            &CountingApprover(called.clone()),
+            ApprovalRequest {
+                thread_id: "thread-1".to_string(),
+                tool: "shell".to_string(),
+                command: Some("ls".to_string()),
+                path: None,
+                reason: String::new(),
+            },
+            &CancellationToken::new(),
+            &CancellationToken::new(),
+        )
+        .await;
+        assert_eq!(decision, "decline");
+        assert!(!called.load(Ordering::SeqCst), "approver was invoked");
     }
 }

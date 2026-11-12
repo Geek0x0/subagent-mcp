@@ -96,7 +96,7 @@ impl FakeCodex {
     }
 
     fn install_defaults(&self) {
-        let user_agent = format!("subagent-mcp/{} (fake)", pinned_version());
+        let user_agent = format!("codex-cli/{} (fake)", pinned_version());
         self.handle("initialize", move |_fake, _params| {
             let user_agent = user_agent.clone();
             async move { Ok::<Value, String>(json!({"userAgent": user_agent})) }
@@ -533,6 +533,19 @@ where
     tokio::time::timeout(Duration::from_secs(2), future)
         .await
         .expect("operation timed out")
+}
+
+async fn wait_until(mut condition: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("condition timed out");
 }
 
 // ---------------------------------------------------------------------------
@@ -1036,6 +1049,177 @@ async fn retryable_error_not_terminal() {
     .unwrap();
     assert_eq!(text, "ok");
     assert_eq!(*messages.lock().unwrap(), ["informational"]);
+    thread.close().await.unwrap();
+    pool.close().await;
+}
+
+// ---------------------------------------------------------------------------
+// Null fields, malformed results, and narrow approval parsing
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn null_fields_zero_value_like_go() {
+    let fake = FakeCodex::new();
+    let pool = fake_pool(std::slice::from_ref(&fake));
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+    script_turn(
+        &fake,
+        "thr-1",
+        "turn-1",
+        script(move |fake| {
+            let reply_tx = reply_tx.clone();
+            async move {
+                let reply = fake
+                    .request(
+                        "item/commandExecution/requestApproval",
+                        json!({
+                            "threadId": "thr-1",
+                            "turnId": "turn-1",
+                            "command": "rm x",
+                            "reason": null,
+                        }),
+                    )
+                    .await
+                    .expect("approval reply");
+                let _ = reply_tx.send(reply);
+                agent_message(&fake, "thr-1", "turn-1", "final_answer", "ok").await;
+                fake.notify(
+                    "turn/completed",
+                    json!({
+                        "threadId": "thr-1",
+                        "turn": {"id": "turn-1", "status": "completed", "error": null},
+                    }),
+                )
+                .await;
+            }
+        }),
+    );
+    let thread = start(&pool, options()).await;
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let text = with_timeout(thread.run(
+        ctx(),
+        "hi".to_string(),
+        None,
+        ThreadCallbacks {
+            emit: no_emit(),
+            approve: Arc::new(Recording {
+                decision: true,
+                got: got.clone(),
+            }),
+        },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(text, "ok");
+    assert_eq!(got.lock().unwrap()[0].reason, "");
+    assert_eq!(
+        decision(&reply_rx.recv().await.expect("approval reply")),
+        json!({"decision": "accept"})
+    );
+    thread.close().await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn malformed_thread_start_result_fails() {
+    let fake = FakeCodex::new();
+    fake.handle("thread/start", |_fake, _params| async move {
+        Ok::<Value, String>(json!({"thread": {}}))
+    });
+    let pool = fake_pool(std::slice::from_ref(&fake));
+    let error = match thread::start_thread(&ctx(), pool.clone(), options()).await {
+        Ok(_) => panic!("missing thread id was accepted"),
+        Err(error) => error,
+    };
+    assert!(error.message.contains("thread/start"), "error = {error}");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn malformed_turn_start_result_fails() {
+    let fake = FakeCodex::new();
+    fake.handle("turn/start", |_fake, _params| async move {
+        Ok::<Value, String>(json!({"turn": {}}))
+    });
+    let pool = fake_pool(std::slice::from_ref(&fake));
+    let thread = start(&pool, options()).await;
+    let error = with_timeout(thread.run(
+        ctx(),
+        "hi".to_string(),
+        None,
+        ThreadCallbacks {
+            emit: no_emit(),
+            approve: Arc::new(Always(true)),
+        },
+    ))
+    .await
+    .expect_err("missing turn id");
+    assert!(error.message.contains("turn/start"), "error = {error}");
+    thread.close().await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn approval_ignores_unrelated_malformed_fields() {
+    let fake = FakeCodex::new();
+    let pool = fake_pool(std::slice::from_ref(&fake));
+    let (reply_tx, mut reply_rx) = mpsc::unbounded_channel();
+    script_turn(
+        &fake,
+        "thr-1",
+        "turn-1",
+        script(move |fake| {
+            let reply_tx = reply_tx.clone();
+            async move {
+                let reply = fake
+                    .request(
+                        "item/commandExecution/requestApproval",
+                        json!({
+                            "threadId": "thr-1",
+                            "turnId": "turn-1",
+                            "command": "rm x",
+                            "reason": "cleanup",
+                            "item": "malformed",
+                            "turn": 42,
+                            "tokenUsage": "bad",
+                            "willRetry": "not-a-bool",
+                        }),
+                    )
+                    .await
+                    .expect("approval reply");
+                let _ = reply_tx.send(reply);
+                agent_message(&fake, "thr-1", "turn-1", "final_answer", "ok").await;
+                complete_turn(&fake, "thr-1", "turn-1", "completed").await;
+            }
+        }),
+    );
+    let thread = start(&pool, options()).await;
+    let got = Arc::new(Mutex::new(Vec::new()));
+    let text = with_timeout(thread.run(
+        ctx(),
+        "hi".to_string(),
+        None,
+        ThreadCallbacks {
+            emit: no_emit(),
+            approve: Arc::new(Recording {
+                decision: true,
+                got: got.clone(),
+            }),
+        },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(text, "ok");
+    {
+        let got = got.lock().unwrap();
+        assert_eq!(got.len(), 1, "approver was not invoked");
+        assert_eq!(got[0].command.as_deref(), Some("rm x"));
+        assert_eq!(got[0].reason, "cleanup");
+    }
+    assert_eq!(
+        decision(&reply_rx.recv().await.expect("approval reply")),
+        json!({"decision": "accept"})
+    );
     thread.close().await.unwrap();
     pool.close().await;
 }
@@ -2063,6 +2247,276 @@ async fn completed_turn_leaves_no_stray() {
     pool.close().await;
 }
 
+#[tokio::test(start_paused = true)]
+async fn settle_stray_succeeds_when_earlier_turn_completes_late() {
+    let fake = FakeCodex::new();
+    let pool = fake_pool(std::slice::from_ref(&fake));
+    script_turn(&fake, "thr-1", "turn-1", script(|_fake| async move {}));
+    let calls = Arc::new(AtomicU64::new(0));
+    let calls_for_handler = calls.clone();
+    let late_fake = fake.clone();
+    fake.handle("turn/interrupt", move |_fake, _params| {
+        let calls = calls_for_handler.clone();
+        let late_fake = late_fake.clone();
+        async move {
+            if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_secs(40)).await;
+                    complete_turn(&late_fake, "thr-1", "turn-1", "interrupted").await;
+                });
+            }
+            Ok::<Value, String>(json!({}))
+        }
+    });
+    let thread = start(&pool, options()).await;
+    let run_ctx = ctx();
+    let cancel = run_ctx.cancel.clone();
+    let first = thread
+        .run(
+            run_ctx,
+            "hi".to_string(),
+            None,
+            ThreadCallbacks {
+                emit: Arc::new(move |_kind, event| {
+                    if event["type"] == "task_started" {
+                        cancel.cancel();
+                    }
+                }),
+                approve: Arc::new(Always(true)),
+            },
+        )
+        .await
+        .expect_err("first run");
+    assert_eq!(first.message, "context canceled");
+
+    script_turn(
+        &fake,
+        "thr-1",
+        "turn-2",
+        script(|fake| async move {
+            agent_message(&fake, "thr-1", "turn-2", "final_answer", "again").await;
+            complete_turn(&fake, "thr-1", "turn-2", "completed").await;
+        }),
+    );
+    let begin = tokio::time::Instant::now();
+    let text = thread
+        .run(
+            ctx(),
+            "again".to_string(),
+            None,
+            ThreadCallbacks {
+                emit: no_emit(),
+                approve: Arc::new(Always(true)),
+            },
+        )
+        .await
+        .expect("second run");
+    assert_eq!(text, "again");
+    // The late completion settles the stray; the second run only waits for it.
+    assert!(tokio::time::Instant::now() - begin <= Duration::from_secs(30));
+    assert_eq!(fake.received("turn/interrupt").len(), 2);
+    thread.close().await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn queued_completion_leaves_no_stray() {
+    let fake = FakeCodex::new();
+    let pool = fake_pool(std::slice::from_ref(&fake));
+    script_turn(
+        &fake,
+        "thr-1",
+        "turn-1",
+        script(|fake| async move {
+            agent_message(&fake, "thr-1", "turn-1", "final_answer", "first").await;
+            complete_turn(&fake, "thr-1", "turn-1", "completed").await;
+        }),
+    );
+    let thread = start(&pool, options()).await;
+    let run_ctx = ctx();
+    let cancel = run_ctx.cancel.clone();
+    let error = thread
+        .run(
+            run_ctx,
+            "hi".to_string(),
+            None,
+            ThreadCallbacks {
+                emit: Arc::new(move |_kind, event| {
+                    if event["type"] == "task_complete" {
+                        cancel.cancel();
+                    }
+                }),
+                approve: Arc::new(Always(true)),
+            },
+        )
+        .await
+        .expect_err("cancelled after completion");
+    assert_eq!(error.message, "context canceled");
+
+    script_turn(
+        &fake,
+        "thr-1",
+        "turn-2",
+        script(|fake| async move {
+            agent_message(&fake, "thr-1", "turn-2", "final_answer", "again").await;
+            complete_turn(&fake, "thr-1", "turn-2", "completed").await;
+        }),
+    );
+    let text = with_timeout(thread.run(
+        ctx(),
+        "again".to_string(),
+        None,
+        ThreadCallbacks {
+            emit: no_emit(),
+            approve: Arc::new(Always(true)),
+        },
+    ))
+    .await
+    .unwrap();
+    assert_eq!(text, "again");
+    fake.assert_no("turn/interrupt");
+    thread.close().await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancel_during_turn_start_uses_thirty_second_budget() {
+    let fake = FakeCodex::new();
+    let pool = fake_pool(std::slice::from_ref(&fake));
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let entered_tx = Arc::new(Mutex::new(Some(entered_tx)));
+    fake.handle("turn/start", move |_fake, _params| {
+        let entered_tx = entered_tx.lock().unwrap().take();
+        async move {
+            if let Some(sender) = entered_tx {
+                let _ = sender.send(());
+            }
+            std::future::pending::<()>().await;
+            Ok::<Value, String>(json!({"turn": {"id": "turn-1"}}))
+        }
+    });
+    let thread = start(&pool, options()).await;
+    let run_ctx = ctx();
+    let cancel = run_ctx.cancel.clone();
+    let begin = tokio::time::Instant::now();
+    let run = tokio::spawn(async move {
+        thread
+            .run(
+                run_ctx,
+                "hi".to_string(),
+                None,
+                ThreadCallbacks {
+                    emit: no_emit(),
+                    approve: Arc::new(Always(true)),
+                },
+            )
+            .await
+    });
+    entered_rx.await.expect("turn/start entered");
+    cancel.cancel();
+    let error = run.await.unwrap().expect_err("cancelled run");
+    assert_eq!(error.message, "context canceled");
+    assert_eq!(tokio::time::Instant::now() - begin, Duration::from_secs(30));
+    fake.assert_no("turn/interrupt");
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn close_during_turn_start_uses_turn_started_notification() {
+    let fake = FakeCodex::new();
+    let pool = fake_pool(std::slice::from_ref(&fake));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered_for_handler = entered.clone();
+    let release_for_handler = release.clone();
+    fake.handle("turn/start", move |fake, _params| {
+        let entered = entered_for_handler.clone();
+        let release = release_for_handler.clone();
+        async move {
+            fake.notify(
+                "turn/started",
+                json!({"threadId": "thr-1", "turn": {"id": "turn-1"}}),
+            )
+            .await;
+            entered.notify_one();
+            release.notified().await;
+            Ok::<Value, String>(json!({"turn": {"id": "turn-1"}}))
+        }
+    });
+    let thread = Arc::new(start(&pool, options()).await);
+    let runner = thread.clone();
+    let run = tokio::spawn(async move {
+        runner
+            .run(
+                ctx(),
+                "hi".to_string(),
+                None,
+                ThreadCallbacks {
+                    emit: no_emit(),
+                    approve: Arc::new(Always(true)),
+                },
+            )
+            .await
+    });
+    with_timeout(entered.notified()).await;
+    // Let the router deliver turn/started before closing.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let closer = thread.clone();
+    let close = tokio::spawn(async move { closer.close().await });
+    // The interrupt is sent while turn/start is still unanswered.
+    wait_until(|| !fake.received("turn/interrupt").is_empty()).await;
+    fake.assert_params(
+        "turn/interrupt",
+        json!({"threadId": "thr-1", "turnId": "turn-1"}),
+    );
+    release.notify_waiters();
+    with_timeout(close).await.unwrap().unwrap();
+    let error = with_timeout(run).await.unwrap().expect_err("closed run");
+    assert_eq!(error.message, "codex thread closed; start a new session");
+    pool.close().await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn close_shares_five_second_budget() {
+    let fake = FakeCodex::new();
+    let pool = fake_pool(std::slice::from_ref(&fake));
+    script_turn(&fake, "thr-1", "turn-1", script(|_fake| async move {}));
+    fake.handle("turn/interrupt", |_fake, _params| async move {
+        tokio::time::sleep(Duration::from_secs(10)).await;
+        Ok::<Value, String>(json!({}))
+    });
+    let thread = Arc::new(start(&pool, options()).await);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let started_for_emit = started.clone();
+    let runner = thread.clone();
+    let run = tokio::spawn(async move {
+        runner
+            .run(
+                ctx(),
+                "hi".to_string(),
+                None,
+                ThreadCallbacks {
+                    emit: Arc::new(move |_kind, event| {
+                        if event["type"] == "task_started" {
+                            started_for_emit.notify_one();
+                        }
+                    }),
+                    approve: Arc::new(Always(true)),
+                },
+            )
+            .await
+    });
+    started.notified().await;
+    let begin = tokio::time::Instant::now();
+    thread.close().await.unwrap();
+    assert_eq!(tokio::time::Instant::now() - begin, Duration::from_secs(5));
+    assert_eq!(fake.received("turn/interrupt").len(), 1);
+    fake.assert_no("thread/unsubscribe");
+    let error = run.await.unwrap().expect_err("closed run");
+    assert_eq!(error.message, "codex thread closed; start a new session");
+    pool.close().await;
+}
+
 // ---------------------------------------------------------------------------
 // Adapter capabilities
 // ---------------------------------------------------------------------------
@@ -2238,6 +2692,18 @@ async fn bounded_cleanup_kills_direct_child_after_grace() {
     pool::remove_pool(&command);
 }
 
+#[tokio::test]
+async fn fake_user_agent_records_pinned_version() {
+    let fake = FakeCodex::new();
+    let pool = fake_pool(std::slice::from_ref(&fake));
+    let conn = with_timeout(pool.get(&ctx())).await.expect("acquire");
+    assert_eq!(
+        conn.user_agent,
+        format!("codex-cli/{} (fake)", pinned_version())
+    );
+    pool.close().await;
+}
+
 #[test]
 fn fixture_version_is_pinned() {
     let version = pinned_version();
@@ -2253,8 +2719,8 @@ fn fixture_version_is_pinned() {
         ),
     ] {
         assert!(
-            contents.contains(&format!("codex-cli {version}")),
-            "{name} does not record the pinned codex-cli {version}"
+            contents.contains(&format!("codex-cli/{version}")),
+            "{name} does not record the pinned codex-cli/{version}"
         );
     }
 }
