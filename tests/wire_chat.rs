@@ -71,6 +71,9 @@ enum Reply {
     },
     /// A non-2xx response body for the stream endpoint.
     Status { status: u16, body: Vec<u8> },
+    /// A non-2xx response whose body never terminates: the head promises more
+    /// bytes than are sent, then the socket is held open.
+    StatusHoldOpen { status: u16, body: Vec<u8> },
     /// The `/models` endpoint reply.
     Models { status: u16, body: Vec<u8> },
 }
@@ -102,6 +105,13 @@ impl Reply {
 
     fn status(status: u16, body: impl Into<Vec<u8>>) -> Self {
         Reply::Status {
+            status,
+            body: body.into(),
+        }
+    }
+
+    fn status_hold_open(status: u16, body: impl Into<Vec<u8>>) -> Self {
+        Reply::StatusHoldOpen {
             status,
             body: body.into(),
         }
@@ -258,6 +268,20 @@ async fn write_reply(socket: &mut TcpStream, reply: &Reply) -> bool {
             );
             let _ = socket.write_all(head.as_bytes()).await;
             let _ = socket.write_all(body).await;
+            false
+        }
+        Reply::StatusHoldOpen { status, body } => {
+            // Promise more body than is sent: a client that reads to the
+            // advertised length blocks until the connection is closed.
+            let head = format!(
+                "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                reason(*status),
+                body.len() + 4096
+            );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body).await;
+            let _ = socket.flush().await;
+            tokio::time::sleep(Duration::from_secs(5)).await;
             false
         }
         Reply::Models { status, body } => {
@@ -684,6 +708,53 @@ async fn turn_sends_configured_max_output_tokens_and_omits_an_unset_one() {
                 "max_tokens must be absent when the config sets no limit: {body}"
             ),
         }
+    }
+}
+
+#[tokio::test]
+async fn reasoning_models_reject_max_tokens_before_sending() {
+    // go-openai's ReasoningValidator: `o1*`/`o3*`/`o4*`/`gpt-5*` with
+    // `max_tokens > 0` fails with ErrReasoningModelMaxTokensDeprecated and no
+    // request is sent.
+    for model in ["o1-mini", "o3-mini", "o4-mini", "gpt-5-codex"] {
+        let fake = spawn_fake(vec![Reply::sse(sse_text("ok"))], Reply::models_ok(&[])).await;
+        let mut cfg = provider_config(&fake.base);
+        cfg.max_output_tokens = Some(4096);
+        let adapter = ChatCompletions::new("deepseek", &cfg).unwrap();
+
+        let mut req = turn_request(model);
+        req.messages = vec![user("hi")];
+        let err = run_turn(&adapter, req)
+            .await
+            .expect_err("a reasoning model must reject max_tokens");
+        assert_eq!(
+            err.message, "this model is not supported MaxTokens, please use MaxCompletionTokens",
+            "{model}"
+        );
+        assert_eq!(
+            fake.request_count(),
+            0,
+            "{model}: the guard must fail before the request is sent"
+        );
+    }
+}
+
+#[tokio::test]
+async fn reasoning_guard_leaves_other_models_and_an_unset_limit_alone() {
+    // Control: the guard must not over-fire. A reasoning model with no
+    // configured limit, and a non-reasoning model with one, both send.
+    for (model, max_tokens) in [("o1-mini", None), ("deepseek-chat", Some(4096i64))] {
+        let fake = spawn_fake(vec![Reply::sse(sse_text("ok"))], Reply::models_ok(&[])).await;
+        let mut cfg = provider_config(&fake.base);
+        cfg.max_output_tokens = max_tokens;
+        let adapter = ChatCompletions::new("deepseek", &cfg).unwrap();
+
+        let mut req = turn_request(model);
+        req.messages = vec![user("hi")];
+        run_turn(&adapter, req)
+            .await
+            .unwrap_or_else(|e| panic!("{model}: {e}"));
+        assert_eq!(fake.request_count(), 1, "{model}");
     }
 }
 
@@ -1218,6 +1289,40 @@ async fn framing_exact_done_ends_the_stream() {
 }
 
 #[tokio::test]
+async fn framing_accepts_crlf_line_endings() {
+    // go-openai's `ReadBytes('\n')` + `bytes.TrimSpace` strips the trailing
+    // '\r' from CRLF-framed SSE; the framer must do the same.
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\r\n\r\n",
+        "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\r\n\r\n",
+        "data: [DONE]\r\n\r\n",
+    );
+    let fake = spawn_fake(vec![Reply::sse(body)], Reply::models_ok(&[])).await;
+    let result = run_turn(&adapter(&fake.base), turn_request("m"))
+        .await
+        .unwrap();
+    assert_eq!(result.text, "hi");
+}
+
+#[tokio::test]
+async fn framing_done_without_a_finish_reason_is_truncated() {
+    // `[DONE]` ends the stream cleanly but carries no finish reason, so the
+    // turn is reported as truncated exactly like a body that just ends.
+    let body = concat!(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    let fake = spawn_fake(vec![Reply::sse(body)], Reply::models_ok(&[])).await;
+    let err = run_turn(&adapter(&fake.base), turn_request("m"))
+        .await
+        .expect_err("[DONE] without a finish reason must fail the turn");
+    assert_eq!(
+        err.message,
+        "chat completions: stream ended without a finish reason (truncated response)"
+    );
+}
+
+#[tokio::test]
 async fn framing_has_no_fixed_scanner_limit() {
     // go-openai uses bufio.Reader.ReadBytes, which grows with the line. A
     // million-byte event must be delivered whole rather than hitting a scanner
@@ -1483,6 +1588,92 @@ async fn chat_turn_stops_a_stream_when_the_context_is_canceled() {
         "mid-stream cancellation took {:?}",
         started.elapsed()
     );
+}
+
+#[tokio::test]
+async fn error_body_drain_stops_when_the_context_is_canceled() {
+    // A 500 whose error body never terminates must not hang the turn: Go reads
+    // the body on a ctx-bound request, so cancellation aborts the read.
+    let fake = spawn_fake(
+        vec![Reply::status_hold_open(500, "partial error body")],
+        Reply::models_ok(&[]),
+    )
+    .await;
+    let adapter = Arc::new(adapter_with_backoff(&fake.base, Duration::ZERO));
+    let cancel = CancellationToken::new();
+    let turn_cancel = cancel.clone();
+
+    let started = Instant::now();
+    let handle = tokio::spawn(async move {
+        adapter
+            .turn(
+                RunContext {
+                    cancel: turn_cancel,
+                    deadline: None,
+                },
+                turn_request("m"),
+                Box::new(|_| {}),
+            )
+            .await
+    });
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        cancel.cancel();
+    });
+
+    let err = tokio::time::timeout(Duration::from_secs(1), handle)
+        .await
+        .expect("an unterminated error body must not hang the turn")
+        .unwrap()
+        .expect_err("a canceled run must fail");
+    assert!(
+        err.message.contains("context canceled"),
+        "unexpected error: {}",
+        err.message
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "cancellation took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(fake.request_count(), 1);
+}
+
+#[tokio::test]
+async fn error_body_drain_stops_at_the_run_deadline() {
+    let fake = spawn_fake(
+        vec![Reply::status_hold_open(429, "partial error body")],
+        Reply::models_ok(&[]),
+    )
+    .await;
+    let adapter = Arc::new(adapter_with_backoff(&fake.base, Duration::ZERO));
+
+    let started = Instant::now();
+    let err = tokio::time::timeout(
+        Duration::from_secs(2),
+        adapter.turn(
+            RunContext {
+                cancel: CancellationToken::new(),
+                deadline: Some(tokio::time::Instant::now() + Duration::from_millis(100)),
+            },
+            turn_request("m"),
+            Box::new(|_| {}),
+        ),
+    )
+    .await
+    .expect("an unterminated error body must not outlive the run deadline")
+    .expect_err("an expired deadline must fail");
+    assert!(
+        err.message.contains("context deadline exceeded"),
+        "unexpected error: {}",
+        err.message
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "deadline took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(fake.request_count(), 1);
 }
 
 #[tokio::test]

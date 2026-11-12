@@ -511,13 +511,48 @@ async fn wait_for_backoff(ctx: &RunContext, delay: Duration) -> Result<(), &'sta
     }
 }
 
-async fn drain_error_body(mut response: PooledResponse) -> String {
+/// Drain a failed response's error body under the run context. Go reads the
+/// body with `io.ReadAll` on a ctx-bound request, so cancellation or the
+/// deadline aborts the read; without that bound an unterminated 429/5xx body
+/// would hang the turn forever. Returns the context reason when the run ends
+/// before the body does.
+async fn drain_error_body(
+    ctx: &RunContext,
+    mut response: PooledResponse,
+) -> Result<String, &'static str> {
     let mut buf = Vec::new();
-    while let Ok(Some(chunk)) = response.chunk().await {
-        buf.extend_from_slice(&chunk);
+    loop {
+        tokio::select! {
+            chunk = response.chunk() => match chunk {
+                Ok(Some(bytes)) => buf.extend_from_slice(&bytes),
+                // A read error ends the drain the way Go's `io.ReadAll` does;
+                // the status classification still comes from the HTTP status.
+                Ok(None) | Err(_) => break,
+            },
+            _ = ctx.cancel.cancelled() => return Err("context canceled"),
+            _ = wait_deadline(ctx.deadline) => return Err("context deadline exceeded"),
+        }
     }
     response.close().await;
-    String::from_utf8_lossy(&buf).into_owned()
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// go-openai's `ReasoningValidator` (`reasoning_validator.go`): the SDK rejects
+/// a `max_tokens` on an `o1*`/`o3*`/`o4*`/`gpt-5*` model before any request is
+/// sent, with `ErrReasoningModelMaxTokensDeprecated` surfaced unwrapped. The
+/// other validator checks (logprobs, temperature, top_p, n, penalties) cannot
+/// fire here because this adapter never sets those fields.
+fn reasoning_model_guard(model: &str, max_tokens: Option<i64>) -> Result<(), ProviderError> {
+    let reasoning_model = ["o1", "o3", "o4", "gpt-5"]
+        .iter()
+        .any(|prefix| model.starts_with(prefix));
+    if reasoning_model && max_tokens.is_some_and(|tokens| tokens > 0) {
+        return Err(ProviderError {
+            message: "this model is not supported MaxTokens, please use MaxCompletionTokens"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 // Alias kept short for the retry helpers.
@@ -789,7 +824,10 @@ impl ChatCompletions {
         };
         let status = response.status().map_or(0, |status| status.as_u16());
         if is_failure_status(status) {
-            let message = drain_error_body(response).await;
+            let message = match drain_error_body(ctx, response).await {
+                Ok(message) => message,
+                Err(reason) => return Err(SetupError::Context(reason)),
+            };
             return Err(SetupError::Status { status, message });
         }
         Ok(response)
@@ -834,6 +872,11 @@ impl ChatCompletions {
         mut on_delta: DeltaSink,
     ) -> Result<TurnResult, ProviderError> {
         let body = self.build_body(&req)?;
+        // go-openai validates the request inside `CreateChatCompletionStream`
+        // before it builds or sends anything, so this guard runs after the
+        // tool-schema checks and before the retry loop (including its
+        // context check): the SDK error, not a context error, wins.
+        reasoning_model_guard(&req.model, self.cfg.max_output_tokens)?;
         let headers = self.auth_headers(true)?;
         let url =
             Url::parse(&format!("{}{CHAT_PATH}", self.base())).map_err(|error| ProviderError {
