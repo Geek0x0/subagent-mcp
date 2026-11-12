@@ -55,7 +55,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 regex = "1"
 libc = "0.2"
-rustix = "1"
+rustix = { version = "1", features = ["fs"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
