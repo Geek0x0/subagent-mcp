@@ -1,11 +1,13 @@
 //! Agent layer: system-prompt construction, the in-memory session manager,
 //! and the rollout payload builders (Go `internal/agent`).
 
+pub mod executor;
 pub mod prompt;
 pub mod rollout;
 pub mod runner;
 pub mod session;
 
+pub use executor::{BuiltinToolExecutor, builtin_tools};
 pub use prompt::{
     AGENTS_MD_MAX_BYTES, DEFAULT_SYSTEM_PROMPT, PromptError, load_agents_md, system_prompt,
 };
