@@ -40,6 +40,47 @@ jobs:
         run: cargo test --all-targets
 
   # ---------------------------------------------------------------------------
+  # Packaging test (Task 29A).
+  #
+  # Builds and packages the host target only, then asserts the archive name and
+  # entries. The six-target release dry run lives in
+  # rust-release-dry-run.yml; performance smoke (scripts/perf-smoke.sh and
+  # docs/release/perf-results.md) is Task 29B and is not wired here.
+  # ---------------------------------------------------------------------------
+  package:
+    name: package (linux x86_64 host)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Package host target
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          bash scripts/package-rust-release.sh --version "$version" \
+            --target x86_64-unknown-linux-gnu --out target/package-test
+
+      - name: Assert archive name and contents
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          archive="target/package-test/subagent-mcp_${version}_linux_amd64.tar.gz"
+          test -s "$archive"
+          diff -u <(printf 'README.md\nconfig.example.toml\nsubagent-mcp\n' | LC_ALL=C sort) \
+            <(tar -tzf "$archive" | LC_ALL=C sort)
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-package-host
+          path: target/package-test/subagent-mcp_*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
   # Platform runtime and TLS trust gates (Task 28).
   #
   # Each job runs the platform's own test binary plus the shared TLS trust

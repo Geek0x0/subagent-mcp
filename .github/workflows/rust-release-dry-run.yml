@@ -1,0 +1,250 @@
+name: Rust Release Dry Run
+
+# Dry run only. Builds the six release targets once each, packages them with
+# scripts/package-rust-release.sh, and uploads the archives plus a checksums.txt
+# generated from those exact archives. It never creates a tag or a GitHub
+# release and never updates scripts/release.lock or the plugin pin.
+#
+# The six-target matrix is the Task 29A gate; the host-target packaging test in
+# rust-ci.yml is the fast check. Performance smoke (scripts/perf-smoke.sh and
+# docs/release/perf-results.md) is Task 29B and is not part of this workflow.
+#
+# Windows arm64 runs natively on the GitHub-hosted windows-11-arm runner. If
+# that label is unavailable, re-run this workflow with
+# windows_arm64_fallback=true and complete the runtime evidence checklist in
+# docs/release/windows-arm64-evidence.md. A cargo-xwin cross-build alone is not
+# acceptance.
+
+on:
+  workflow_dispatch:
+    inputs:
+      windows_arm64_fallback:
+        description: "Build Windows arm64 with cargo-xwin (requires Windows arm64 VM evidence)"
+        type: boolean
+        default: false
+  pull_request:
+    paths:
+      - ".github/workflows/rust-release-dry-run.yml"
+      - "scripts/package-rust-release.sh"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  package:
+    name: package (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux is musl so the published binary does not depend on the
+          # runner's glibc. Both runners are native, so ring's C/asm sources
+          # compile for the runner architecture.
+          - name: linux-amd64-musl
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            musl: true
+          - name: linux-arm64-musl
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            musl: true
+          # macOS builds natively on each architecture. The deployment target
+          # keeps the binary runnable on macOS 12+ as required by the design.
+          - name: macos-amd64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
+            deployment_target: "12.0"
+          - name: macos-arm64
+            target: aarch64-apple-darwin
+            runner: macos-15
+            deployment_target: "12.0"
+          # Windows x86_64 builds natively. +crt-static links the static CRT.
+          - name: windows-amd64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            crt_static: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Add Rust target
+        run: rustup target add --toolchain 1.94.1 ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: matrix.musl == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Package target
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          target='${{ matrix.target }}'
+          if [ '${{ matrix.musl }}' = 'true' ]; then
+            # cc-rs and rustc both need the musl driver for a musl target.
+            under=$(printf '%s' "$target" | tr '-' '_')
+            upper=$(printf '%s' "$target" | tr 'a-z-' 'A-Z_')
+            export "CC_${under}=musl-gcc"
+            export "CARGO_TARGET_${upper}_LINKER=musl-gcc"
+          fi
+          if [ '${{ matrix.crt_static }}' = 'true' ]; then
+            # Target-scoped so host build scripts keep the runner's default CRT.
+            upper=$(printf '%s' "$target" | tr 'a-z-' 'A-Z_')
+            export "CARGO_TARGET_${upper}_RUSTFLAGS=-C target-feature=+crt-static"
+          fi
+          bash scripts/package-rust-release.sh --version "$version" --target "$target" --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-release-target-${{ matrix.target }}
+          path: dist/subagent-mcp_*
+          if-no-files-found: error
+          retention-days: 7
+
+  # Native Windows arm64 packaging. This is the acceptance path: the archive is
+  # produced by the same target it runs on.
+  windows_arm64_native:
+    name: package (windows-arm64, native)
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_arm64_fallback != true }}
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Add Rust target
+        run: rustup target add --toolchain 1.94.1 aarch64-pc-windows-msvc
+
+      - name: Package target
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static"
+          bash scripts/package-rust-release.sh --version "$version" --target aarch64-pc-windows-msvc --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-release-target-aarch64-pc-windows-msvc
+          path: dist/subagent-mcp_*
+          if-no-files-found: error
+          retention-days: 7
+
+  # Fallback only: cross-build Windows arm64 on Linux with cargo-xwin. The
+  # archive from this job is NOT acceptance until it has been run on a Windows
+  # arm64 machine and recorded in docs/release/windows-arm64-evidence.md.
+  windows_arm64_xwin:
+    name: package (windows-arm64, cargo-xwin fallback)
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.windows_arm64_fallback == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Add Rust target
+        run: rustup target add --toolchain 1.94.1 aarch64-pc-windows-msvc
+
+      - name: Install cross linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm
+
+      - name: Install cargo-xwin
+        run: cargo install cargo-xwin --locked
+
+      - name: Package target
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static"
+          bash scripts/package-rust-release.sh --version "$version" --target aarch64-pc-windows-msvc --out dist --cargo "cargo xwin"
+
+      - name: Record fallback evidence requirement
+        shell: bash
+        run: |
+          {
+            echo "### Windows arm64 used the cargo-xwin fallback"
+            echo
+            echo "This archive is a cross-build and is **not** acceptance evidence."
+            echo "Run it on a Windows arm64 machine and fill in"
+            echo "\`docs/release/windows-arm64-evidence.md\` with the archive SHA-256,"
+            echo "Windows build number, \`subagent-mcp.exe --version\` output, and the"
+            echo "MCP stdio handshake result."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-release-target-aarch64-pc-windows-msvc
+          path: dist/subagent-mcp_*
+          if-no-files-found: error
+          retention-days: 7
+
+  # One place generates checksums.txt from the final archives. It downloads the
+  # artifacts rather than rebuilding, so the uploaded checksums cover exactly
+  # the archives in the dry-run artifact.
+  checksums:
+    name: checksums (six targets)
+    needs: [package, windows_arm64_native, windows_arm64_xwin]
+    if: ${{ always() && !cancelled() && needs.package.result == 'success' && (needs.windows_arm64_native.result == 'success' || needs.windows_arm64_xwin.result == 'success') }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rust-release-target-*
+          path: dist
+          merge-multiple: true
+
+      - name: Require six non-empty archives
+        run: |
+          set -euo pipefail
+          count=$(find dist -maxdepth 1 -type f -name 'subagent-mcp_*' | wc -l)
+          test "$count" -eq 6 || {
+            echo "expected 6 archives, found $count" >&2
+            find dist -maxdepth 1 -type f -printf '%f %s bytes\n' | sort >&2
+            exit 1
+          }
+          empty=$(find dist -maxdepth 1 -type f -name 'subagent-mcp_*' -size 0)
+          if [ -n "$empty" ]; then
+            echo "zero-byte archive found:" >&2
+            printf '%s\n' "$empty" >&2
+            exit 1
+          fi
+          find dist -maxdepth 1 -type f -name 'subagent-mcp_*' -printf '%f %s bytes\n' | sort
+
+      - name: Generate checksums.txt
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum subagent-mcp_* > checksums.txt
+          cat checksums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rust-release-dry-run
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
