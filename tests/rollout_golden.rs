@@ -417,7 +417,7 @@ fn full_rollout_matches_go_golden() {
         prompt,
         approval_policy,
         sandbox,
-        &writable_roots,
+        Some(writable_roots.as_slice()),
         model,
         effort,
         Some(effort_sent),
@@ -752,5 +752,146 @@ fn provider_request_error_suppresses_upstream() {
     assert!(
         payload.get("upstream").is_none(),
         "upstream must be suppressed on error"
+    );
+}
+
+/// Go `internal/agent/session.go` `shellWritableRoots()` +
+/// `internal/agent/rollout.go` `sandboxPolicy()`: `writable_roots` serializes
+/// as JSON `null` for danger-full-access (nil slice) and for workspace-write
+/// with zero roots (`append([]string(nil), ...)` stays nil), as `[]` for
+/// read-only (empty non-nil slice), and as an array for workspace-write with
+/// roots. The Rust recorder represents Go's nil slice with `None` and Go's
+/// empty slice with `Some(&[])`.
+#[test]
+fn sandbox_policy_writable_roots_null_vs_empty() {
+    let _guard = EnvGuard::new();
+    let home = tempfile::tempdir().unwrap();
+    _guard.set("CODEX_HOME", home.path().to_str().unwrap());
+    _guard.set("SUBAGENT_MCP_ROLLOUT", "");
+
+    let roots = vec![
+        PathBuf::from("/allowed/root-a"),
+        PathBuf::from("/allowed/root-b"),
+    ];
+    let empty: &[PathBuf] = &[];
+
+    let mut recorder = RolloutRecorder::create(
+        "thread-roots",
+        Path::new("/cwd"),
+        "sys",
+        "prov",
+        "model",
+        "high",
+    )
+    .unwrap();
+    let path = find_rollout(home.path(), "thread-roots");
+
+    // (label, sandbox type, roots option, expected JSON writable_roots)
+    let cases: Vec<(&str, &str, Option<&[PathBuf]>, Value)> = vec![
+        (
+            "danger-full-access -> null",
+            "danger-full-access",
+            None,
+            Value::Null,
+        ),
+        (
+            "workspace-write with zero roots -> null",
+            "workspace-write",
+            None,
+            Value::Null,
+        ),
+        ("read-only -> []", "read-only", Some(empty), json!([])),
+        (
+            "workspace-write with roots -> array",
+            "workspace-write",
+            Some(roots.as_slice()),
+            json!(["/allowed/root-a", "/allowed/root-b"]),
+        ),
+    ];
+
+    for (i, (_, sandbox, roots_opt, _)) in cases.iter().enumerate() {
+        recorder.record_turn_start(
+            &format!("turn-{}", i),
+            Path::new("/cwd"),
+            "p",
+            "never",
+            sandbox,
+            *roots_opt,
+            "model",
+            "high",
+            Some("high"),
+        );
+    }
+
+    let lines = read_lines(&path);
+    let contexts: Vec<&Value> = lines
+        .iter()
+        .filter(|l| l["type"] == "turn_context")
+        .collect();
+    assert_eq!(contexts.len(), cases.len(), "one turn_context per case");
+    for (i, (label, sandbox, _, expected)) in cases.iter().enumerate() {
+        let policy = &contexts[i]["payload"]["sandbox_policy"];
+        assert_eq!(
+            policy["type"].as_str(),
+            Some(*sandbox),
+            "case {label}: sandbox type"
+        );
+        assert_eq!(
+            &policy["writable_roots"], expected,
+            "case {label}: writable_roots"
+        );
+    }
+}
+
+/// Go `recordTurnStart` formats `current_date` from a local `time.Now()`, not
+/// UTC. Verify the recorded value equals `chrono::Local`'s `YYYY-MM-DD` for the
+/// instant of the call (before/after captures tolerate a midnight rollover),
+/// so the assertion holds in any timezone without hardcoding a date.
+#[test]
+fn turn_context_current_date_is_local() {
+    let _guard = EnvGuard::new();
+    let home = tempfile::tempdir().unwrap();
+    _guard.set("CODEX_HOME", home.path().to_str().unwrap());
+    _guard.set("SUBAGENT_MCP_ROLLOUT", "");
+
+    let mut recorder = RolloutRecorder::create(
+        "thread-date",
+        Path::new("/cwd"),
+        "sys",
+        "prov",
+        "model",
+        "high",
+    )
+    .unwrap();
+    let path = find_rollout(home.path(), "thread-date");
+
+    let empty: &[PathBuf] = &[];
+    let before = chrono::Local::now().format("%Y-%m-%d").to_string();
+    recorder.record_turn_start(
+        "t",
+        Path::new("/cwd"),
+        "p",
+        "never",
+        "read-only",
+        Some(empty),
+        "model",
+        "high",
+        Some("high"),
+    );
+    let after = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    let lines = read_lines(&path);
+    let context = lines
+        .iter()
+        .find(|l| l["type"] == "turn_context")
+        .expect("one turn_context line");
+    let current_date = context["payload"]["current_date"].as_str().unwrap();
+    assert_eq!(current_date.len(), 10, "YYYY-MM-DD format");
+    assert!(
+        current_date == before || current_date == after,
+        "current_date {} is not the local date {} / {}",
+        current_date,
+        before,
+        after
     );
 }

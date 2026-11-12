@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Local};
 use serde_json::{Map, Value, json};
 
 use crate::patch::{Change, ChangeKind};
@@ -49,15 +49,21 @@ fn millis_between(start: SystemTime, end: SystemTime) -> i64 {
     }
 }
 
-/// Go `started.Format("2006-01-02")` in UTC.
+/// Go `started.Format("2006-01-02")` on a local `time.Now()` (not UTC).
 fn current_date(t: SystemTime) -> String {
-    let dt: DateTime<Utc> = DateTime::from(t);
+    let dt: DateTime<Local> = DateTime::from(t);
     dt.format("%Y-%m-%d").to_string()
 }
 
 impl RolloutRecorder {
     /// Go `recordTurnStart`: turn_context, task_started, the user prompt item,
     /// and the user_message event.
+    ///
+    /// `writable_roots` mirrors Go `shellWritableRoots()`: `None` is Go's nil
+    /// slice and serializes as JSON `null` (danger-full-access, or
+    /// workspace-write with zero roots); `Some(&[])` is Go's empty non-nil
+    /// slice and serializes as `[]` (read-only); `Some(roots)` serializes the
+    /// array (workspace-write with roots).
     #[allow(clippy::too_many_arguments)]
     pub fn record_turn_start(
         &mut self,
@@ -66,16 +72,21 @@ impl RolloutRecorder {
         prompt: &str,
         approval_policy: &str,
         sandbox: &str,
-        writable_roots: &[PathBuf],
+        writable_roots: Option<&[PathBuf]>,
         model: &str,
         effort: &str,
         effort_sent: Option<&str>,
     ) {
         let started = SystemTime::now();
-        let roots: Vec<Value> = writable_roots
-            .iter()
-            .map(|p| json!(p.display().to_string()))
-            .collect();
+        let roots: Value = match writable_roots {
+            None => Value::Null,
+            Some(paths) => Value::Array(
+                paths
+                    .iter()
+                    .map(|p| json!(p.display().to_string()))
+                    .collect(),
+            ),
+        };
         self.write_line(
             "turn_context",
             json!({
@@ -316,5 +327,26 @@ impl RolloutRecorder {
     /// Go `recordError`: a bare error event.
     pub fn record_error(&mut self, message: &str) {
         self.write_line("event_msg", json!({"type": "error", "message": message}));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// Go `recordTurnStart` formats `started.Format("2006-01-02")` on a local
+    /// `time.Now()`, not UTC. Compare `current_date` against `chrono::Local`
+    /// for a fixed `SystemTime`; the expected value is computed (never
+    /// hardcoded), so the assertion is timezone-robust.
+    #[test]
+    fn current_date_uses_local_date() {
+        let fixed = UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+        let expected: String = {
+            let dt: DateTime<Local> = DateTime::from(fixed);
+            dt.format("%Y-%m-%d").to_string()
+        };
+        assert_eq!(current_date(fixed), expected);
+        assert_eq!(current_date(fixed).len(), 10, "YYYY-MM-DD format");
     }
 }
