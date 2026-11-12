@@ -9,11 +9,14 @@ name: Rust Release Dry Run
 # rust-ci.yml is the fast check. Performance smoke (scripts/perf-smoke.sh and
 # docs/release/perf-results.md) is Task 29B and is not part of this workflow.
 #
-# Windows arm64 runs natively on the GitHub-hosted windows-11-arm runner. If
-# that label is unavailable, re-run this workflow with
-# windows_arm64_fallback=true and complete the runtime evidence checklist in
-# docs/release/windows-arm64-evidence.md. A cargo-xwin cross-build alone is not
-# acceptance.
+# Windows arm64 runs natively on the GitHub-hosted windows-11-arm runner. That
+# label is a preview, so on pull_request the native job is non-blocking and a
+# missing arm64 archive is recorded as a warning instead of failing the run. On
+# workflow_dispatch it is a required release gate. If the label is unavailable,
+# re-run with windows_arm64_fallback=true and complete the runtime evidence
+# checklist in docs/release/windows-arm64-evidence.md. A cargo-xwin cross-build
+# alone is not acceptance: the checksums job marks the artifact and fails the
+# run when arm64 was cross-built.
 
 on:
   workflow_dispatch:
@@ -118,9 +121,15 @@ jobs:
 
   # Native Windows arm64 packaging. This is the acceptance path: the archive is
   # produced by the same target it runs on.
+  #
+  # windows-11-arm is a preview label, so on pull_request this job is
+  # continue-on-error: an unavailable runner must not block packaging PRs or the
+  # checksums job. On workflow_dispatch it is a required release gate and a
+  # failure fails the run.
   windows_arm64_native:
     name: package (windows-arm64, native)
     if: ${{ github.event_name != 'workflow_dispatch' || inputs.windows_arm64_fallback != true }}
+    continue-on-error: ${{ github.event_name == 'pull_request' }}
     runs-on: windows-11-arm
     timeout-minutes: 45
     steps:
@@ -141,10 +150,21 @@ jobs:
           export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static"
           bash scripts/package-rust-release.sh --version "$version" --target aarch64-pc-windows-msvc --out dist
 
+      # Provenance travels inside the artifact, so a downloaded archive always
+      # says which build path produced it.
+      - name: Record arm64 build path
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'native\n' > dist/WINDOWS_ARM64_BUILD_PATH
+          cat dist/WINDOWS_ARM64_BUILD_PATH
+
       - uses: actions/upload-artifact@v4
         with:
           name: rust-release-target-aarch64-pc-windows-msvc
-          path: dist/subagent-mcp_*
+          path: |
+            dist/subagent-mcp_*
+            dist/WINDOWS_ARM64_BUILD_PATH
           if-no-files-found: error
           retention-days: 7
 
@@ -182,6 +202,13 @@ jobs:
           export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static"
           bash scripts/package-rust-release.sh --version "$version" --target aarch64-pc-windows-msvc --out dist --cargo "cargo xwin"
 
+      - name: Record arm64 build path
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'cargo-xwin\n' > dist/WINDOWS_ARM64_BUILD_PATH
+          cat dist/WINDOWS_ARM64_BUILD_PATH
+
       - name: Record fallback evidence requirement
         shell: bash
         run: |
@@ -189,7 +216,10 @@ jobs:
             echo "### Windows arm64 used the cargo-xwin fallback"
             echo
             echo "This archive is a cross-build and is **not** acceptance evidence."
-            echo "Run it on a Windows arm64 machine and fill in"
+            echo "The checksums job fails this run and records"
+            echo "\`dist/arm64-build-status.json\` with"
+            echo "\`\"acceptance\": \"requires-vm-evidence\"\`."
+            echo "Run the archive on a Windows arm64 machine and fill in"
             echo "\`docs/release/windows-arm64-evidence.md\` with the archive SHA-256,"
             echo "Windows build number, \`subagent-mcp.exe --version\` output, and the"
             echo "MCP stdio handshake result."
@@ -198,42 +228,142 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: rust-release-target-aarch64-pc-windows-msvc
-          path: dist/subagent-mcp_*
+          path: |
+            dist/subagent-mcp_*
+            dist/WINDOWS_ARM64_BUILD_PATH
           if-no-files-found: error
           retention-days: 7
 
   # One place generates checksums.txt from the final archives. It downloads the
   # artifacts rather than rebuilding, so the uploaded checksums cover exactly
   # the archives in the dry-run artifact.
+  #
+  # It also owns the Windows arm64 provenance gate:
+  #   - dist/WINDOWS_ARM64_BUILD_PATH is written by the arm64 job that produced
+  #     the archive (native or cargo-xwin) and travels inside that artifact.
+  #   - dist/arm64-build-status.json is the machine-readable verdict and is
+  #     uploaded with the archives.
+  #   - A cargo-xwin archive is packaged for VM evidence but fails this job:
+  #     cross-built is not release evidence.
+  #   - A missing arm64 archive fails on workflow_dispatch (release gate) and is
+  #     only a warning on pull_request, where the preview windows-11-arm label
+  #     must not block packaging work.
   checksums:
     name: checksums (six targets)
     needs: [package, windows_arm64_native, windows_arm64_xwin]
-    if: ${{ always() && !cancelled() && needs.package.result == 'success' && (needs.windows_arm64_native.result == 'success' || needs.windows_arm64_xwin.result == 'success') }}
+    if: ${{ always() && !cancelled() && needs.package.result == 'success' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    env:
+      ARM64_TARGET: aarch64-pc-windows-msvc
+      # A dispatch is a release gate; a pull_request may be missing arm64.
+      RELEASE_GATE: ${{ github.event_name == 'workflow_dispatch' }}
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           pattern: rust-release-target-*
           path: dist
           merge-multiple: true
 
-      - name: Require six non-empty archives
+      - name: Verify archive set and arm64 build path
         run: |
           set -euo pipefail
-          count=$(find dist -maxdepth 1 -type f -name 'subagent-mcp_*' | wc -l)
-          test "$count" -eq 6 || {
-            echo "expected 6 archives, found $count" >&2
-            find dist -maxdepth 1 -type f -printf '%f %s bytes\n' | sort >&2
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+
+          base_archives=(
+            "subagent-mcp_${version}_linux_amd64.tar.gz"
+            "subagent-mcp_${version}_linux_arm64.tar.gz"
+            "subagent-mcp_${version}_darwin_amd64.tar.gz"
+            "subagent-mcp_${version}_darwin_arm64.tar.gz"
+            "subagent-mcp_${version}_windows_amd64.zip"
+          )
+          arm64_archive="subagent-mcp_${version}_windows_arm64.zip"
+
+          # The five unconditional targets must exist, be non-empty, and be the
+          # only archives in the set (checked below).
+          for name in "${base_archives[@]}"; do
+            test -s "dist/$name" || {
+              echo "::error::missing or empty archive: $name"
+              exit 1
+            }
+          done
+
+          # Provenance marker written by the arm64 job that built the archive.
+          build_path=missing
+          if [ -f dist/WINDOWS_ARM64_BUILD_PATH ]; then
+            build_path=$(tr -d '[:space:]' < dist/WINDOWS_ARM64_BUILD_PATH)
+          fi
+          case "$build_path" in
+          native | cargo-xwin | missing) ;;
+          *)
+            echo "::error::unknown Windows arm64 build path: $build_path"
             exit 1
-          }
-          empty=$(find dist -maxdepth 1 -type f -name 'subagent-mcp_*' -size 0)
-          if [ -n "$empty" ]; then
-            echo "zero-byte archive found:" >&2
-            printf '%s\n' "$empty" >&2
+            ;;
+          esac
+
+          arm64_present=false
+          if [ -f "dist/$arm64_archive" ]; then
+            arm64_present=true
+            test -s "dist/$arm64_archive" || {
+              echo "::error::zero-byte archive: $arm64_archive"
+              exit 1
+            }
+          fi
+
+          if [ "$arm64_present" = true ] && [ "$build_path" = missing ]; then
+            echo "::error::$arm64_archive has no WINDOWS_ARM64_BUILD_PATH provenance marker"
             exit 1
           fi
-          find dist -maxdepth 1 -type f -name 'subagent-mcp_*' -printf '%f %s bytes\n' | sort
+          if [ "$arm64_present" = false ] && [ "$build_path" != missing ]; then
+            echo "::error::stale WINDOWS_ARM64_BUILD_PATH=$build_path with no arm64 archive"
+            exit 1
+          fi
+          if [ "$arm64_present" = false ] && [ "$RELEASE_GATE" = true ]; then
+            echo "::error::release gate requires the native $ARM64_TARGET archive"
+            exit 1
+          fi
+
+          # Exact file set: five archives, plus arm64 only when it was built.
+          expected_list=$(printf '%s\n' "${base_archives[@]}")
+          if [ "$arm64_present" = true ]; then
+            expected_list=$(printf '%s\n%s\n' "$expected_list" "$arm64_archive")
+          fi
+          expected=$(printf '%s\n' "$expected_list" | LC_ALL=C sort)
+          actual=$(find dist -maxdepth 1 -type f -name 'subagent-mcp_*' -printf '%f\n' | LC_ALL=C sort)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::archive set mismatch"
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+
+          case "$build_path" in
+          native) acceptance=native ;;
+          cargo-xwin) acceptance=requires-vm-evidence ;;
+          *) acceptance=missing ;;
+          esac
+
+          if [ "$arm64_present" = false ]; then
+            echo "::warning::Windows arm64 archive missing (windows-11-arm unavailable?); not a release gate on ${{ github.event_name }}"
+          fi
+
+          cat > dist/arm64-build-status.json <<JSON
+          {
+            "target": "$ARM64_TARGET",
+            "event": "${{ github.event_name }}",
+            "release_gate": $RELEASE_GATE,
+            "build_path": "$build_path",
+            "archive_present": $arm64_present,
+            "archive": "$arm64_archive",
+            "acceptance": "$acceptance",
+            "runtime_evidence": "docs/release/windows-arm64-evidence.md"
+          }
+          JSON
+
+          printf 'Windows arm64 build path: %s (acceptance: %s)\n' "$build_path" "$acceptance"
+          find dist -maxdepth 1 -type f -printf '%f %s bytes\n' | LC_ALL=C sort
 
       - name: Generate checksums.txt
         run: |
@@ -242,9 +372,39 @@ jobs:
           sha256sum subagent-mcp_* > checksums.txt
           cat checksums.txt
 
+      - name: Summarize arm64 status
+        if: always()
+        run: |
+          set -euo pipefail
+          {
+            echo "### Rust release dry run"
+            echo
+            if [ -f dist/arm64-build-status.json ]; then
+              cat dist/arm64-build-status.json
+            else
+              echo "arm64 build status unavailable (verification failed before it was written)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: rust-release-dry-run
           path: dist/
           if-no-files-found: error
           retention-days: 7
+
+      # Cross-built arm64 must never look like a passed release gate. The
+      # artifact is still uploaded above so the VM evidence run has a binary.
+      - name: Reject cross-built arm64 as release evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ ! -f dist/WINDOWS_ARM64_BUILD_PATH ]; then
+            exit 0
+          fi
+          build_path=$(tr -d '[:space:]' < dist/WINDOWS_ARM64_BUILD_PATH)
+          if [ "$build_path" = cargo-xwin ]; then
+            echo "::error::Windows arm64 was cross-built with cargo-xwin; not release evidence until docs/release/windows-arm64-evidence.md is filled in from a Windows arm64 VM"
+            exit 1
+          fi

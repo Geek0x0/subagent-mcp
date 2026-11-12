@@ -37,10 +37,21 @@ Windows archives contain `subagent-mcp.exe`; Unix archives contain
 `config.example.toml`, and the packaging script refuses to finish if the entry
 set or a non-empty size does not match.
 
+The Windows arm64 artifact additionally carries a `WINDOWS_ARM64_BUILD_PATH`
+marker (`native` or `cargo-xwin`) written by the job that built it. The
+`checksums` job copies that marker into the dry-run artifact, writes
+`arm64-build-status.json` (`target`, `event`, `release_gate`, `build_path`,
+`archive_present`, `acceptance`), and fails the run when the marker says
+`cargo-xwin`. A six-archive set is required on `workflow_dispatch`; on
+`pull_request` a missing arm64 archive is a warning so the preview
+`windows-11-arm` label cannot block packaging PRs.
+
 ## 2. Native Windows arm64 path (acceptance)
 
 Job: `windows_arm64_native` on `windows-11-arm`, running the same packaging
-script as the other five targets.
+script as the other five targets. On `workflow_dispatch` it is a required gate;
+on `pull_request` it is `continue-on-error` and a missing archive is recorded as
+a warning, because the runner label is a preview.
 
 Evidence to record after the first successful run:
 
@@ -83,7 +94,10 @@ workflow manually with `windows_arm64_fallback=true`; job `windows_arm64_xwin`
 then cross-builds on `ubuntu-24.04` with `cargo-xwin` and
 `CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS=-C target-feature=+crt-static`.
 
-A cross-built archive is **not acceptance**. The runtime checklist below is
+A cross-built archive is **not acceptance**. The fallback job writes
+`dist/WINDOWS_ARM64_BUILD_PATH=cargo-xwin`; the `checksums` job copies that
+marker into the artifact, sets `"acceptance": "requires-vm-evidence"` in
+`arm64-build-status.json`, and fails the run. The runtime checklist below is
 mandatory and must be filled in before the artifact can be treated as a release
 candidate.
 

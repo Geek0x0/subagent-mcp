@@ -255,7 +255,9 @@ windows)
 	entries=$(list_zip "$archive")
 	;;
 *)
-	tar -czf "$archive" -C "$stage" "subagent-mcp" "README.md" "config.example.toml"
+	# COPYFILE_DISABLE stops bsdtar on macOS from adding AppleDouble ._*
+	# members (and xattr entries) that would break the exact entry assertion.
+	COPYFILE_DISABLE=1 tar -czf "$archive" -C "$stage" "subagent-mcp" "README.md" "config.example.toml"
 	entries=$(tar -tzf "$archive" | sed 's#^\./##')
 	;;
 esac

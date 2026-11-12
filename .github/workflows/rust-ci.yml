@@ -43,12 +43,62 @@ jobs:
   # Packaging test (Task 29A).
   #
   # Builds and packages the host target only, then asserts the archive name and
-  # entries. The six-target release dry run lives in
-  # rust-release-dry-run.yml; performance smoke (scripts/perf-smoke.sh and
-  # docs/release/perf-results.md) is Task 29B and is not wired here.
+  # entries. It runs after `verify` and only when packaging inputs changed, so a
+  # fat-LTO release build does not run for unrelated PRs. GitHub only supports
+  # `paths:` at workflow level and this workflow must keep running `verify` on
+  # every PR, so the small `changes` job computes the filter with git diff.
+  #
+  # The six-target release dry run lives in rust-release-dry-run.yml;
+  # performance smoke (scripts/perf-smoke.sh and docs/release/perf-results.md) is
+  # Task 29B and is not wired here.
   # ---------------------------------------------------------------------------
+  changes:
+    name: packaging input changes
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      package: ${{ steps.filter.outputs.package }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect packaging input changes
+        id: filter
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            echo "package=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          base="origin/${{ github.base_ref }}"
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          if ! changed=$(git diff --name-only "$base"...HEAD); then
+            echo "::warning::could not diff against $base; running the packaging test"
+            echo "package=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          printf 'changed files:\n%s\n' "$changed"
+          if printf '%s\n' "$changed" | awk '
+            /^src\// { found = 1 }
+            /^README\.md$/ { found = 1 }
+            /^config\.example\.toml$/ { found = 1 }
+            /^Cargo\.toml$/ { found = 1 }
+            /^Cargo\.lock$/ { found = 1 }
+            /^rust-toolchain\.toml$/ { found = 1 }
+            /^scripts\/package-rust-release\.sh$/ { found = 1 }
+            /^\.github\/workflows\/rust-ci\.yml$/ { found = 1 }
+            END { exit found ? 0 : 1 }
+          '; then
+            echo "package=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "package=false" >> "$GITHUB_OUTPUT"
+          fi
+
   package:
     name: package (linux x86_64 host)
+    needs: [verify, changes]
+    if: ${{ needs.changes.outputs.package == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
