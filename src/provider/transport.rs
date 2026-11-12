@@ -14,6 +14,14 @@
 //! `NO_PROXY`, matching Go's `http.ProxyFromEnvironment`). Neither is disabled
 //! here, and no `Client::timeout` is set: only [`execute_with_header_timeout`]
 //! bounds the wait for response headers, so long SSE bodies are never cut off.
+//!
+//! [`shared_client`] is the **internal pool only**. It returns a bare
+//! `reqwest::Client` with no response-header bound and no `extra_body`; a
+//! direct `.get().send()` through it is NOT the adapter request path. Adapters
+//! must send through [`PooledClient`], whose [`PooledClient::execute`] and
+//! [`PooledClient::execute_json`] methods enforce the shared 10-minute
+//! [`DEFAULT_RESPONSE_HEADER_TIMEOUT`] (a header-only timer, never a total
+//! timeout) and apply the configured `extra_body` merge automatically.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -23,6 +31,7 @@ use std::time::Duration;
 
 use serde_json::value::RawValue;
 
+use crate::config::ProviderConfig;
 use crate::provider::{ProviderError, TransportKind, Usage};
 
 // --- Constants (Go transport.go) ------------------------------------------
@@ -56,6 +65,13 @@ static CLIENTS: LazyLock<Mutex<HashMap<String, reqwest::Client>>> =
 /// Return the connection pool shared by every adapter built for the same
 /// `(kind, base_url)`. `reqwest::Client` clones are cheap (an internal `Arc`),
 /// so every caller reuses one TLS/TCP pool without rebuilding the client.
+///
+/// This is the **pool**, not the adapter send path. It intentionally carries no
+/// `Client::timeout` (which would truncate long SSE bodies) and no
+/// `extra_body`; a direct `.get().send()` here has no response-header bound.
+/// Adapter requests must go through [`PooledClient::execute`] /
+/// [`PooledClient::execute_json`], which enforce
+/// [`DEFAULT_RESPONSE_HEADER_TIMEOUT`] and merge `extra_body`.
 pub fn shared_client(kind: TransportKind, base_url: &str) -> reqwest::Client {
     let key = format!("{}\x00{}", kind_label(kind), base_url);
     let mut clients = CLIENTS.lock().unwrap();
@@ -284,10 +300,20 @@ impl Default for UpstreamRecorder {
 
 // --- Bounded drain + PooledClient ------------------------------------------
 
-/// Drain an unread response body up to [`DRAIN_LIMIT`] bytes and
-/// [`DRAIN_TIMEOUT`], teeing chunks to the debug capture and upstream recorder.
-/// Returns the number of bytes drained. This is the core of the drain-on-drop
-/// behavior: a sentinel-but-still-open stream cannot stall the caller.
+/// Prefix of `chunk` that still fits in the remaining drain budget. Clamping
+/// here is what makes the cap exact even when a single chunk is larger than the
+/// whole budget (Go `io.CopyN` reads exactly 64 KiB).
+fn cap_chunk(chunk: &[u8], total: usize) -> &[u8] {
+    let take = (DRAIN_LIMIT - total).min(chunk.len());
+    &chunk[..take]
+}
+
+/// Drain an unread response body up to **exactly** [`DRAIN_LIMIT`] bytes and
+/// [`DRAIN_TIMEOUT`], teeing only that capped prefix to the debug capture and
+/// upstream recorder. Returns the number of bytes drained. This is the core of
+/// the drain-on-drop behavior: a sentinel-but-still-open stream cannot stall
+/// the caller, and Go's `io.CopyN` reads exactly 64 KiB (the last chunk is
+/// clamped, never added whole).
 async fn bounded_drain(
     resp: reqwest::Response,
     mut debug: Option<DebugCapture>,
@@ -300,11 +326,16 @@ async fn bounded_drain(
             while total < DRAIN_LIMIT {
                 match resp.chunk().await {
                     Ok(Some(bytes)) => {
-                        total += bytes.len();
+                        // Retain at most the remaining budget: clamp an
+                        // oversized chunk instead of adding it whole.
+                        let capped = cap_chunk(&bytes, total);
+                        total += capped.len();
                         if let Some(d) = debug.as_mut() {
-                            d.write_chunk(&bytes);
+                            d.write_chunk(capped);
                         }
-                        upstream.lock().unwrap().feed(&bytes);
+                        upstream.lock().unwrap().feed(capped);
+                        // The `while` guard stops immediately once total
+                        // reaches DRAIN_LIMIT; no further chunk is read.
                     }
                     Ok(None) | Err(_) => break,
                 }
@@ -315,10 +346,20 @@ async fn bounded_drain(
     total
 }
 
-/// Drain a bare `reqwest::Response` with the standard bounds. Exposed so the
-/// bounded-drain contract is directly testable.
+/// Drain a bare `reqwest::Response` with the standard bounds and explicit
+/// recorders. Exposed so the exact-cap and capped-prefix contracts are directly
+/// testable; returns exactly the number of bytes retained (≤ [`DRAIN_LIMIT`]).
+pub async fn drain_response_with(
+    resp: reqwest::Response,
+    debug: Option<DebugCapture>,
+    upstream: Arc<Mutex<UpstreamRecorder>>,
+) -> usize {
+    bounded_drain(resp, debug, upstream).await
+}
+
+/// Drain a bare `reqwest::Response` with the standard bounds (no recorders).
 pub async fn drain_response(resp: reqwest::Response) -> usize {
-    bounded_drain(resp, None, Arc::new(Mutex::new(UpstreamRecorder::new()))).await
+    drain_response_with(resp, None, Arc::new(Mutex::new(UpstreamRecorder::new()))).await
 }
 
 /// A response whose unread body is drained on drop, so the pooled connection
@@ -386,30 +427,132 @@ impl Drop for PooledResponse {
     }
 }
 
+/// Merge `extra` into a POST request carrying a byte-backed JSON body (Go's
+/// `mergeJSONBody` inside `drainingTransport.RoundTrip`). Only POSTs whose
+/// `Content-Type` contains `json` are merged; anything else is left untouched.
+/// Applied by the single send path so no adapter request can bypass it.
+fn apply_extra_body(
+    req: &mut reqwest::Request,
+    extra: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), ProviderError> {
+    if *req.method() != reqwest::Method::POST {
+        return Ok(());
+    }
+    let is_json = req
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("json"));
+    if !is_json {
+        return Ok(());
+    }
+    let Some(original) = req.body().and_then(|b| b.as_bytes()) else {
+        // A streaming body cannot be merged synchronously; adapters build
+        // JSON bodies with `execute_json`, which is always byte-backed.
+        return Ok(());
+    };
+    let merged = merge_extra_body(original, extra)?;
+    *req.body_mut() = Some(reqwest::Body::from(merged));
+    Ok(())
+}
+
 /// A client over the shared pool that wraps responses with debug capture,
-/// upstream recording, and bounded drain-on-drop. Adapters call [`Self::execute`]
-/// after applying [`merge_extra_body`] to their request body.
+/// upstream recording, and bounded drain-on-drop. This is the **adapter send
+/// path**: it enforces [`DEFAULT_RESPONSE_HEADER_TIMEOUT`] and applies the
+/// configured `extra_body` merge to every POST JSON body automatically (Go
+/// `PooledClient` / `PooledClientWithBody`). Adapters must not send through
+/// [`shared_client`] directly.
 pub struct PooledClient {
     http: reqwest::Client,
     kind: TransportKind,
+    extra_body: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 impl PooledClient {
+    /// Build a client with no `extra_body` (Go `PooledClient`).
     pub fn new(kind: TransportKind, base_url: &str) -> Self {
+        Self::with_extra_body(kind, base_url, None)
+    }
+
+    /// Build a client carrying `extra_body`, merged into every POST JSON
+    /// request body automatically (Go `PooledClientWithBody`).
+    pub fn with_extra_body(
+        kind: TransportKind,
+        base_url: &str,
+        extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+    ) -> Self {
         Self {
             http: shared_client(kind, base_url),
             kind,
+            extra_body,
         }
     }
 
-    /// Execute `req` with the header-only timeout and wrap the response.
-    pub async fn execute(
+    /// Build straight from a resolved [`ProviderConfig`]: base URL and
+    /// `extra_body` come from config, so adapters cannot forget the merge.
+    pub fn from_config(kind: TransportKind, cfg: &ProviderConfig) -> Self {
+        Self::with_extra_body(kind, &cfg.base_url, cfg.extra_body.clone())
+    }
+
+    /// Primary adapter entry: build a JSON POST from parts and send it. The
+    /// `extra_body` merge and the enforced 10-minute header timeout are applied
+    /// automatically through [`Self::execute`].
+    pub async fn execute_json(
+        &self,
+        url: reqwest::Url,
+        headers: reqwest::header::HeaderMap,
+        body: &[u8],
+    ) -> Result<PooledResponse, ProviderError> {
+        let mut req = reqwest::Request::new(reqwest::Method::POST, url);
+        *req.headers_mut() = headers;
+        req.headers_mut().insert(
+            reqwest::header::CONTENT_TYPE,
+            reqwest::header::HeaderValue::from_static("application/json"),
+        );
+        *req.body_mut() = Some(reqwest::Body::from(body.to_vec()));
+        self.execute(req).await
+    }
+
+    /// Send `req` with the enforced 10-minute response-header timeout and the
+    /// automatic `extra_body` merge. Every execute variant funnels through
+    /// here, so an adapter cannot bypass the merge or the header bound.
+    pub async fn execute(&self, req: reqwest::Request) -> Result<PooledResponse, ProviderError> {
+        self.send(req, DEFAULT_RESPONSE_HEADER_TIMEOUT).await
+    }
+
+    /// Like [`Self::execute`] but with an explicit header timeout. Kept for
+    /// tests and special cases; the normal adapter path is [`Self::execute`],
+    /// which enforces the shared 10-minute default just like Go's fixed
+    /// `ResponseHeaderTimeout` on the pooled transport.
+    pub async fn execute_with_timeout(
         &self,
         req: reqwest::Request,
         timeout: Duration,
     ) -> Result<PooledResponse, ProviderError> {
+        self.send(req, timeout).await
+    }
+
+    /// The single send path: merge `extra_body`, keep `Content-Length` in sync
+    /// with the (possibly merged) body, then bound only the header wait.
+    async fn send(
+        &self,
+        mut req: reqwest::Request,
+        timeout: Duration,
+    ) -> Result<PooledResponse, ProviderError> {
         let method = req.method().clone();
         let url = req.url().clone();
+        if let Some(extra) = &self.extra_body {
+            apply_extra_body(&mut req, extra)?;
+        }
+        // The merge can change the body length; keep Content-Length correct on
+        // the wire regardless of what the caller set.
+        let body_len = req.body().and_then(|b| b.as_bytes()).map(|b| b.len());
+        if let Some(len) = body_len
+            && let Ok(value) = reqwest::header::HeaderValue::from_str(&len.to_string())
+        {
+            req.headers_mut()
+                .insert(reqwest::header::CONTENT_LENGTH, value);
+        }
         let resp = execute_with_header_timeout(&self.http, req, timeout).await?;
         let status = resp.status();
         let headers = resp.headers().clone();
@@ -491,4 +634,24 @@ pub fn usage_from_json(value: Option<&serde_json::Value>) -> Option<Usage> {
         reasoning: field("reasoning"),
         total: field("total"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cap_chunk_clamps_a_single_oversized_chunk() {
+        // A chunk larger than the whole budget is clamped to the budget, not
+        // added whole (the exact-64-KiB guarantee).
+        let big = vec![7u8; DRAIN_LIMIT + 4096];
+        assert_eq!(cap_chunk(&big, 0).len(), DRAIN_LIMIT);
+        assert_eq!(cap_chunk(&big, 0), &big[..DRAIN_LIMIT]);
+        // A chunk crossing the remaining budget is trimmed to what is left.
+        let small = vec![9u8; 100];
+        assert_eq!(cap_chunk(&small, DRAIN_LIMIT - 10).len(), 10);
+        assert_eq!(cap_chunk(&small, DRAIN_LIMIT - 10), &small[..10]);
+        // Under the cap, the whole chunk is retained.
+        assert_eq!(cap_chunk(&small, 0).len(), 100);
+    }
 }
