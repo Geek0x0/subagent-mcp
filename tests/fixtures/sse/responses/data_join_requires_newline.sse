@@ -1,0 +1,7 @@
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":1
+data: 2,"delta":"x"}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":3,"response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":0,"total_tokens":1}}}
+

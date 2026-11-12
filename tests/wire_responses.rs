@@ -1,538 +1,37 @@
 //! Task 11: Responses adapter wire tests.
 //!
-//! Ports `internal/provider/responses/{adapter,env_credentials,shared_transport}_test.go`
-//! and adds the SSE framing cases the Rust adapter owns: blank-line dispatch,
-//! comment/empty-event skipping, `data:` line joining, the 32 MiB line cap,
-//! EOF without a trailing blank line, and `[DONE]` ending the stream without
-//! counting as a terminal response event.
+//! Ports `internal/provider/responses/{adapter,shared_transport}_test.go` and
+//! adds the SSE framing and OpenAI SDK retry cases the Rust adapter owns:
+//! blank-line dispatch, comment/empty-event skipping, `data:` line joining,
+//! the 32 MiB line cap (both sides of the boundary), EOF without a trailing
+//! blank line, `[DONE]` ending the stream without counting as a terminal
+//! response event, and the SDK's `MaxRetries: 2` policy for 408/409/429/5xx,
+//! connection errors, `x-should-retry`, and `Retry-After` hints.
+//!
+//! The credential-environment test lives in its own binary
+//! (`wire_responses_env.rs`) so `set_var` cannot race another test's
+//! `PooledClient` environment read.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
-use subagent_mcp::config::{Api, ProviderConfig};
-use subagent_mcp::provider::responses::Responses;
+use subagent_mcp::provider::responses::{
+    MAX_ATTEMPTS, MAX_RETRY_DELAY, Responses, default_retry_delay,
+};
 use subagent_mcp::provider::sse::SSE_MAX_LINE;
 use subagent_mcp::provider::{
-    DeltaSink, Message, ModelLister, Provider, ProviderError, Role, ToolSpec, TurnRequest,
-    TurnResult, Usage,
+    DeltaSink, Message, ModelLister, Provider, Role, ToolSpec, TurnRequest, Usage,
 };
 use subagent_mcp::util::run::RunContext;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
 use tokio_util::sync::CancellationToken;
 
-// ---------------------------------------------------------------------------
-// Scripted fake Responses API (stand-in for Go's testutil.FakeResponses)
-// ---------------------------------------------------------------------------
+#[path = "support/responses_fake.rs"]
+mod fake;
 
-#[derive(Clone, Default)]
-struct Item {
-    reasoning_summary: String,
-    encrypted_content: String,
-    message_text: String,
-    message_refusal: String,
-    function_call_id: String,
-    function_name: String,
-    function_arguments: String,
-}
-
-impl Item {
-    fn text(text: &str) -> Self {
-        Self {
-            message_text: text.to_string(),
-            ..Default::default()
-        }
-    }
-
-    fn refusal(text: &str) -> Self {
-        Self {
-            message_refusal: text.to_string(),
-            ..Default::default()
-        }
-    }
-
-    fn reasoning(summary: &str, encrypted: &str) -> Self {
-        Self {
-            reasoning_summary: summary.to_string(),
-            encrypted_content: encrypted.to_string(),
-            ..Default::default()
-        }
-    }
-
-    fn call(id: &str, name: &str, arguments: &str) -> Self {
-        Self {
-            function_call_id: id.to_string(),
-            function_name: name.to_string(),
-            function_arguments: arguments.to_string(),
-            ..Default::default()
-        }
-    }
-
-    fn render(&self, index: usize) -> Value {
-        if !self.reasoning_summary.is_empty() || !self.encrypted_content.is_empty() {
-            json!({
-                "type": "reasoning",
-                "id": format!("rs_{index}"),
-                "summary": [{"type": "summary_text", "text": self.reasoning_summary.clone()}],
-                "encrypted_content": self.encrypted_content.clone(),
-            })
-        } else if !self.message_text.is_empty() || !self.message_refusal.is_empty() {
-            let content = if !self.message_text.is_empty() {
-                json!([{"type": "output_text", "text": self.message_text.clone(), "annotations": []}])
-            } else {
-                json!([{"type": "refusal", "refusal": self.message_refusal.clone()}])
-            };
-            json!({
-                "type": "message",
-                "id": format!("msg_{index}"),
-                "role": "assistant",
-                "status": "completed",
-                "content": content,
-            })
-        } else {
-            json!({
-                "type": "function_call",
-                "id": format!("fc_{index}"),
-                "call_id": self.function_call_id.clone(),
-                "name": self.function_name.clone(),
-                "arguments": self.function_arguments.clone(),
-                "status": "completed",
-            })
-        }
-    }
-}
-
-#[derive(Default)]
-struct TurnScript {
-    items: Vec<Item>,
-    response_status: Option<&'static str>,
-    incomplete_reason: String,
-    input_tokens: i64,
-    cached_tokens: i64,
-    output_tokens: i64,
-    reasoning_tokens: i64,
-    stream_error: Option<(String, String)>,
-}
-
-enum Scripted {
-    /// One scripted Responses turn rendered as SSE.
-    Turn(TurnScript),
-    /// Raw SSE bytes (framing cases).
-    Raw(String),
-    /// Non-200 JSON error reply.
-    Http(u16),
-}
-
-fn text_turn(text: &str) -> Scripted {
-    Scripted::Turn(TurnScript {
-        items: vec![Item::text(text)],
-        ..Default::default()
-    })
-}
-
-struct Recorded {
-    method: String,
-    path: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-}
-
-#[derive(Default)]
-struct State {
-    scripted: VecDeque<Scripted>,
-    requests: Vec<Recorded>,
-    models: Vec<String>,
-    models_status: u16,
-    connections: usize,
-}
-
-struct FakeResponses {
-    base: String,
-    state: Arc<Mutex<State>>,
-}
-
-impl FakeResponses {
-    fn request(&self, index: usize) -> Value {
-        let raw = self.raw_request(index);
-        serde_json::from_slice(&raw).expect("request body must be JSON")
-    }
-
-    fn raw_request(&self, index: usize) -> Vec<u8> {
-        let guard = self.state.lock().unwrap();
-        guard.requests[index].body.clone()
-    }
-
-    fn headers(&self, index: usize) -> HashMap<String, String> {
-        let guard = self.state.lock().unwrap();
-        guard.requests[index].headers.clone()
-    }
-
-    fn method_and_path(&self, index: usize) -> (String, String) {
-        let guard = self.state.lock().unwrap();
-        (
-            guard.requests[index].method.clone(),
-            guard.requests[index].path.clone(),
-        )
-    }
-
-    fn request_count(&self) -> usize {
-        self.state.lock().unwrap().requests.len()
-    }
-
-    fn connections(&self) -> usize {
-        self.state.lock().unwrap().connections
-    }
-
-    fn set_models(&self, ids: &[&str]) {
-        self.state.lock().unwrap().models = ids.iter().map(|id| id.to_string()).collect();
-    }
-
-    fn set_models_status(&self, status: u16) {
-        self.state.lock().unwrap().models_status = status;
-    }
-}
-
-async fn spawn_fake(scripted: Vec<Scripted>) -> FakeResponses {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    let state = Arc::new(Mutex::new(State {
-        scripted: scripted.into(),
-        ..Default::default()
-    }));
-    let server_state = Arc::clone(&state);
-    tokio::spawn(async move {
-        loop {
-            let Ok((socket, _)) = listener.accept().await else {
-                return;
-            };
-            server_state.lock().unwrap().connections += 1;
-            let state = Arc::clone(&server_state);
-            tokio::spawn(async move {
-                serve_connection(socket, state).await;
-            });
-        }
-    });
-    FakeResponses {
-        base: format!("http://{address}"),
-        state,
-    }
-}
-
-async fn serve_connection(mut socket: tokio::net::TcpStream, state: Arc<Mutex<State>>) {
-    let mut buffer: Vec<u8> = Vec::new();
-    loop {
-        let header_end = loop {
-            if let Some(index) = find(&buffer, b"\r\n\r\n") {
-                break index + 4;
-            }
-            let mut chunk = [0u8; 8192];
-            match socket.read(&mut chunk).await {
-                Ok(0) | Err(_) => return,
-                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-            }
-        };
-        let head = String::from_utf8_lossy(&buffer[..header_end]).into_owned();
-        let mut lines = head.split("\r\n");
-        let request_line = lines.next().unwrap_or("");
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or("").to_string();
-        let path = parts.next().unwrap_or("").to_string();
-        let mut headers = HashMap::new();
-        for line in lines {
-            if let Some((name, value)) = line.split_once(':') {
-                headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-            }
-        }
-        let length: usize = headers
-            .get("content-length")
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
-        while buffer.len() < header_end + length {
-            let mut chunk = [0u8; 8192];
-            match socket.read(&mut chunk).await {
-                Ok(0) | Err(_) => return,
-                Ok(read) => buffer.extend_from_slice(&chunk[..read]),
-            }
-        }
-        let body = buffer[header_end..header_end + length].to_vec();
-        buffer.drain(..header_end + length);
-        let (reply, keep_alive) = handle(&state, &method, &path, &headers, &body);
-        if socket.write_all(&reply).await.is_err() || !keep_alive {
-            return;
-        }
-    }
-}
-
-fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
-}
-
-fn handle(
-    state: &Arc<Mutex<State>>,
-    method: &str,
-    path: &str,
-    headers: &HashMap<String, String>,
-    body: &[u8],
-) -> (Vec<u8>, bool) {
-    let request_index = {
-        let mut guard = state.lock().unwrap();
-        guard.requests.push(Recorded {
-            method: method.to_string(),
-            path: path.to_string(),
-            headers: headers.clone(),
-            body: body.to_vec(),
-        });
-        guard.requests.len() - 1
-    };
-
-    match (method, path) {
-        ("POST", "/responses") => {
-            let scripted = state.lock().unwrap().scripted.pop_front();
-            let Some(scripted) = scripted else {
-                return (
-                    http_response(
-                        500,
-                        "application/json",
-                        br#"{"error":{"message":"unexpected extra request","type":"server_error"}}"#,
-                    ),
-                    true,
-                );
-            };
-            match scripted {
-                Scripted::Http(status) => (
-                    http_response(
-                        status,
-                        "application/json",
-                        br#"{"error":{"message":"scripted failure","type":"server_error"}}"#,
-                    ),
-                    true,
-                ),
-                Scripted::Raw(raw) => (
-                    http_response(200, "text/event-stream", raw.as_bytes()),
-                    true,
-                ),
-                Scripted::Turn(script) => {
-                    let request: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
-                    let model = request
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .unwrap_or("")
-                        .to_string();
-                    let raw = render_turn(&script, &model, request_index);
-                    (
-                        http_response(200, "text/event-stream", raw.as_bytes()),
-                        true,
-                    )
-                }
-            }
-        }
-        ("GET", "/models") => {
-            let (status, ids) = {
-                let guard = state.lock().unwrap();
-                (guard.models_status, guard.models.clone())
-            };
-            if status != 0 && status != 200 {
-                return (
-                    http_response(
-                        status,
-                        "application/json",
-                        br#"{"error":{"message":"scripted failure","type":"server_error"}}"#,
-                    ),
-                    true,
-                );
-            }
-            let data: Vec<Value> = ids
-                .into_iter()
-                .map(|id| json!({"id": id, "object": "model"}))
-                .collect();
-            let body = serde_json::to_vec(&json!({"object": "list", "data": data})).unwrap();
-            (http_response(200, "application/json", &body), true)
-        }
-        _ => (http_response(404, "text/plain", b"not found"), true),
-    }
-}
-
-fn http_response(status: u16, content_type: &str, body: &[u8]) -> Vec<u8> {
-    let reason = match status {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        404 => "Not Found",
-        500 => "Internal Server Error",
-        _ => "Status",
-    };
-    let mut raw = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
-        body.len()
-    )
-    .into_bytes();
-    raw.extend_from_slice(body);
-    raw
-}
-
-fn render_turn(script: &TurnScript, model: &str, request_index: usize) -> String {
-    let mut out = String::new();
-    let mut sequence = 0;
-    let response_id = format!("resp_{request_index}");
-    let created = json!({
-        "id": response_id.clone(),
-        "object": "response",
-        "created_at": 1700000000,
-        "status": "in_progress",
-        "model": model,
-        "output": [],
-    });
-    push_event(
-        &mut out,
-        "response.created",
-        &json!({"sequence_number": sequence, "response": created}),
-    );
-    sequence += 1;
-
-    let mut output = Vec::new();
-    for (index, item) in script.items.iter().enumerate() {
-        if !item.message_text.is_empty() {
-            push_event(
-                &mut out,
-                "response.output_text.delta",
-                &json!({
-                    "sequence_number": sequence,
-                    "item_id": format!("msg_{index}"),
-                    "output_index": index,
-                    "content_index": 0,
-                    "delta": item.message_text.clone(),
-                }),
-            );
-            sequence += 1;
-        }
-        output.push(item.render(index));
-    }
-
-    if let Some((code, message)) = &script.stream_error {
-        push_event(
-            &mut out,
-            "error",
-            &json!({
-                "sequence_number": sequence,
-                "code": code,
-                "message": message,
-            }),
-        );
-        return out;
-    }
-
-    let status = script.response_status.unwrap_or("completed");
-    let mut response = json!({
-        "id": response_id,
-        "object": "response",
-        "created_at": 1700000000,
-        "status": status,
-        "model": model,
-        "output": output,
-        "usage": {
-            "input_tokens": script.input_tokens,
-            "input_tokens_details": {"cached_tokens": script.cached_tokens},
-            "output_tokens": script.output_tokens,
-            "output_tokens_details": {"reasoning_tokens": script.reasoning_tokens},
-            "total_tokens": script.input_tokens + script.output_tokens,
-        },
-    });
-    if status == "incomplete" {
-        response["incomplete_details"] = json!({"reason": script.incomplete_reason.clone()});
-    }
-    if status == "failed" {
-        response["error"] = json!({"code": "server_error", "message": "scripted failure"});
-    }
-    push_event(
-        &mut out,
-        &format!("response.{status}"),
-        &json!({"sequence_number": sequence, "response": response}),
-    );
-    out
-}
-
-fn push_event(out: &mut String, kind: &str, payload: &Value) {
-    // Go's fake writes the event type into the payload as well as the SSE
-    // `event:` line; the adapter switches on the payload's `type`.
-    let mut payload = payload.clone();
-    if let Some(object) = payload.as_object_mut() {
-        object.insert("type".to_string(), json!(kind));
-    }
-    out.push_str(&format!("event: {kind}\ndata: {payload}\n\n"));
-}
-
-// ---------------------------------------------------------------------------
-// Adapter helpers
-// ---------------------------------------------------------------------------
-
-fn provider_config(base: &str, key: &str) -> ProviderConfig {
-    ProviderConfig {
-        api: Api::Responses,
-        base_url: base.to_string(),
-        env_key: None,
-        key: Some(key.to_string()),
-        command: None,
-        default_model: "m".to_string(),
-        models: Vec::new(),
-        effort_map: BTreeMap::new(),
-        max_output_tokens: None,
-        max_nudges: None,
-        extra_body: None,
-    }
-}
-
-fn adapter(fake: &FakeResponses, key: &str) -> Responses {
-    Responses::new("openai", &provider_config(&fake.base, key)).unwrap()
-}
-
-fn shell_spec() -> ToolSpec {
-    ToolSpec {
-        name: "shell".to_string(),
-        description: "run".to_string(),
-        parameters: RawValue::from_string(
-            r#"{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}"#
-                .to_string(),
-        )
-        .unwrap(),
-    }
-}
-
-fn context() -> RunContext {
-    RunContext {
-        cancel: CancellationToken::new(),
-        deadline: None,
-    }
-}
-
-fn request(model: &str) -> TurnRequest {
-    TurnRequest {
-        model: model.to_string(),
-        messages: vec![Message {
-            role: Role::User,
-            text: "hi".to_string(),
-            ..Default::default()
-        }],
-        ..Default::default()
-    }
-}
-
-async fn run_turn(provider: &Responses, request: TurnRequest) -> Result<TurnResult, ProviderError> {
-    provider.turn(context(), request, Box::new(|_| {})).await
-}
-
-fn item_kind(item: &Value) -> String {
-    match item.get("type").and_then(Value::as_str) {
-        None | Some("") | Some("message") => format!(
-            "message:{}",
-            item.get("role").and_then(Value::as_str).unwrap_or("")
-        ),
-        Some(kind) => kind.to_string(),
-    }
-}
+use fake::*;
 
 // ---------------------------------------------------------------------------
 // Ported Go adapter tests
@@ -825,8 +324,8 @@ async fn stream_error_event_reports_code_and_message() {
 
 #[tokio::test]
 async fn http_error_fails_the_turn() {
-    let fake = spawn_fake(vec![Scripted::Http(400)]).await;
-    let error = run_turn(&adapter(&fake, "k"), request("gpt-x"))
+    let fake = spawn_fake(vec![http_error(400)]).await;
+    let error = run_turn(&fast_adapter(&fake), request("gpt-x"))
         .await
         .unwrap_err();
     assert!(
@@ -926,6 +425,11 @@ async fn list_models_http_error_is_wrapped_with_list_models() {
         "unexpected error: {}",
         error.message
     );
+    assert_eq!(
+        fake.request_count(),
+        1,
+        "401 is not retryable, so the listing must be attempted once"
+    );
 }
 
 #[tokio::test]
@@ -960,6 +464,227 @@ async fn provider_name_is_the_configured_name() {
 }
 
 // ---------------------------------------------------------------------------
+// OpenAI SDK retry policy (MaxRetries: 2)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn retryable_statuses_are_attempted_three_times() {
+    for status in [408, 409, 429, 500, 503] {
+        let fake = spawn_fake(vec![
+            http_error(status),
+            http_error(status),
+            http_error(status),
+        ])
+        .await;
+        let error = run_turn(&fast_adapter(&fake), request("gpt-x"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains(&status.to_string()),
+            "status {status}: unexpected error: {}",
+            error.message
+        );
+        assert_eq!(
+            fake.request_count(),
+            MAX_ATTEMPTS,
+            "status {status} must use every retry"
+        );
+    }
+}
+
+#[tokio::test]
+async fn non_retryable_statuses_are_attempted_once() {
+    for status in [400, 401, 403, 404, 422] {
+        let fake = spawn_fake(vec![http_error(status), text_turn("unused")]).await;
+        let error = run_turn(&fast_adapter(&fake), request("gpt-x"))
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains(&status.to_string()),
+            "status {status}: unexpected error: {}",
+            error.message
+        );
+        assert_eq!(fake.request_count(), 1, "status {status} must not retry");
+    }
+}
+
+#[tokio::test]
+async fn a_retry_can_recover_the_turn() {
+    let fake = spawn_fake(vec![http_error(500), http_error(429), text_turn("ok")]).await;
+    let result = run_turn(&fast_adapter(&fake), request("gpt-x"))
+        .await
+        .unwrap();
+    assert_eq!(result.text, "ok");
+    assert_eq!(fake.request_count(), MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn model_listing_uses_the_same_retry_policy() {
+    let fake = spawn_fake(Vec::new()).await;
+    fake.set_models(&["model-a"]);
+    fake.set_models_transient_failures(500, MAX_ATTEMPTS - 1);
+    let ids: Vec<String> = ModelLister::list_models(&fast_adapter(&fake))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|model| model.id)
+        .collect();
+    assert_eq!(ids, vec!["model-a"]);
+    assert_eq!(fake.request_count(), MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn connection_errors_are_retried() {
+    let (base, attempts) = spawn_closing_server().await;
+    let mut provider = Responses::new("openai", &provider_config(&base, "k")).unwrap();
+    provider.set_retry_delay(Arc::new(|_, _| Duration::ZERO));
+    let error = run_turn(&provider, request("gpt-x")).await.unwrap_err();
+    assert!(!error.message.is_empty());
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        MAX_ATTEMPTS,
+        "a connection error must use every retry"
+    );
+}
+
+#[tokio::test]
+async fn x_should_retry_true_forces_a_retry() {
+    let fake = spawn_fake(vec![
+        http_error_with(400, &[("x-should-retry", "true")]),
+        http_error_with(400, &[("x-should-retry", "true")]),
+        text_turn("ok"),
+    ])
+    .await;
+    let result = run_turn(&fast_adapter(&fake), request("gpt-x"))
+        .await
+        .unwrap();
+    assert_eq!(result.text, "ok");
+    assert_eq!(fake.request_count(), MAX_ATTEMPTS);
+}
+
+#[tokio::test]
+async fn x_should_retry_false_suppresses_a_retry() {
+    let fake = spawn_fake(vec![
+        http_error_with(500, &[("x-should-retry", "false")]),
+        text_turn("unused"),
+    ])
+    .await;
+    let error = run_turn(&fast_adapter(&fake), request("gpt-x"))
+        .await
+        .unwrap_err();
+    assert!(error.message.contains("500"));
+    assert_eq!(fake.request_count(), 1);
+}
+
+#[tokio::test]
+async fn retry_after_hints_reach_the_delay_function() {
+    let fake = spawn_fake(vec![
+        http_error_with(429, &[("Retry-After-Ms", "1500")]),
+        text_turn("ok"),
+    ])
+    .await;
+    let mut provider = adapter(&fake, "k");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    provider.set_retry_delay(Arc::new(move |attempt, retry_after| {
+        recorder.lock().unwrap().push((attempt, retry_after));
+        Duration::ZERO
+    }));
+    run_turn(&provider, request("gpt-x")).await.unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(0, Some(Duration::from_millis(1500)))]
+    );
+
+    let fake = spawn_fake(vec![
+        http_error_with(429, &[("Retry-After", "60")]),
+        text_turn("ok"),
+    ])
+    .await;
+    let mut provider = adapter(&fake, "k");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&seen);
+    provider.set_retry_delay(Arc::new(move |attempt, retry_after| {
+        recorder.lock().unwrap().push((attempt, retry_after));
+        Duration::ZERO
+    }));
+    run_turn(&provider, request("gpt-x")).await.unwrap();
+    assert_eq!(
+        *seen.lock().unwrap(),
+        vec![(0, Some(MAX_RETRY_DELAY))],
+        "a server-directed delay is capped at 8s"
+    );
+}
+
+#[test]
+fn default_retry_delay_matches_the_sdk_backoff() {
+    // Go: 0.5s * 2^attempt, capped at 8s, minus up to a quarter jitter.
+    for (attempt, min_ms, max_ms) in [(0usize, 375u64, 500u64), (1, 750, 1000), (2, 1500, 2000)] {
+        let delay = default_retry_delay(attempt, None);
+        assert!(
+            delay >= Duration::from_millis(min_ms) && delay <= Duration::from_millis(max_ms),
+            "attempt {attempt}: {delay:?} outside [{min_ms}ms, {max_ms}ms]"
+        );
+    }
+    assert_eq!(
+        default_retry_delay(0, Some(Duration::from_secs(3))),
+        Duration::from_secs(3),
+        "a server-directed delay wins over the exponential backoff"
+    );
+    assert_eq!(
+        default_retry_delay(0, Some(Duration::from_secs(60))),
+        MAX_RETRY_DELAY
+    );
+    assert_eq!(MAX_ATTEMPTS, 3, "Go MaxRetries: 2 means three attempts");
+}
+
+#[tokio::test]
+async fn cancellation_during_a_retry_wait_is_not_retried() {
+    let fake = spawn_fake(vec![http_error(500), text_turn("unused")]).await;
+    let mut provider = adapter(&fake, "k");
+    provider.set_retry_delay(Arc::new(|_, _| Duration::from_secs(30)));
+    let cancel = CancellationToken::new();
+    let canceller = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        canceller.cancel();
+    });
+    let error = provider
+        .turn(
+            RunContext {
+                cancel,
+                deadline: None,
+            },
+            request("gpt-x"),
+            Box::new(|_| {}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.message, "context canceled");
+    assert_eq!(fake.request_count(), 1, "cancellation must not retry");
+}
+
+#[tokio::test]
+async fn an_elapsed_deadline_during_a_retry_wait_is_not_retried() {
+    let fake = spawn_fake(vec![http_error(500), text_turn("unused")]).await;
+    let mut provider = adapter(&fake, "k");
+    provider.set_retry_delay(Arc::new(|_, _| Duration::from_secs(30)));
+    let error = provider
+        .turn(
+            RunContext {
+                cancel: CancellationToken::new(),
+                deadline: Some(tokio::time::Instant::now() + Duration::from_millis(20)),
+            },
+            request("gpt-x"),
+            Box::new(|_| {}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.message, "context deadline exceeded");
+    assert_eq!(fake.request_count(), 1, "a deadline must not retry");
+}
+
+// ---------------------------------------------------------------------------
 // SSE framing
 // ---------------------------------------------------------------------------
 
@@ -967,6 +692,8 @@ const TEXT_COMPLETED: &str = include_str!("fixtures/sse/responses/text_completed
 const FRAMING_MULTI_DATA: &str = include_str!("fixtures/sse/responses/framing_multi_data.sse");
 const DONE_PREFIX: &str = include_str!("fixtures/sse/responses/done_prefix.sse");
 const EOF_WITHOUT_BLANK: &str = include_str!("fixtures/sse/responses/eof_without_blank.sse");
+const DATA_JOIN_REQUIRES_NEWLINE: &str =
+    include_str!("fixtures/sse/responses/data_join_requires_newline.sse");
 
 #[tokio::test]
 async fn terminal_event_then_done_completes_the_turn() {
@@ -1006,6 +733,27 @@ async fn blank_line_dispatch_skips_comments_and_empty_events() {
         "data: lines must be joined with a newline and comments/empty events skipped"
     );
     assert_eq!(result.usage.map(|usage| usage.total), Some(2));
+}
+
+/// The fixture splits a JSON number across two `data:` lines. The SDK joins
+/// them with `\n`, which makes `1\n2` invalid JSON; an implementation that
+/// forgot the newline would parse `12` and complete the turn successfully.
+#[tokio::test]
+async fn data_lines_are_joined_with_a_newline() {
+    let fake = spawn_fake(vec![Scripted::Raw(DATA_JOIN_REQUIRES_NEWLINE.to_string())]).await;
+    let deltas = Arc::new(Mutex::new(String::new()));
+    let sink: DeltaSink = {
+        let deltas = Arc::clone(&deltas);
+        Box::new(move |delta| deltas.lock().unwrap().push_str(&delta))
+    };
+    let result = adapter(&fake, "k")
+        .turn(context(), request("gpt-x"), sink)
+        .await;
+    assert!(
+        result.is_err(),
+        "the joined payload must be invalid JSON, proving the newline was inserted"
+    );
+    assert_eq!(*deltas.lock().unwrap(), "");
 }
 
 #[tokio::test]
@@ -1048,112 +796,73 @@ async fn a_line_over_the_32_mib_cap_fails_the_stream() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Credentials and connection sharing
-// ---------------------------------------------------------------------------
+/// A line of exactly `SSE_MAX_LINE - 1` bytes is the largest the Go scanner
+/// accepts; only a line of `SSE_MAX_LINE` or more is rejected.
+#[tokio::test]
+async fn a_line_at_the_32_mib_cap_minus_one_is_accepted() {
+    const PREFIX: &str = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"";
+    const SUFFIX: &str = "\"}";
+    const TERMINAL: &str = "event: response.completed\ndata: {\"type\":\"response.completed\",\"sequence_number\":1,\"response\":{\"status\":\"completed\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":0,\"total_tokens\":1}}}\n\n";
+    let padding = SSE_MAX_LINE - 1 - PREFIX.len() - SUFFIX.len();
+    let mut body = String::with_capacity(SSE_MAX_LINE + 512);
+    body.push_str(PREFIX);
+    body.push_str(&"x".repeat(padding));
+    body.push_str(SUFFIX);
+    body.push_str("\n\n");
+    body.push_str(TERMINAL);
 
-struct EnvRestore(Vec<(String, Option<String>)>);
-
-impl Drop for EnvRestore {
-    fn drop(&mut self) {
-        for (key, value) in &self.0 {
-            // SAFETY: this test binary only mutates these variables in this
-            // test, and the guard restores every value before the test ends.
-            unsafe {
-                match value {
-                    Some(value) => std::env::set_var(key, value),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
+    let fake = spawn_fake(vec![Scripted::Raw(body)]).await;
+    let delta_len = Arc::new(Mutex::new(0usize));
+    let counter = Arc::clone(&delta_len);
+    let result = adapter(&fake, "k")
+        .turn(
+            context(),
+            request("gpt-x"),
+            Box::new(move |delta| *counter.lock().unwrap() += delta.len()),
+        )
+        .await
+        .unwrap();
+    assert_eq!(result.text, "");
+    assert_eq!(*delta_len.lock().unwrap(), padding);
 }
+
+// ---------------------------------------------------------------------------
+// SDK top-level error envelope
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn credentials_never_come_from_the_environment() {
-    let hostile = [
-        ("ANTHROPIC_API_KEY", "sk-ant-env-DIFFERENT-key"),
-        ("ANTHROPIC_AUTH_TOKEN", "sk-ant-oat-SECRET-from-env"),
-        (
-            "ANTHROPIC_CUSTOM_HEADERS",
-            "X-Corp-Gateway-Token: gw-secret",
-        ),
-        ("ANTHROPIC_BASE_URL", "http://127.0.0.1:1/elsewhere"),
-        ("OPENAI_API_KEY", "sk-openai-env-DIFFERENT-key"),
-        ("OPENAI_ADMIN_KEY", "sk-admin-env-SECRET"),
-        ("OPENAI_ORG_ID", "org-real"),
-        ("OPENAI_PROJECT_ID", "proj-real"),
-        ("OPENAI_CUSTOM_HEADERS", "X-Corp-Gateway-Token: gw-SECRET"),
-        ("OPENAI_BASE_URL", "http://127.0.0.1:1/elsewhere"),
-    ];
-    let restore = EnvRestore(
-        hostile
-            .iter()
-            .map(|(key, _)| (key.to_string(), std::env::var(key).ok()))
-            .collect(),
-    );
-    for (key, value) in hostile {
-        // SAFETY: serialized by ENV_LOCK and restored by `restore`.
-        unsafe { std::env::set_var(key, value) };
-    }
-
-    let fake = spawn_fake(vec![text_turn("hello")]).await;
-    fake.set_models(&["model-a"]);
-    let provider = Responses::new("openai", &provider_config(&fake.base, "cfg-key-0123")).unwrap();
-
-    let result = run_turn(&provider, request("gpt-x")).await.unwrap();
-    assert_eq!(result.text, "hello");
-    let ids: Vec<String> = ModelLister::list_models(&provider)
+async fn a_top_level_error_field_ends_the_stream() {
+    let fake = spawn_fake(vec![Scripted::Raw(
+        "data: {\"type\":\"response.output_text.delta\",\"error\":{\"message\":\"boom\"}}\n\n"
+            .to_string(),
+    )])
+    .await;
+    let error = run_turn(&adapter(&fake, "k"), request("gpt-x"))
         .await
-        .unwrap()
-        .into_iter()
-        .map(|model| model.id)
-        .collect();
-    assert_eq!(ids, vec!["model-a"]);
+        .unwrap_err();
     assert_eq!(
-        fake.request_count(),
-        2,
-        "the configured server must see exactly the turn and the model listing"
+        error.message,
+        "received error while streaming: {\"message\":\"boom\"}"
     );
-
-    let secrets = [
-        "sk-ant-env-DIFFERENT-key",
-        "sk-ant-oat-SECRET-from-env",
-        "gw-secret",
-        "sk-openai-env-DIFFERENT-key",
-        "sk-admin-env-SECRET",
-        "org-real",
-        "proj-real",
-        "gw-SECRET",
-    ];
-    for index in 0..2 {
-        let headers = fake.headers(index);
-        assert_eq!(
-            headers.get("authorization").map(String::as_str),
-            Some("Bearer cfg-key-0123")
-        );
-        for forbidden in [
-            "x-corp-gateway-token",
-            "openai-organization",
-            "openai-project",
-        ] {
-            assert!(
-                !headers.contains_key(forbidden),
-                "environment-derived header {forbidden} reached the wire"
-            );
-        }
-        for value in headers.values() {
-            for secret in secrets {
-                assert!(
-                    !value.contains(secret),
-                    "environment value {secret} leaked into a header"
-                );
-            }
-        }
-    }
-
-    drop(restore);
 }
+
+/// gjson's `Exists()` is true for an explicit null, so the SDK reports a
+/// null error field as an empty-message stream error instead of ignoring it.
+#[tokio::test]
+async fn a_present_null_error_field_ends_the_stream() {
+    let fake = spawn_fake(vec![Scripted::Raw(
+        "data: {\"type\":\"response.created\",\"error\":null}\n\n".to_string(),
+    )])
+    .await;
+    let error = run_turn(&adapter(&fake, "k"), request("gpt-x"))
+        .await
+        .unwrap_err();
+    assert_eq!(error.message, "received error while streaming: ");
+}
+
+// ---------------------------------------------------------------------------
+// Connection sharing
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn sequential_sessions_share_one_connection_with_their_own_keys() {
