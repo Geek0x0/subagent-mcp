@@ -6,6 +6,7 @@ pub mod patch;
 pub mod policy;
 pub mod provider;
 pub mod repo;
+pub mod sandbox;
 pub mod tools;
 pub mod util;
 
