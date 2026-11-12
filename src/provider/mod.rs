@@ -11,10 +11,12 @@
 //! header-only timeout, debug capture, upstream recorder, bounded
 //! drain-on-drop, and JSON replay helpers), and [`sse`] (a byte/line reader
 //! only; provider-specific framing state machines belong to the later adapter
-//! tasks). Task 10 adds the first adapter, [`chat_completions`].
+//! tasks). Task 10 adds the first adapter, [`chat_completions`]; Task 11 adds
+//! the [`responses`] adapter.
 
 pub mod chat_completions;
 pub mod factory;
+pub mod responses;
 pub mod sse;
 pub mod tls;
 pub mod transport;
@@ -25,6 +27,7 @@ pub mod types;
 pub use factory::{register_shutdown, shutdown};
 
 pub use chat_completions::ChatCompletions;
+pub use responses::Responses;
 
 pub use types::{
     Agent, AuthChecker, AuthStatus, DeltaSink, Message, ModelInfo, ModelLister, Provider,
