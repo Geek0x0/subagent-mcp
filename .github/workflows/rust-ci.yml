@@ -31,6 +31,11 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      # The fake app-server fixtures record the pinned codex-cli version. A live
+      # CLI version drift is a pre-release smoke failure, not a silent acceptance.
+      - name: codex fake fixture version
+        run: cargo test --test codex_fake -- --exact fixture_version_is_pinned
+
       # Differential tests are cfg-gated to Linux x86_64; on macOS/Windows they
       # report zero differential tests instead of trying to run the Linux
       # reference binary.
