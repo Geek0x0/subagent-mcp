@@ -23,13 +23,13 @@ const API_RESPONSES: &str = "responses";
 const API_MESSAGES: &str = "messages";
 const API_CODEX: &str = "codex-app-server";
 
-const EFFORT_VALUES: [&str; 8] = [
+pub const EFFORT_VALUES: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
 ];
 const EFFORT_VALUES_DISPLAY: &str = "[none minimal low medium high xhigh max ultra]";
 
 const DEFAULT_MAX_OUTPUT_TOKENS: i64 = 64000;
-const MAX_NUDGES_LIMIT: i64 = 10;
+pub const MAX_NUDGES_LIMIT: i64 = 10;
 
 const DEFAULT_AUTO_BASE_URL: &str = "https://api.typesafe.ai";
 const DEFAULT_AUTO_TIMEOUT_SECONDS: i64 = 20;
