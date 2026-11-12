@@ -622,8 +622,15 @@ fn differential_auto_selection_matches_jev_golden() {
 fn differential_codex_turn_matches_record_golden() {
     let _guard = SCENARIO_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let script = golden::fixture("codex/app-server-turn.sh");
-    let record_path = Path::new("/tmp/subagent-mcp-codex-app-server-record.jsonl").to_path_buf();
-    let _ = std::fs::remove_file(&record_path);
+    // Per-run record path (review finding 4): the script prefers
+    // FAKE_CODEX_RECORD and only falls back to its fixed /tmp file when the
+    // environment is scrubbed, so concurrent runs can never share a record.
+    // The dialer passes the parent environment through minus the scrub table,
+    // which never contains FAKE_CODEX_RECORD. The guard restores the previous
+    // value so no ambient variable outlives the scenario.
+    let record_dir = tempfile::tempdir().unwrap();
+    let record_path = record_dir.path().join("record.jsonl");
+    let _record_env = crate::support::EnvGuard::set("FAKE_CODEX_RECORD", record_path.as_os_str());
 
     let mut config = provider_config(Api::CodexAppServer, "");
     config.command = Some(script.to_str().unwrap().to_string());
@@ -681,7 +688,6 @@ fn differential_codex_turn_matches_record_golden() {
 
     // The recorded client-to-peer requests match the Go golden line for line.
     let record = std::fs::read_to_string(&record_path).expect("codex record exists");
-    let _ = std::fs::remove_file(&record_path);
     let got: Vec<Value> = record
         .lines()
         .filter(|line| !line.trim().is_empty())

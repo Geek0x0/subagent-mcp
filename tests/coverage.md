@@ -81,16 +81,23 @@ Rust coverage columns:
 
 ## Golden fixtures captured from the pinned binary (stand alone after Go deletion)
 
-- `tests/fixtures/mcp/*.jsonl` — complete Go output streams (responses +
-  `subagent/event` notifications in arrival order) for ten scenarios:
+- `tests/fixtures/mcp/*.jsonl` — complete Go output streams (responses and
+  `subagent/event` notifications in arrival order) for eleven scenarios:
   chat/responses/messages text turns, tool turn, files turn, patch turn,
-  nudge, budget refusal, mid-turn cancellation, auto (Jev) selection, and a
-  Codex app-server turn.
+  nudge, budget refusal, mid-turn cancellation, auto (Jev) selection, a Codex
+  app-server turn, and a progress turn captured with `_meta.progressToken`
+  (`chat-progress.jsonl`, whose `notifications/progress` frames — token,
+  per-call sequence, mapped message — are compared causally per call).
 - `tests/fixtures/wire/<scenario>/NN-*.json` — provider HTTP requests
   (method, path, headers, body) recorded by the mock during the same runs,
   plus `expected-tree.txt` for the files turn.
 - `tests/fixtures/rollout/<scenario>.jsonl` — rollout JSONL written by the Go
-  server for the same runs.
+  server for the same runs. All ten are compared live: the MCP replays in
+  `tests/differential/agent.rs` read the rollout file the server wrote under
+  `CODEX_HOME` — including the server-written `session_meta` line — after
+  each scenario, and `tests/differential/rollout.rs` additionally compares
+  the runner-level recorder output (with `session_meta` constructed at the
+  call site) for three scenarios.
 - `tests/fixtures/patch/` — the apply_patch case (patch text extracted from
   the captured wire request), the resulting tree with modes, and file
   contents.
@@ -103,11 +110,20 @@ Rust coverage columns:
 
 Volatile fields are normalized by `tests/differential/support/normalize.rs`
 (UUIDs, RFC 3339 timestamps, Go durations, PIDs, provider request IDs,
-versions, temp roots) plus the scenario-local extras documented in
-`tests/differential/support/golden.rs` (rollout `current_date`,
-`completed_at`, `cli_version`; timing values `duration_ms`/`ttft_ms`;
-transport-only headers `x-stainless-*`, `host`, `content-length`,
-`user-agent`, `accept-encoding`, `connection`, and an `accept: */*` stdlib
-default). Consecutive `agent_message_delta` events are collapsed within a
-turn before comparison, progress is compared per call, and global
-cross-session interleaving is never compared.
+versions, temp roots — in string values and in object keys, since e.g. the
+rollout `patch_apply_end` payload keys its `changes` map by file path) plus
+the scenario-local extras documented in `tests/differential/support/golden.rs`
+(rollout `current_date`, `completed_at`, `cli_version`; timing values
+`duration_ms`/`ttft_ms`; transport-only headers `x-stainless-*`, `host`,
+`content-length`, `user-agent`, `accept-encoding`, `connection`, and an
+`accept: */*` stdlib default). Consecutive `agent_message_delta` events are
+collapsed within a turn before comparison, progress is compared per call via
+the `chat-progress` replay, and global cross-session interleaving is never
+compared.
+
+Known divergence documented by the Codex MCP replay: Go 0.13.1 emits no
+`subagent/event` notifications for Codex sessions (verified live against the
+pinned binary), while the Rust port forwards the runner events. The Codex
+golden comparison pins exactly the frames the golden captured (initialize
+response and tools/call result); the extra Rust notifications are a parity
+divergence, not asserted behavior.

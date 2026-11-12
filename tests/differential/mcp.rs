@@ -176,13 +176,11 @@ fn assert_mcp_matches(requests: &[Value]) {
 }
 
 #[test]
-
 fn differential_mcp_initialize_matches_reference() {
     assert_mcp_matches(&[initialize_request()]);
 }
 
 #[test]
-
 fn differential_mcp_tools_list_matches_reference() {
     assert_mcp_matches(&[
         initialize_request(),
@@ -191,7 +189,6 @@ fn differential_mcp_tools_list_matches_reference() {
 }
 
 #[test]
-
 fn differential_mcp_unknown_tool_matches_reference() {
     assert_mcp_matches(&[
         initialize_request(),

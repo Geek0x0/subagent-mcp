@@ -7,7 +7,7 @@
 //! keys the shared normalizer does not own), and provides the per-turn event
 //! extraction with the required `agent_message_delta` collapsing.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value};
 
@@ -225,10 +225,94 @@ pub fn golden_temp_roots(value: &Value, out: &mut Vec<String>) {
             }
         }
         Value::Object(object) => {
+            // Keys can carry temp-rooted paths too (e.g. the rollout
+            // `patch_apply_end` `changes` map is keyed by file path).
+            for key in object.keys() {
+                golden_temp_roots(&Value::String(key.clone()), out);
+            }
             for item in object.values() {
                 golden_temp_roots(item, out);
             }
         }
         _ => {}
     }
+}
+
+/// Find the one rollout file under `home` whose name ends with
+/// `-{thread_id}.jsonl` (the server names them `rollout-<ts>-<thread>.jsonl`).
+pub fn find_rollout(home: &Path, thread_id: &str) -> PathBuf {
+    fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
+        if let Ok(entries) = std::fs::read_dir(dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    collect(&path, out);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                    out.push(path);
+                }
+            }
+        }
+    }
+    let mut all = Vec::new();
+    collect(home, &mut all);
+    let suffix = format!("-{thread_id}.jsonl");
+    let matches: Vec<_> = all
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .map(|name| name.to_string_lossy().ends_with(&suffix))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert_eq!(matches.len(), 1, "exactly one rollout file for {thread_id}");
+    matches[0].clone()
+}
+
+/// Read a rollout file as parsed JSON lines, skipping empty lines.
+pub fn read_rollout(path: &Path) -> Vec<Value> {
+    std::fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("read rollout {}: {error}", path.display()))
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_str(line).expect("rollout line parses"))
+        .collect()
+}
+
+/// Compare live rollout lines (parsed from the recorder's file) to the golden
+/// rollout JSONL, normalized. The live side gets the live home and cwd as its
+/// temp roots; the golden side every `/tmp` root the capture left inside it.
+pub fn assert_rollout_matches(got_home: &Path, got_cwd: &Path, got: Vec<Value>, golden_rel: &str) {
+    let golden = read_jsonl(golden_rel);
+    let mut roots = Vec::new();
+    for line in &golden {
+        golden_temp_roots(line, &mut roots);
+    }
+    let mut golden_context = NormalizeContext::new();
+    for root in roots {
+        golden_context = golden_context.with_temp_root(root);
+    }
+    let rust_context = NormalizeContext::new()
+        .with_temp_root(got_home)
+        .with_temp_root(got_cwd);
+    let got: Vec<Value> = got
+        .into_iter()
+        .map(|line| normalize_value(blank_timing(line), &rust_context))
+        .collect();
+    let golden: Vec<Value> = golden
+        .into_iter()
+        .map(|line| normalize_value(blank_timing(line), &golden_context))
+        .collect();
+    assert_eq!(got, golden, "rollout lines differ from {golden_rel}");
+}
+
+/// Find the rollout file the server wrote for `thread_id` under `home` and
+/// compare it to the golden rollout JSONL.
+pub fn assert_rollout_for_thread_matches(
+    home: &Path,
+    cwd: &Path,
+    thread_id: &str,
+    golden_rel: &str,
+) {
+    let path = find_rollout(home, thread_id);
+    assert_rollout_matches(home, cwd, read_rollout(&path), golden_rel);
 }

@@ -6,13 +6,17 @@
 //! test constructs that one line at the call site (exactly as Go's
 //! `internal/server/server.go` does; the capture cwds are not git repos, so
 //! no `git` object is present). All other lines come from the runner with the
-//! recorder attached, as in production.
+//! recorder attached, as in production. The server-written `session_meta` is
+//! additionally compared end-to-end by the MCP replays in
+//! `tests/differential/agent.rs`, which read the rollout file the Rust server
+//! actually wrote, so this fabricated line is belt-and-braces for the runner
+//! level only.
 //!
 //! Volatile fields (timestamps, `current_date`, `started_at`/`completed_at`
 //! epoch seconds, `cli_version`, durations, and cwd paths) are normalized to
 //! placeholders before the parsed lines are compared.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -29,8 +33,8 @@ use subagent_mcp::rollout::RolloutRecorder;
 use subagent_mcp::util::approval::{ApprovalRequest, Approver};
 use subagent_mcp::util::run::RunContext;
 
-use crate::support::golden::{self, read_jsonl};
-use crate::support::normalize::NormalizeContext;
+use crate::support::EnvGuard;
+use crate::support::golden;
 
 const TEXT_STOP: &str = include_str!("../fixtures/sse/chat/text_stop_usage.sse");
 const EMPTY_STOP: &str = include_str!("../fixtures/sse/chat/empty_stop_usage.sse");
@@ -115,8 +119,10 @@ fn run_with_rollout(
 
     // The recorder resolves the rollout root from CODEX_HOME, exactly like
     // Go's rollout.Open. SAFETY: env mutation is serialized under
-    // SCENARIO_LOCK for the whole test.
-    unsafe { std::env::set_var("CODEX_HOME", home.path()) };
+    // SCENARIO_LOCK for the whole test, and the guard restores the previous
+    // value so no ambient CODEX_HOME leaks to other scenarios (review
+    // finding 5).
+    let _codex_home = EnvGuard::set("CODEX_HOME", home.path());
 
     let thread_id = uuid::Uuid::new_v4().to_string();
     let recorder = RolloutRecorder::create(
@@ -172,46 +178,8 @@ fn run_with_rollout(
             .expect("run succeeds");
     });
 
-    let path = find_rollout(home.path(), &thread_id);
-    (home, cwd, thread_id, read_lines(&path))
-}
-
-fn find_rollout(home: &Path, thread_id: &str) -> PathBuf {
-    let mut all = Vec::new();
-    collect_jsonl(home, &mut all);
-    let suffix = format!("-{thread_id}.jsonl");
-    let matches: Vec<_> = all
-        .into_iter()
-        .filter(|path| {
-            path.file_name()
-                .map(|name| name.to_string_lossy().ends_with(&suffix))
-                .unwrap_or(false)
-        })
-        .collect();
-    assert_eq!(matches.len(), 1, "exactly one rollout file for {thread_id}");
-    matches[0].clone()
-}
-
-fn collect_jsonl(dir: &Path, out: &mut Vec<PathBuf>) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                collect_jsonl(&path, out);
-            } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
-                out.push(path);
-            }
-        }
-    }
-}
-
-fn read_lines(path: &Path) -> Vec<Value> {
-    std::fs::read_to_string(path)
-        .unwrap()
-        .lines()
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_str(line).expect("rollout line parses"))
-        .collect()
+    let path = golden::find_rollout(home.path(), &thread_id);
+    (home, cwd, thread_id, golden::read_rollout(&path))
 }
 
 /// Build `session_meta` exactly as Go's server.go does for a non-auto
@@ -239,38 +207,12 @@ fn with_session_meta(lines: Vec<Value>, thread_id: &str, cwd: &Path) -> Vec<Valu
     out
 }
 
-fn assert_rollout_matches(got_home: &Path, got_cwd: &Path, got: Vec<Value>, golden_rel: &str) {
-    let golden = read_jsonl(golden_rel);
-    // The golden carries its own (deleted) temp roots; collect them so both
-    // sides normalize to `<tmp>` in their own contexts.
-    let mut roots = Vec::new();
-    for line in &golden {
-        golden::golden_temp_roots(line, &mut roots);
-    }
-    let mut golden_context = NormalizeContext::new();
-    for root in roots {
-        golden_context = golden_context.with_temp_root(root);
-    }
-    let rust_context = NormalizeContext::new()
-        .with_temp_root(got_home)
-        .with_temp_root(got_cwd);
-    let got: Vec<Value> = got
-        .into_iter()
-        .map(|line| golden::normalize_value(golden::blank_timing(line), &rust_context))
-        .collect();
-    let golden: Vec<Value> = golden
-        .into_iter()
-        .map(|line| golden::normalize_value(golden::blank_timing(line), &golden_context))
-        .collect();
-    assert_eq!(got, golden, "rollout lines differ from {golden_rel}");
-}
-
 #[test]
 fn differential_rollout_chat_turn_matches_golden() {
     let _guard = SCENARIO_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let (home, cwd, thread_id, lines) =
         run_with_rollout(&[TEXT_STOP.to_string()], "hi", 0, Sandbox::ReadOnly, &[]);
-    assert_rollout_matches(
+    golden::assert_rollout_matches(
         home.path(),
         cwd.path(),
         with_session_meta(lines, &thread_id, cwd.path()),
@@ -288,7 +230,7 @@ fn differential_rollout_chat_nudge_matches_golden() {
         Sandbox::ReadOnly,
         &[],
     );
-    assert_rollout_matches(
+    golden::assert_rollout_matches(
         home.path(),
         cwd.path(),
         with_session_meta(lines, &thread_id, cwd.path()),
@@ -306,7 +248,7 @@ fn differential_rollout_chat_tool_turn_matches_golden() {
         Sandbox::WorkspaceWrite,
         &[("a.txt", "alpha\n"), ("src/b.txt", "beta\n")],
     );
-    assert_rollout_matches(
+    golden::assert_rollout_matches(
         home.path(),
         cwd.path(),
         with_session_meta(lines, &thread_id, cwd.path()),

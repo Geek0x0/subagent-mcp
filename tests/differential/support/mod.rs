@@ -10,6 +10,7 @@ pub mod mock_http;
 pub mod normalize;
 
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
@@ -187,6 +188,40 @@ pub fn run_cli(binary: &Path, args: &[&str], envs: &[(&str, &str)], home: &Path)
     command
         .output()
         .unwrap_or_else(|error| panic!("failed to run {}: {error}", binary.display()))
+}
+
+/// Set `name` to `value` for the scope of this guard, restoring the previous
+/// value (or its absence) on drop.
+///
+/// Task 27 review finding: `rollout.rs` mutated `CODEX_HOME` process-wide and
+/// never restored it. Every env mutation in the differential suite now goes
+/// through this guard, so a later `CODEX_HOME`-respecting scenario cannot
+/// become a heisenbug. SAFETY: callers serialize environment mutation behind
+/// their module's `SCENARIO_LOCK`.
+pub struct EnvGuard {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvGuard {
+    pub fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = env::var_os(name);
+        // SAFETY: callers serialize environment mutation behind a scenario lock.
+        unsafe { env::set_var(name, value) };
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: same lock discipline as `EnvGuard::set`.
+        unsafe {
+            match &self.previous {
+                Some(value) => env::set_var(self.name, value),
+                None => env::remove_var(self.name),
+            }
+        }
+    }
 }
 
 /// A newline-delimited JSON-RPC MCP process.

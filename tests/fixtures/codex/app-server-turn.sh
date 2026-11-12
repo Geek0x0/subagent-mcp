@@ -12,9 +12,11 @@
 # Scripted turn: one agentMessage ("hello from codex") delivered as two
 # item/agentMessage/delta events plus the completed item, then turn/completed.
 IFS= read -r line || exit 0
-# The pool dialer scrubs the child environment, so the record path is a fixed
-# well-known file under /tmp rather than an env var. The differential tests
-# delete it before and after each run and serialize codex scenarios on a mutex.
+# The differential tests give the record a per-run unique path through
+# FAKE_CODEX_RECORD (the dialer passes the parent environment through minus
+# the scrub table, which never contains that name). The fixed path is only a
+# fallback for environments that scrub everything, such as the pinned Go
+# binary's pool dialer; the tests serialize codex scenarios on a mutex.
 RECORD="${FAKE_CODEX_RECORD:-/tmp/subagent-mcp-codex-app-server-record.jsonl}"
 
 while true; do
