@@ -18,16 +18,17 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use serde_json::json;
+use serde_json::{Value, json};
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::agent::session::{AgentError, Emitter, SessionLease};
 use crate::policy::{ApprovalPolicy, Sandbox};
 use crate::provider::{
-    DeltaSink, Message, ProviderError, Role, ToolCall, ToolSpec, TurnRequest, TurnResult,
+    DeltaSink, Message, ProviderError, Role, ThreadCallbacks, ToolCall, ToolSpec, TurnRequest,
+    TurnResult, Usage,
 };
-use crate::util::approval::Approver;
+use crate::util::approval::{ApprovalRequest, Approver};
 use crate::util::duration::format_go_duration;
 use crate::util::run::RunContext;
 
@@ -262,6 +263,32 @@ fn stop_cause(ctx: &RunContext, deadline_text: Option<&str>) -> Option<String> {
     None
 }
 
+/// Go `recordThreadEvent`'s numeric reader: a token_count event from a
+/// delegated thread carries JSON numbers, never a typed [`Usage`].
+fn int_field(event: &Value, key: &str) -> i64 {
+    event.get(key).and_then(Value::as_i64).unwrap_or(0)
+}
+
+/// The delegated-thread event sink. Named to keep the closure type out of the
+/// run path (the same shape as `ThreadCallbacks::emit`).
+type ThreadEmit = Arc<dyn Fn(&str, Value) + Send + Sync>;
+
+/// Replace the provider's thread id on an approval with the session id, which
+/// is what the MCP client knows as `threadId`. Go's provider approval type has
+/// no thread id; the runner supplies `s.ID` at this boundary.
+struct ThreadApprover {
+    inner: Arc<dyn Approver>,
+    thread_id: String,
+}
+
+#[async_trait::async_trait]
+impl Approver for ThreadApprover {
+    async fn approve(&self, ctx: &RunContext, mut req: ApprovalRequest) -> bool {
+        req.thread_id.clone_from(&self.thread_id);
+        self.inner.approve(ctx, req).await
+    }
+}
+
 impl Runner {
     /// Go `RunLocked` for a session the caller already holds through
     /// `Manager.Acquire`. Sets `last_used` at the end of the run.
@@ -301,6 +328,7 @@ impl Runner {
         let reasoning_effort = opts.reasoning_effort.clone();
         let sandbox = opts.sandbox;
         let approval = opts.approval;
+        let thread = opts.thread.clone();
         let root_paths = lease.root_paths.clone();
 
         let RunContext {
@@ -311,6 +339,94 @@ impl Runner {
             run_deadline.map(|d| format!("run deadline of {} reached", format_go_duration(d)));
         let deadline = combine_deadline(caller_deadline, run_deadline);
         let ctx = RunContext { cancel, deadline };
+
+        if let Some(thread) = thread {
+            // A delegated thread spends the same budget as the built-in loop,
+            // so the check runs before the thread is handed the prompt. Both
+            // ceilings are cumulative, which is why a thread that reaches one
+            // stays stopped.
+            if let Some(msg) = budget_error(
+                max_history_bytes,
+                lease.history_bytes,
+                max_total_tokens,
+                lease.total_usage.total,
+            ) {
+                hooks
+                    .emitter
+                    .emit(&thread_id, json!({"type": "error", "message": &msg}));
+                if let Some(r) = &mut lease.rollout {
+                    r.record_error(&msg);
+                }
+                return Err(AgentError { message: msg });
+            }
+
+            // A delegated thread reports usage through token_count events and
+            // has no TurnResult to take it from. Collect them while it runs,
+            // then account them (even on failure) so the token budget and any
+            // attached rollout stay complete.
+            let usage_events = Arc::new(Mutex::new(Vec::new()));
+            let recorded = usage_events.clone();
+            let emitter = hooks.emitter.clone();
+            let emit_thread_id = thread_id.clone();
+            let emit: ThreadEmit = Arc::new(move |_kind, event| {
+                if event.get("type").and_then(Value::as_str) == Some("token_count") {
+                    recorded.lock().unwrap().push(event.clone());
+                }
+                emitter.emit(&emit_thread_id, event);
+            });
+            let approver: Arc<dyn Approver> = Arc::new(ThreadApprover {
+                inner: hooks.approver.clone(),
+                thread_id: thread_id.clone(),
+            });
+            let outcome = thread
+                .run(
+                    ctx.clone(),
+                    prompt.to_string(),
+                    effort_sent.clone(),
+                    ThreadCallbacks {
+                        emit,
+                        approve: approver,
+                    },
+                )
+                .await;
+
+            for event in usage_events.lock().unwrap().iter() {
+                let last = Usage {
+                    input: int_field(event, "prompt_tokens"),
+                    cached: 0,
+                    output: int_field(event, "completion_tokens"),
+                    reasoning: 0,
+                    total: int_field(event, "total_tokens"),
+                };
+                lease.total_usage.input += last.input;
+                lease.total_usage.cached += last.cached;
+                lease.total_usage.output += last.output;
+                lease.total_usage.reasoning += last.reasoning;
+                lease.total_usage.total += last.total;
+                let total = lease.total_usage.clone();
+                if let Some(r) = &mut lease.rollout {
+                    r.record_thread_token_count(&last, &total);
+                }
+            }
+
+            return match outcome {
+                Ok(text) => Ok(text),
+                Err(error) => {
+                    let message = if ctx.cancel.is_cancelled() || ctx.deadline_reason().is_some() {
+                        stop_cause(&ctx, deadline_text.as_deref()).unwrap_or(error.message)
+                    } else {
+                        error.message
+                    };
+                    hooks
+                        .emitter
+                        .emit(&thread_id, json!({"type": "error", "message": &message}));
+                    if let Some(r) = &mut lease.rollout {
+                        r.record_error(&message);
+                    }
+                    Err(AgentError { message })
+                }
+            };
+        }
 
         hooks
             .emitter

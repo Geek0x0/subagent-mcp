@@ -790,36 +790,42 @@ async fn candidate_descriptions_use_defaults_and_config() {
     assert!(description("c5").contains("Z.ai latest GLM"));
 }
 
+fn codex_provider_config() -> ProviderConfig {
+    ProviderConfig {
+        api: Api::CodexAppServer,
+        base_url: String::new(),
+        env_key: None,
+        key: None,
+        command: None,
+        default_model: "gpt-6.1-terra".into(),
+        models: vec![ModelConfig {
+            id: "gpt-6.1-terra".into(),
+            description: String::new(),
+        }],
+        effort_map: BTreeMap::new(),
+        max_output_tokens: None,
+        max_nudges: None,
+        extra_body: None,
+    }
+}
+
 #[tokio::test]
-async fn codex_candidates_are_unavailable_in_24a() {
+async fn codex_single_candidate_is_skipped_without_a_judge() {
     let _env = env_guard();
     let mut config = Config {
         path: PathBuf::from("/test/config.toml"),
         providers: BTreeMap::new(),
         auto: None,
     };
-    config.providers.insert(
-        "codex".into(),
-        ProviderConfig {
-            api: Api::CodexAppServer,
-            base_url: String::new(),
-            env_key: None,
-            key: None,
-            command: None,
-            default_model: "gpt-6.1-terra".into(),
-            models: vec![ModelConfig {
-                id: "gpt-6.1-terra".into(),
-                description: String::new(),
-            }],
-            effort_map: BTreeMap::new(),
-            max_output_tokens: None,
-            max_nudges: None,
-            extra_body: None,
-        },
-    );
+    config
+        .providers
+        .insert("codex".into(), codex_provider_config());
     config.auto = Some(auto_config("http://127.0.0.1:1"));
+    // Constructing the tools registers the Codex adapter, making the
+    // configured candidate available.
+    let _tools = tools(config.clone());
     let manager = SessionManager::new();
-    let error = resolve_auto(
+    let selection = resolve_auto(
         &plain_ctx(),
         &config,
         &manager,
@@ -827,9 +833,76 @@ async fn codex_candidates_are_unavailable_in_24a() {
         &cwd().to_path_buf(),
     )
     .await
-    .unwrap_err();
-    assert!(error.message.contains("no provider is usable"));
-    assert!(error.message.contains("codex"));
+    .unwrap();
+    assert_eq!(selection.provider, "codex");
+    assert_eq!(selection.model, "gpt-6.1-terra");
+    assert!(selection.skipped);
+    assert!(selection.judge_model.is_none());
+    assert!(selection.confidence.is_none());
+    assert!(selection.input_tokens.is_none());
+    assert!(selection.output_tokens.is_none());
+    assert!(selection.omitted.is_empty());
+}
+
+#[tokio::test]
+async fn codex_candidate_can_be_chosen_by_the_judge() {
+    let _env = env_guard();
+    let mock = spawn_mock(Reply::Response {
+        status: 200,
+        body: json!({
+            "model": "jev-1.14.0",
+            "answers": {
+                "model": {
+                    "type": "choice",
+                    "choice": "c3",
+                    "confidence": 0.87,
+                    "probabilities": {"c1": 0.05, "c2": 0.08, "c3": 0.87}
+                }
+            },
+            "usage": {"input_tokens": 40, "output_tokens": 4}
+        })
+        .to_string(),
+    })
+    .await;
+    let mut config = test_config(vec![(
+        "alpha",
+        Arc::new(StubProvider::with_turns("alpha", vec![text_turn("ok")])),
+    )]);
+    config
+        .providers
+        .insert("codex".into(), codex_provider_config());
+    config.auto = Some(auto_config(&mock.base));
+    let _tools = tools(config.clone());
+    let manager = SessionManager::new();
+    let selection = resolve_auto(
+        &plain_ctx(),
+        &config,
+        &manager,
+        "task",
+        &cwd().to_path_buf(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(selection.provider, "codex");
+    assert_eq!(selection.model, "gpt-6.1-terra");
+    assert!(!selection.skipped);
+    assert_eq!(selection.judge_model.as_deref(), Some("jev-1.14.0"));
+    assert_eq!(selection.confidence, Some(0.87));
+    assert_eq!(selection.input_tokens, Some(40));
+    assert_eq!(selection.output_tokens, Some(4));
+    assert!(selection.omitted.is_empty());
+
+    let (request, _) = recorded(mock).await;
+    let criteria = request.json()["questions"]["model"]["criteria"]
+        .as_object()
+        .unwrap()
+        .clone();
+    assert!(
+        criteria
+            .values()
+            .any(|description| description.as_str().unwrap().contains("codex")),
+        "criteria = {criteria:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1262,10 +1335,10 @@ async fn explicit_model_still_needs_provider_under_auto() {
 #[test]
 fn factory_new_works_for_the_http_apis() {
     let _env = env_guard();
-    // Constructing the tools registers chat-completions, responses, and
-    // messages. This binary overrides responses with a test dispatcher, so
-    // assert the two real wrappers that remain; chat-completions is exercised
-    // by the Task 24B wire tests and the mcp_tools binary.
+    // Constructing the tools registers chat-completions, responses, messages,
+    // and Codex. This binary overrides responses with a test dispatcher, so
+    // assert the real wrappers that remain; `mcp_tools.rs` constructs the real
+    // `Responses::new` and exercises the registered Codex adapter.
     let _tools = tools(test_config(vec![(
         "alpha",
         Arc::new(StubProvider::new("alpha")),
@@ -1293,4 +1366,5 @@ fn factory_new_works_for_the_http_apis() {
     assert!(factory::lookup(Api::ChatCompletions.as_str()).is_some());
     assert!(factory::lookup(Api::Messages.as_str()).is_some());
     assert!(factory::lookup(Api::Responses.as_str()).is_some());
+    assert!(factory::lookup(Api::CodexAppServer.as_str()).is_some());
 }

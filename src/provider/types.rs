@@ -107,7 +107,7 @@ pub enum TransportKind {
 }
 
 #[async_trait::async_trait]
-pub trait Provider: Send + Sync {
+pub trait Provider: Send + Sync + std::any::Any {
     fn name(&self) -> &str;
     async fn turn(
         &self,
