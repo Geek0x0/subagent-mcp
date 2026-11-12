@@ -12,9 +12,14 @@
 //! `[DONE]` as ordinary data, and a non-empty `stop_reason` as the terminal
 //! signal (`message_stop` is not required).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use reqwest::header::{ACCEPT, HeaderMap, HeaderValue};
 use reqwest::{StatusCode, Url};
 use serde_json::{Map, Value, json};
+use tokio_util::sync::CancellationToken;
 
 use crate::config::ProviderConfig;
 use crate::provider::sse::SSE_MAX_LINE;
@@ -28,9 +33,43 @@ use crate::util::run::RunContext;
 /// Bounds `pause_turn` re-requests within one turn (Go `maxPauseContinuations`).
 pub const MAX_PAUSE_CONTINUATIONS: usize = 5;
 
+/// Go SDK `MaxRetries: 2`: three total attempts for a retryable request.
+pub const MAX_RETRIES: usize = 2;
+
 const MESSAGES_PATH: &str = "v1/messages";
 const MODELS_PATH: &str = "v1/models";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+/// A retry delay function `(attempt, Retry-After) -> Duration`. Tests override
+/// it so a retryable response does not really sleep.
+pub type RetryDelay = Arc<dyn Fn(usize, Option<Duration>) -> Duration + Send + Sync>;
+
+static RETRY_SEED: AtomicU64 = AtomicU64::new(0);
+
+/// Go SDK `retryDelay`: the server's `Retry-After` when present, otherwise
+/// `0.5s * 2^attempt` capped at 8s with up to a quarter of it jittered away. A
+/// cheap time+seed mix stands in for `math/rand` (no `rand` dependency).
+pub fn default_retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
+    if let Some(retry_after) = retry_after {
+        return retry_after;
+    }
+    let max_delay = Duration::from_secs(8);
+    let base = Duration::from_millis(500).saturating_mul(1u32 << attempt.min(4) as u32);
+    let delay = base.min(max_delay);
+    let quarter = delay / 4;
+    if quarter.is_zero() {
+        return delay;
+    }
+    let span = quarter.as_nanos() as u64 + 1;
+    let seed = RETRY_SEED.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed)
+        ^ u64::from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos(),
+        );
+    delay - Duration::from_nanos(seed % span)
+}
 
 /// Anthropic Messages provider.
 pub struct Messages {
@@ -41,6 +80,7 @@ pub struct Messages {
     cfg: ProviderConfig,
     api_key: String,
     max_tokens: i64,
+    retry_delay: RetryDelay,
 }
 
 impl Messages {
@@ -69,7 +109,13 @@ impl Messages {
             max_tokens: cfg.max_output_tokens.unwrap_or(0),
             cfg: cfg.clone(),
             api_key,
+            retry_delay: Arc::new(default_retry_delay),
         })
+    }
+
+    /// Override the retry delay (tests use this so retries do not really sleep).
+    pub fn set_retry_delay(&mut self, delay: RetryDelay) {
+        self.retry_delay = delay;
     }
 
     /// Resolve an API path the way the Go SDK does: relative to the configured
@@ -106,6 +152,106 @@ impl Messages {
         Ok(headers)
     }
 
+    /// Send the turn request with the Go SDK retry policy (`MaxRetries: 2`):
+    /// 408/409/429/5xx, `x-should-retry: true`, and connection errors retry;
+    /// other 4xx and cancellation/deadline do not.
+    async fn send_json_with_retry(
+        &self,
+        ctx: &RunContext,
+        url: &Url,
+        headers: &HeaderMap,
+        body: &[u8],
+    ) -> Result<PooledResponse, ProviderError> {
+        let mut attempt = 0usize;
+        loop {
+            if let Some(reason) = context_ended(ctx) {
+                return Err(ProviderError {
+                    message: reason.to_string(),
+                });
+            }
+            let outcome = tokio::select! {
+                response = self.client.execute_json(url.clone(), headers.clone(), body) => {
+                    match response {
+                        Ok(response) => self.classify(response).await,
+                        Err(error) => Err(AttemptError::Connection(error.message)),
+                    }
+                }
+                _ = ctx.cancel.cancelled() => Err(AttemptError::Context("context canceled")),
+                _ = wait_deadline(ctx.deadline) => {
+                    Err(AttemptError::Context("context deadline exceeded"))
+                }
+            };
+            match outcome {
+                Ok(response) => return Ok(response),
+                Err(failure) => {
+                    let delay = next_retry("POST", url, attempt, failure, &self.retry_delay)?;
+                    wait_for_backoff(ctx, delay).await?;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// Send a `GET` request (model listing) with the same retry policy.
+    async fn send_get_with_retry(
+        &self,
+        ctx: &RunContext,
+        url: &Url,
+        headers: &HeaderMap,
+    ) -> Result<PooledResponse, ProviderError> {
+        let mut attempt = 0usize;
+        loop {
+            if let Some(reason) = context_ended(ctx) {
+                return Err(ProviderError {
+                    message: reason.to_string(),
+                });
+            }
+            let outcome = {
+                let mut request = reqwest::Request::new(reqwest::Method::GET, url.clone());
+                *request.headers_mut() = headers.clone();
+                tokio::select! {
+                    response = self.client.execute(request) => {
+                        match response {
+                            Ok(response) => self.classify(response).await,
+                            Err(error) => Err(AttemptError::Connection(error.message)),
+                        }
+                    }
+                    _ = ctx.cancel.cancelled() => Err(AttemptError::Context("context canceled")),
+                    _ = wait_deadline(ctx.deadline) => {
+                        Err(AttemptError::Context("context deadline exceeded"))
+                    }
+                }
+            };
+            match outcome {
+                Ok(response) => return Ok(response),
+                Err(failure) => {
+                    let delay = next_retry("GET", url, attempt, failure, &self.retry_delay)?;
+                    wait_for_backoff(ctx, delay).await?;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    /// A 2xx response is returned as-is; anything else is drained and reported
+    /// as a status failure so the retry loop can classify it.
+    async fn classify(&self, mut response: PooledResponse) -> Result<PooledResponse, AttemptError> {
+        let status = response
+            .status()
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+        if status.is_success() {
+            return Ok(response);
+        }
+        let headers = response.headers().cloned().unwrap_or_default();
+        let body = read_body(&mut response).await;
+        response.close().await;
+        Err(AttemptError::Status {
+            status,
+            headers,
+            body,
+        })
+    }
+
     /// Accumulate one message from the SSE stream. `on_delta` receives text
     /// deltas as they arrive.
     async fn stream(
@@ -120,26 +266,10 @@ impl Messages {
         })?;
         let headers = self.headers()?;
 
-        let mut response = tokio::select! {
-            response = self.client.execute_json(url.clone(), headers, &body) => response?,
-            _ = ctx.cancel.cancelled() => {
-                return Err(ProviderError { message: "context canceled".to_string() });
-            }
-            _ = wait_deadline(ctx.deadline) => {
-                return Err(ProviderError { message: "context deadline exceeded".to_string() });
-            }
-        };
-
-        let status = response
-            .status()
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-        if !status.is_success() {
-            let body = read_body(&mut response).await;
-            response.close().await;
-            return Err(ProviderError {
-                message: api_error("POST", &url, status, &body),
-            });
-        }
+        let mut response = self
+            .send_json_with_retry(ctx, &url, &headers, &body)
+            .await?;
+        let status = response.status().unwrap_or(StatusCode::OK);
 
         let mut accumulator = Accumulator::default();
         let mut framer = Framer::default();
@@ -251,6 +381,13 @@ impl Provider for Messages {
 #[async_trait::async_trait]
 impl ModelLister for Messages {
     async fn list_models(&self) -> Result<Vec<ModelInfo>, ProviderError> {
+        // The trait carries no RunContext, so retries run with a context that
+        // can never be cancelled (Go passes the caller's ctx).
+        let ctx = RunContext {
+            cancel: CancellationToken::new(),
+            deadline: None,
+        };
+        let headers = self.headers()?;
         let mut models = Vec::new();
         let mut after: Option<String> = None;
         loop {
@@ -258,26 +395,14 @@ impl ModelLister for Messages {
             if let Some(after) = &after {
                 url.query_pairs_mut().append_pair("after_id", after);
             }
-            let mut request = reqwest::Request::new(reqwest::Method::GET, url.clone());
-            *request.headers_mut() = self.headers()?;
-
-            let mut response =
-                self.client
-                    .execute(request)
-                    .await
-                    .map_err(|error| ProviderError {
-                        message: format!("list models: {}", error.message),
-                    })?;
-            let status = response
-                .status()
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let mut response = self
+                .send_get_with_retry(&ctx, &url, &headers)
+                .await
+                .map_err(|error| ProviderError {
+                    message: format!("list models: {}", error.message),
+                })?;
             let body = read_body(&mut response).await;
             response.close().await;
-            if !status.is_success() {
-                return Err(ProviderError {
-                    message: format!("list models: {}", api_error("GET", &url, status, &body)),
-                });
-            }
             let page: Value = serde_json::from_slice(&body).map_err(|error| ProviderError {
                 message: format!("list models: {error}"),
             })?;
@@ -1082,6 +1207,140 @@ async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
     }
 }
 
+// --- Retry policy (Go SDK requestconfig) -----------------------------------
+
+/// One failed request attempt, classified for the retry decision.
+enum AttemptError {
+    /// Cancellation or the run deadline: never retried.
+    Context(&'static str),
+    /// A transport/connection failure: retried (Go `res == nil`).
+    Connection(String),
+    /// A non-2xx response; retryability comes from the status and headers.
+    Status {
+        status: StatusCode,
+        headers: HeaderMap,
+        body: Vec<u8>,
+    },
+}
+
+impl AttemptError {
+    fn retryable(&self) -> bool {
+        match self {
+            AttemptError::Context(_) => false,
+            AttemptError::Connection(_) => true,
+            AttemptError::Status {
+                status, headers, ..
+            } => should_retry(status.as_u16(), headers),
+        }
+    }
+
+    fn retry_after(&self) -> Option<Duration> {
+        match self {
+            AttemptError::Status { headers, .. } => parse_retry_after(headers),
+            _ => None,
+        }
+    }
+
+    fn into_error(self, method: &str, url: &Url) -> ProviderError {
+        match self {
+            AttemptError::Context(reason) => ProviderError {
+                message: reason.to_string(),
+            },
+            AttemptError::Connection(message) => ProviderError { message },
+            AttemptError::Status { status, body, .. } => ProviderError {
+                message: api_error(method, url, status, &body),
+            },
+        }
+    }
+}
+
+/// The delay before the next attempt, or the final error once the attempt is
+/// not retryable or the `MaxRetries` budget is spent.
+fn next_retry(
+    method: &str,
+    url: &Url,
+    attempt: usize,
+    failure: AttemptError,
+    retry_delay: &RetryDelay,
+) -> Result<Duration, ProviderError> {
+    if !failure.retryable() || attempt >= MAX_RETRIES {
+        return Err(failure.into_error(method, url));
+    }
+    Ok(retry_delay(attempt, failure.retry_after()))
+}
+
+/// Go SDK `shouldRetry`: explicit `x-should-retry` wins over the status.
+fn should_retry(status: u16, headers: &HeaderMap) -> bool {
+    if let Some(value) = headers
+        .get("x-should-retry")
+        .and_then(|value| value.to_str().ok())
+    {
+        if value == "true" {
+            return true;
+        }
+        if value == "false" {
+            return false;
+        }
+    }
+    status == 408 || status == 409 || status == 429 || status >= 500
+}
+
+/// Go SDK `parseRetryAfterHeader`: `Retry-After-Ms` first, then `Retry-After`
+/// (fractional seconds or an RFC 1123 HTTP date).
+fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(value) = value("retry-after-ms")
+        && let Ok(milliseconds) = value.parse::<f64>()
+    {
+        return Some(Duration::from_secs_f64(milliseconds / 1000.0).max(Duration::ZERO));
+    }
+    let value = value("retry-after")?;
+    if let Ok(seconds) = value.parse::<f64>() {
+        return Some(Duration::from_secs_f64(seconds.max(0.0)));
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let remaining = when.with_timezone(&chrono::Utc) - chrono::Utc::now();
+    // A date in the past means "retry now", not "use the exponential default".
+    Some(remaining.to_std().unwrap_or(Duration::ZERO))
+}
+
+/// Why the caller stopped the run, if it did (Go `callerCtx.Err()`).
+fn context_ended(ctx: &RunContext) -> Option<&'static str> {
+    if ctx.cancel.is_cancelled() {
+        return Some("context canceled");
+    }
+    if let Some(deadline) = ctx.deadline
+        && tokio::time::Instant::now() >= deadline
+    {
+        return Some("context deadline exceeded");
+    }
+    None
+}
+
+/// Sleep before a retry, waking early when the run is cancelled or its
+/// deadline passes.
+async fn wait_for_backoff(ctx: &RunContext, delay: Duration) -> Result<(), ProviderError> {
+    if let Some(reason) = context_ended(ctx) {
+        return Err(ProviderError {
+            message: reason.to_string(),
+        });
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => Ok(()),
+        _ = ctx.cancel.cancelled() => Err(ProviderError {
+            message: "context canceled".to_string(),
+        }),
+        _ = wait_deadline(ctx.deadline) => Err(ProviderError {
+            message: "context deadline exceeded".to_string(),
+        }),
+    }
+}
+
 // --- Shared helpers --------------------------------------------------------
 
 /// Read a complete (non-streaming) response body.
@@ -1116,5 +1375,105 @@ fn truncate_runes(text: &str, max: usize) -> String {
         format!("{truncated}…")
     } else {
         truncated
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in pairs {
+            headers.insert(
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    #[test]
+    fn retryable_statuses_match_the_sdk() {
+        for status in [408, 409, 429, 500, 502, 503, 599] {
+            assert!(
+                should_retry(status, &HeaderMap::new()),
+                "{status} must be retryable"
+            );
+        }
+        for status in [200, 201, 400, 401, 403, 404, 405, 422] {
+            assert!(
+                !should_retry(status, &HeaderMap::new()),
+                "{status} must not be retryable"
+            );
+        }
+        // The explicit header wins over the status, in both directions.
+        assert!(should_retry(400, &headers(&[("x-should-retry", "true")])));
+        assert!(!should_retry(500, &headers(&[("x-should-retry", "false")])));
+    }
+
+    #[test]
+    fn retry_after_headers_are_parsed_in_preference_order() {
+        // Retry-After-Ms wins over Retry-After and is fractional milliseconds.
+        let both = headers(&[("retry-after-ms", "250"), ("retry-after", "9")]);
+        assert_eq!(parse_retry_after(&both), Some(Duration::from_millis(250)));
+
+        // Retry-After accepts fractional seconds.
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "1.5")])),
+            Some(Duration::from_millis(1500))
+        );
+
+        // An HTTP date in the past means "retry now", not the exponential default.
+        assert_eq!(
+            parse_retry_after(&headers(&[(
+                "retry-after",
+                "Sun, 06 Nov 1994 08:49:37 GMT"
+            )])),
+            Some(Duration::ZERO)
+        );
+
+        // A future HTTP date is honored.
+        let future = (chrono::Utc::now() + chrono::Duration::seconds(120))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let parsed = parse_retry_after(&headers(&[("retry-after", &future)])).unwrap();
+        assert!(
+            parsed >= Duration::from_secs(100) && parsed <= Duration::from_secs(130),
+            "future HTTP date parsed as {parsed:?}"
+        );
+
+        // Negative numeric values clamp to zero; absent headers fall through.
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "-2")])),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(parse_retry_after(&HeaderMap::new()), None);
+        assert_eq!(parse_retry_after(&headers(&[("retry-after", "")])), None);
+    }
+
+    #[test]
+    fn default_retry_delay_is_exponential_bounded_and_jittered() {
+        // Go: 0.5s * 2^attempt, capped at 8s, minus up to a quarter as jitter.
+        let first = default_retry_delay(0, None);
+        assert!(
+            first >= Duration::from_millis(375) && first <= Duration::from_millis(500),
+            "first retry delay {first:?}"
+        );
+        let second = default_retry_delay(1, None);
+        assert!(
+            second >= Duration::from_millis(750) && second <= Duration::from_millis(1000),
+            "second retry delay {second:?}"
+        );
+        let capped = default_retry_delay(20, None);
+        assert!(
+            capped >= Duration::from_secs(6) && capped <= Duration::from_secs(8),
+            "capped retry delay {capped:?}"
+        );
+        // A server-provided delay is used verbatim.
+        assert_eq!(
+            default_retry_delay(0, Some(Duration::from_millis(7))),
+            Duration::from_millis(7)
+        );
     }
 }

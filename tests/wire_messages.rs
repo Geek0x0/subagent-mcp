@@ -7,485 +7,25 @@
 //! concatenated with `\n`, `[DONE]` treated as ordinary data, EOF without a
 //! `message_delta`, and EOF with a non-empty `stop_reason` but no `message_stop`.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::{Arc, Mutex};
+mod support;
+
+use std::sync::Arc;
+use std::time::Duration;
 
 use serde_json::{Value, json};
-use subagent_mcp::config::{Api, ProviderConfig};
-use subagent_mcp::provider::messages::{MAX_PAUSE_CONTINUATIONS, Messages};
+use subagent_mcp::provider::messages::{
+    MAX_PAUSE_CONTINUATIONS, MAX_RETRIES, Messages, RetryDelay,
+};
 use subagent_mcp::provider::{
-    DeltaSink, ModelLister, Provider, ProviderError, Role, ToolCall, ToolSpec, TurnRequest,
-    TurnResult, Usage,
+    ModelLister, Provider, ProviderError, Role, ToolCall, ToolSpec, TurnRequest, TurnResult, Usage,
 };
 use subagent_mcp::util::run::RunContext;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use support::{Mock, ScriptBlock, ScriptMessage, Scripted, Truncate, request, run_turn, user_only};
 use tokio_util::sync::CancellationToken;
-
-// ---------------------------------------------------------------------------
-// Local HTTP mock (stand-in for Go's httptest.Server + testutil.FakeMessages)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-struct Scripted {
-    status: u16,
-    content_type: String,
-    body: Vec<u8>,
-}
-
-impl Scripted {
-    fn sse(body: impl Into<Vec<u8>>) -> Self {
-        Self {
-            status: 200,
-            content_type: "text/event-stream".into(),
-            body: body.into(),
-        }
-    }
-
-    fn json(body: impl Into<Vec<u8>>) -> Self {
-        Self {
-            status: 200,
-            content_type: "application/json".into(),
-            body: body.into(),
-        }
-    }
-
-    fn status(status: u16, body: impl Into<Vec<u8>>) -> Self {
-        Self {
-            status,
-            content_type: "application/json".into(),
-            body: body.into(),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct Recorded {
-    method: String,
-    path: String,
-    headers: Vec<(String, String)>,
-    body: Vec<u8>,
-}
-
-impl Recorded {
-    fn json(&self) -> Value {
-        serde_json::from_slice(&self.body).expect("recorded request body is JSON")
-    }
-
-    fn header(&self, name: &str) -> Option<&str> {
-        let wanted = name.to_ascii_lowercase();
-        self.headers
-            .iter()
-            .find(|(key, _)| *key == wanted)
-            .map(|(_, value)| value.as_str())
-    }
-}
-
-#[derive(Default)]
-struct MockState {
-    scripts: VecDeque<Scripted>,
-    requests: Vec<Recorded>,
-    connections: usize,
-    unexpected: usize,
-}
-
-struct Mock {
-    base: String,
-    state: Arc<Mutex<MockState>>,
-}
-
-impl Mock {
-    async fn start(scripts: Vec<Scripted>) -> Self {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind mock");
-        let base = format!("http://{}", listener.local_addr().unwrap());
-        let state = Arc::new(Mutex::new(MockState {
-            scripts: scripts.into(),
-            ..MockState::default()
-        }));
-        let server_state = Arc::clone(&state);
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
-                server_state.lock().unwrap().connections += 1;
-                let state = Arc::clone(&server_state);
-                tokio::spawn(async move {
-                    while let Some((head, body)) = read_request(&mut socket).await {
-                        let (method, path, headers) = parse_head(&head);
-                        let script = {
-                            let mut locked = state.lock().unwrap();
-                            locked.requests.push(Recorded {
-                                method,
-                                path,
-                                headers,
-                                body,
-                            });
-                            locked.scripts.pop_front()
-                        };
-                        let script = match script {
-                            Some(script) => script,
-                            None => {
-                                state.lock().unwrap().unexpected += 1;
-                                Scripted::status(
-                                    500,
-                                    br#"{"type":"error","error":{"type":"server_error","message":"unexpected extra request"}}"#
-                                        .to_vec(),
-                                )
-                            }
-                        };
-                        if write_response(&mut socket, &script).await.is_err() {
-                            break;
-                        }
-                    }
-                });
-            }
-        });
-        Self { base, state }
-    }
-
-    fn config(&self, max_output_tokens: i64) -> ProviderConfig {
-        ProviderConfig {
-            api: Api::Messages,
-            base_url: self.base.clone(),
-            env_key: None,
-            key: Some("k".to_string()),
-            command: None,
-            default_model: "claude-x".to_string(),
-            models: Vec::new(),
-            effort_map: BTreeMap::new(),
-            max_output_tokens: Some(max_output_tokens),
-            max_nudges: None,
-            extra_body: None,
-        }
-    }
-
-    fn request(&self, index: usize) -> Recorded {
-        let locked = self.state.lock().unwrap();
-        locked.requests.get(index).cloned().unwrap_or_else(|| {
-            panic!(
-                "request index {index} out of range; recorded {}",
-                locked.requests.len()
-            )
-        })
-    }
-
-    fn requests(&self) -> Vec<Recorded> {
-        self.state.lock().unwrap().requests.clone()
-    }
-
-    fn request_count(&self) -> usize {
-        self.state.lock().unwrap().requests.len()
-    }
-
-    fn connections(&self) -> usize {
-        self.state.lock().unwrap().connections
-    }
-
-    fn unexpected(&self) -> usize {
-        self.state.lock().unwrap().unexpected
-    }
-}
-
-async fn read_request(socket: &mut TcpStream) -> Option<(String, Vec<u8>)> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 8192];
-    let header_end = loop {
-        if let Some(pos) = buf.windows(4).position(|window| window == b"\r\n\r\n") {
-            break pos + 4;
-        }
-        let n = socket.read(&mut chunk).await.ok()?;
-        if n == 0 {
-            return None;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    };
-    let head = String::from_utf8_lossy(&buf[..header_end]).into_owned();
-    let content_length = head
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .find(|(key, _)| key.trim().eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    while buf.len() < header_end + content_length {
-        let n = socket.read(&mut chunk).await.ok()?;
-        if n == 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-    let body_end = (header_end + content_length).min(buf.len());
-    Some((head, buf[header_end..body_end].to_vec()))
-}
-
-fn parse_head(head: &str) -> (String, String, Vec<(String, String)>) {
-    let mut lines = head.split("\r\n");
-    let mut request_line = lines.next().unwrap_or("").split_whitespace();
-    let method = request_line.next().unwrap_or("").to_string();
-    let path = request_line.next().unwrap_or("").to_string();
-    let headers = lines
-        .filter_map(|line| line.split_once(':'))
-        .map(|(key, value)| (key.trim().to_ascii_lowercase(), value.trim().to_string()))
-        .collect();
-    (method, path, headers)
-}
-
-async fn write_response(socket: &mut TcpStream, script: &Scripted) -> std::io::Result<()> {
-    let reason = match script.status {
-        200 => "OK",
-        400 => "Bad Request",
-        401 => "Unauthorized",
-        429 => "Too Many Requests",
-        500 => "Internal Server Error",
-        _ => "Status",
-    };
-    let head = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
-        script.status,
-        reason,
-        script.content_type,
-        script.body.len()
-    );
-    let mut bytes = head.into_bytes();
-    bytes.extend_from_slice(&script.body);
-    socket.write_all(&bytes).await?;
-    socket.flush().await
-}
-
-// ---------------------------------------------------------------------------
-// Scripted Messages SSE (mirrors testutil.FakeMessages)
-// ---------------------------------------------------------------------------
-
-#[derive(Clone)]
-enum ScriptBlock {
-    Thinking {
-        thinking: String,
-        signature: String,
-    },
-    Text(String),
-    Tool {
-        id: String,
-        name: String,
-        chunks: Vec<String>,
-    },
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Truncate {
-    Block,
-    Delta,
-}
-
-#[derive(Clone, Default)]
-struct ScriptMessage {
-    status: u16,
-    blocks: Vec<ScriptBlock>,
-    stop_reason: Option<String>,
-    refusal_category: Option<String>,
-    input_tokens: i64,
-    cache_read_tokens: i64,
-    cache_creation_tokens: i64,
-    output_tokens: i64,
-    thinking_tokens: i64,
-    truncate: Option<Truncate>,
-}
-
-impl ScriptMessage {
-    fn text(text: &str) -> Self {
-        Self {
-            blocks: vec![ScriptBlock::Text(text.to_string())],
-            ..Self::default()
-        }
-    }
-
-    fn http_error(status: u16) -> Self {
-        Self {
-            status,
-            ..Self::default()
-        }
-    }
-
-    fn scripted(&self) -> Scripted {
-        if self.status != 0 && self.status != 200 {
-            Scripted::status(
-                self.status,
-                br#"{"type":"error","error":{"type":"invalid_request_error","message":"scripted failure"}}"#
-                    .to_vec(),
-            )
-        } else {
-            Scripted::sse(sse_bytes(self))
-        }
-    }
-}
-
-fn event_bytes(out: &mut Vec<u8>, event: &str, mut payload: Value) {
-    payload["type"] = Value::String(event.to_string());
-    out.extend_from_slice(format!("event: {event}\ndata: {payload}\n\n").as_bytes());
-}
-
-fn sse_bytes(script: &ScriptMessage) -> Vec<u8> {
-    let mut out = Vec::new();
-    event_bytes(
-        &mut out,
-        "message_start",
-        json!({
-            "message": {
-                "id": "msg_0",
-                "type": "message",
-                "role": "assistant",
-                "model": "claude-x",
-                "content": [],
-                "stop_reason": null,
-                "stop_sequence": null,
-                "usage": {
-                    "input_tokens": script.input_tokens,
-                    "cache_read_input_tokens": script.cache_read_tokens,
-                    "cache_creation_input_tokens": script.cache_creation_tokens,
-                    "output_tokens": 0
-                }
-            }
-        }),
-    );
-
-    let mut has_tool = false;
-    for (index, block) in script.blocks.iter().enumerate() {
-        match block {
-            ScriptBlock::Thinking {
-                thinking,
-                signature,
-            } => {
-                event_bytes(
-                    &mut out,
-                    "content_block_start",
-                    json!({
-                        "index": index,
-                        "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-                    }),
-                );
-                if script.truncate == Some(Truncate::Block) {
-                    return out;
-                }
-                if !thinking.is_empty() {
-                    event_bytes(
-                        &mut out,
-                        "content_block_delta",
-                        json!({
-                            "index": index,
-                            "delta": {"type": "thinking_delta", "thinking": thinking}
-                        }),
-                    );
-                }
-                event_bytes(
-                    &mut out,
-                    "content_block_delta",
-                    json!({
-                        "index": index,
-                        "delta": {"type": "signature_delta", "signature": signature}
-                    }),
-                );
-            }
-            ScriptBlock::Text(text) => {
-                event_bytes(
-                    &mut out,
-                    "content_block_start",
-                    json!({
-                        "index": index,
-                        "content_block": {"type": "text", "text": ""}
-                    }),
-                );
-                if script.truncate == Some(Truncate::Block) {
-                    return out;
-                }
-                event_bytes(
-                    &mut out,
-                    "content_block_delta",
-                    json!({
-                        "index": index,
-                        "delta": {"type": "text_delta", "text": text}
-                    }),
-                );
-            }
-            ScriptBlock::Tool { id, name, chunks } => {
-                has_tool = true;
-                event_bytes(
-                    &mut out,
-                    "content_block_start",
-                    json!({
-                        "index": index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": id,
-                            "name": name,
-                            "input": {}
-                        }
-                    }),
-                );
-                if script.truncate == Some(Truncate::Block) {
-                    return out;
-                }
-                for chunk in chunks {
-                    event_bytes(
-                        &mut out,
-                        "content_block_delta",
-                        json!({
-                            "index": index,
-                            "delta": {"type": "input_json_delta", "partial_json": chunk}
-                        }),
-                    );
-                }
-            }
-        }
-        if script.truncate == Some(Truncate::Delta) {
-            return out;
-        }
-        event_bytes(&mut out, "content_block_stop", json!({"index": index}));
-    }
-
-    let stop_reason = script.stop_reason.clone().unwrap_or_else(|| {
-        if has_tool {
-            "tool_use".to_string()
-        } else {
-            "end_turn".to_string()
-        }
-    });
-    let stop_details = if stop_reason == "refusal" {
-        json!({
-            "type": "refusal",
-            "category": script.refusal_category.clone().unwrap_or_default(),
-            "explanation": "scripted refusal"
-        })
-    } else {
-        Value::Null
-    };
-    event_bytes(
-        &mut out,
-        "message_delta",
-        json!({
-            "delta": {
-                "stop_reason": stop_reason,
-                "stop_sequence": null,
-                "stop_details": stop_details
-            },
-            "usage": {
-                "output_tokens": script.output_tokens,
-                "output_tokens_details": {"thinking_tokens": script.thinking_tokens}
-            }
-        }),
-    );
-    event_bytes(&mut out, "message_stop", json!({}));
-    out
-}
 
 // ---------------------------------------------------------------------------
 // Test helpers
 // ---------------------------------------------------------------------------
-
-fn ctx() -> RunContext {
-    RunContext {
-        cancel: CancellationToken::new(),
-        deadline: None,
-    }
-}
 
 fn shell_spec() -> ToolSpec {
     ToolSpec {
@@ -498,36 +38,6 @@ fn shell_spec() -> ToolSpec {
         }))
         .unwrap(),
     }
-}
-
-fn user_only() -> Vec<subagent_mcp::provider::Message> {
-    vec![subagent_mcp::provider::Message {
-        role: Role::User,
-        text: "hi".to_string(),
-        ..Default::default()
-    }]
-}
-
-fn request(model: &str, messages: Vec<subagent_mcp::provider::Message>) -> TurnRequest {
-    TurnRequest {
-        model: model.to_string(),
-        messages,
-        ..TurnRequest::default()
-    }
-}
-
-async fn run_turn(
-    provider: &Messages,
-    req: TurnRequest,
-) -> (Result<TurnResult, ProviderError>, String) {
-    let deltas = Arc::new(Mutex::new(String::new()));
-    let sink: DeltaSink = {
-        let deltas = Arc::clone(&deltas);
-        Box::new(move |text: String| deltas.lock().unwrap().push_str(&text))
-    };
-    let result = provider.turn(ctx(), req, sink).await;
-    let collected = deltas.lock().unwrap().clone();
-    (result, collected)
 }
 
 async fn one_turn(
@@ -1193,136 +703,7 @@ async fn list_models_http_error() {
         "want the API message, got {:?}",
         error.message
     );
-}
-
-// ---------------------------------------------------------------------------
-// Credentials never come from the environment
-// ---------------------------------------------------------------------------
-
-struct EnvGuard {
-    saved: Vec<(String, Option<String>)>,
-}
-
-impl EnvGuard {
-    fn set(pairs: &[(&str, &str)]) -> Self {
-        let mut saved = Vec::new();
-        for (key, value) in pairs {
-            saved.push((key.to_string(), std::env::var(key).ok()));
-            // SAFETY: the credential test is the only test that mutates the
-            // process environment; every other test passes `cfg.key`.
-            unsafe { std::env::set_var(key, value) };
-        }
-        Self { saved }
-    }
-}
-
-impl Drop for EnvGuard {
-    fn drop(&mut self) {
-        for (key, value) in &self.saved {
-            match value {
-                Some(value) => unsafe { std::env::set_var(key, value) },
-                None => unsafe { std::env::remove_var(key) },
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn environment_credentials_never_reach_the_wire() {
-    const CONFIGURED_KEY: &str = "cfg-key-0123";
-    const ENV_API_KEY: &str = "sk-ant-env-DIFFERENT-key";
-    const ENV_AUTH_TOKEN: &str = "sk-ant-oat-SECRET-from-env";
-    const ENV_GATEWAY: &str = "gw-secret";
-    const ENV_OPENAI_KEY: &str = "sk-openai-env-DIFFERENT-key";
-
-    let elsewhere = Mock::start(Vec::new()).await;
-    let elsewhere_url = elsewhere.base.clone();
-    let configured = Mock::start(vec![
-        ScriptMessage::text("hello").scripted(),
-        Scripted::json(br#"{"data":[{"id":"model-a"}],"has_more":false}"#.to_vec()),
-    ])
-    .await;
-
-    let _guard = EnvGuard::set(&[
-        ("ANTHROPIC_API_KEY", ENV_API_KEY),
-        ("ANTHROPIC_AUTH_TOKEN", ENV_AUTH_TOKEN),
-        (
-            "ANTHROPIC_CUSTOM_HEADERS",
-            "X-Corp-Gateway-Token: gw-secret",
-        ),
-        ("ANTHROPIC_BASE_URL", &elsewhere_url),
-        ("OPENAI_API_KEY", ENV_OPENAI_KEY),
-        ("OPENAI_BASE_URL", &elsewhere_url),
-    ]);
-
-    let mut cfg = configured.config(1000);
-    cfg.key = Some(CONFIGURED_KEY.to_string());
-
-    let provider = Messages::new("anthropic", &cfg).unwrap();
-    let (result, _) = run_turn(&provider, request("claude-x", user_only())).await;
-    assert_eq!(result.expect("turn").text, "hello");
-    let ids = provider
-        .list_models()
-        .await
-        .expect("list models")
-        .into_iter()
-        .map(|info| info.id)
-        .collect::<Vec<_>>();
-    assert_eq!(ids, vec!["model-a"]);
-
-    assert_eq!(
-        configured.request_count(),
-        2,
-        "want exactly a turn and a ListModels request"
-    );
-    assert_eq!(
-        elsewhere.requests().len(),
-        0,
-        "no request may go to the environment base URL"
-    );
-
-    let forbidden_values = [
-        ENV_API_KEY,
-        ENV_AUTH_TOKEN,
-        ENV_GATEWAY,
-        ENV_OPENAI_KEY,
-        elsewhere_url.as_str(),
-    ];
-    let forbidden_headers = [
-        "authorization",
-        "x-corp-gateway-token",
-        "openai-organization",
-    ];
-    for index in 0..configured.request_count() {
-        let recorded = configured.request(index);
-        assert_eq!(
-            recorded.header("x-api-key"),
-            Some(CONFIGURED_KEY),
-            "request {index} must carry only the configured key"
-        );
-        assert!(
-            recorded.header("anthropic-version").is_some(),
-            "request {index} must carry Anthropic-Version"
-        );
-        for (name, value) in &recorded.headers {
-            assert!(
-                !forbidden_headers.contains(&name.as_str()),
-                "request {index} sent environment-derived header {name}: {value}"
-            );
-            for secret in forbidden_values {
-                assert!(
-                    !value.contains(secret),
-                    "request {index} leaked {secret:?} into header {name}: {value}"
-                );
-            }
-        }
-    }
-    assert!(
-        configured
-            .request(0)
-            .header("content-type")
-            .is_some_and(|value| value.starts_with("application/json"))
-    );
+    assert_eq!(mock.request_count(), 1, "a 401 must not be retried");
 }
 
 #[tokio::test]
@@ -1490,5 +871,372 @@ async fn line_longer_than_32_mib_fails() {
         error.message.contains("token too long"),
         "want a scanner cap error, got {:?}",
         error.message
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Opaque payload keeps the streamed message JSON
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn opaque_payload_keeps_the_streamed_message_fields() {
+    let mock = Mock::start(vec![ScriptMessage::text("hi").scripted()]).await;
+    let (result, _) = one_turn(&mock, 1000, request("claude-x", user_only())).await;
+    let opaque = result.expect("turn").opaque.expect("opaque payload");
+    let turn: Value = serde_json::from_str(opaque.get()).expect("opaque is JSON");
+    let message = &turn[0];
+
+    // Everything the stream sent is preserved and refreshed.
+    assert_eq!(message["id"], json!("msg_0"));
+    assert_eq!(message["type"], json!("message"));
+    assert_eq!(message["model"], json!("claude-x"));
+    assert_eq!(message["role"], json!("assistant"));
+    assert!(message.get("stop_sequence").is_some());
+    assert_eq!(message["stop_reason"], json!("end_turn"));
+    assert_eq!(message["content"][0]["text"], json!("hi"));
+    assert_eq!(message["usage"]["output_tokens"], json!(0));
+
+    // Go re-marshals the typed SDK `Message`, which adds zero-valued required
+    // fields (`container`, `stop_details`) and expands `usage`; we keep the
+    // server's message JSON. The measured byte delta is recorded in the task
+    // report (745 B for a thinking+text turn, 318 B for an empty end_turn).
+    assert!(
+        message.get("container").is_none(),
+        "the compact server message JSON is the stored shape"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SDK retry policy (Go `MaxRetries: 2`, i.e. three attempts)
+// ---------------------------------------------------------------------------
+
+fn no_wait() -> RetryDelay {
+    Arc::new(|_, _| Duration::ZERO)
+}
+
+#[tokio::test]
+async fn retries_retryable_statuses_then_succeeds() {
+    let mock = Mock::start(vec![
+        ScriptMessage::http_error(500).scripted(),
+        ScriptMessage::http_error(503).scripted(),
+        ScriptMessage::text("recovered").scripted(),
+    ])
+    .await;
+    let mut provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+    provider.set_retry_delay(no_wait());
+
+    let (result, _) = run_turn(&provider, request("claude-x", user_only())).await;
+    assert_eq!(result.expect("turn after retries").text, "recovered");
+    assert_eq!(mock.request_count(), MAX_RETRIES + 1);
+    assert_eq!(mock.unexpected(), 0);
+}
+
+#[tokio::test]
+async fn retries_stop_after_max_retries() {
+    let mock = Mock::start(vec![
+        ScriptMessage::http_error(500).scripted(),
+        ScriptMessage::http_error(500).scripted(),
+        ScriptMessage::http_error(500).scripted(),
+    ])
+    .await;
+    let mut provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+    provider.set_retry_delay(no_wait());
+
+    let (result, _) = run_turn(&provider, request("claude-x", user_only())).await;
+    let error = result.expect_err("retries exhausted");
+    assert!(
+        error.message.contains("scripted failure"),
+        "want the final API error, got {:?}",
+        error.message
+    );
+    assert_eq!(mock.request_count(), MAX_RETRIES + 1);
+    assert_eq!(mock.unexpected(), 0);
+}
+
+#[tokio::test]
+async fn does_not_retry_client_errors() {
+    let mock = Mock::start(vec![ScriptMessage::http_error(400).scripted()]).await;
+    let mut provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+    provider.set_retry_delay(no_wait());
+
+    let (result, _) = run_turn(&provider, request("claude-x", user_only())).await;
+    let error = result.expect_err("400 is not retryable");
+    assert!(error.message.contains("scripted failure"));
+    assert_eq!(mock.request_count(), 1, "a 400 must not be retried");
+    assert_eq!(mock.unexpected(), 0);
+}
+
+#[tokio::test]
+async fn retries_connection_errors() {
+    let mock = Mock::start(vec![
+        Scripted::drop_connection(),
+        ScriptMessage::text("reconnected").scripted(),
+    ])
+    .await;
+    let mut provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+    provider.set_retry_delay(no_wait());
+
+    let (result, _) = run_turn(&provider, request("claude-x", user_only())).await;
+    assert_eq!(result.expect("connection retry").text, "reconnected");
+    assert_eq!(mock.request_count(), 2);
+}
+
+#[tokio::test]
+async fn honors_retry_after_header() {
+    // Default retry delay: an absent Retry-After would wait 375-500 ms, so a
+    // sub-300 ms turn proves the header (0 ms) was honored end to end.
+    let mock = Mock::start(vec![
+        ScriptMessage::http_error(429)
+            .scripted()
+            .with_headers(&[("Retry-After-Ms", "0")]),
+        ScriptMessage::text("after header").scripted(),
+    ])
+    .await;
+
+    let started = std::time::Instant::now();
+    let (result, _) = one_turn(&mock, 1000, request("claude-x", user_only())).await;
+    assert_eq!(result.expect("429 retry").text, "after header");
+    assert_eq!(mock.request_count(), 2);
+    assert!(
+        started.elapsed() < Duration::from_millis(300),
+        "Retry-After-Ms was ignored: waited {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
+async fn cancellation_is_not_retried() {
+    let mock = Mock::start(vec![
+        ScriptMessage::http_error(500).scripted(),
+        ScriptMessage::text("unused").scripted(),
+    ])
+    .await;
+    let mut provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    provider.set_retry_delay(Arc::new(move |_, _| {
+        cancel.cancel();
+        Duration::ZERO
+    }));
+
+    let ctx = RunContext {
+        cancel: token,
+        deadline: None,
+    };
+    let result = provider
+        .turn(
+            ctx,
+            request("claude-x", user_only()),
+            Box::new(|_: String| {}),
+        )
+        .await;
+    assert_eq!(result.expect_err("canceled").message, "context canceled");
+    assert_eq!(mock.request_count(), 1, "a cancelled turn must not retry");
+}
+
+#[tokio::test]
+async fn deadline_is_not_retried() {
+    let mock = Mock::start(vec![
+        ScriptMessage::http_error(500).scripted(),
+        ScriptMessage::text("unused").scripted(),
+    ])
+    .await;
+    let mut provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+    provider.set_retry_delay(Arc::new(|_, _| Duration::from_millis(200)));
+
+    let ctx = RunContext {
+        cancel: CancellationToken::new(),
+        deadline: Some(tokio::time::Instant::now() + Duration::from_millis(50)),
+    };
+    let result = provider
+        .turn(
+            ctx,
+            request("claude-x", user_only()),
+            Box::new(|_: String| {}),
+        )
+        .await;
+    assert_eq!(
+        result.expect_err("deadline").message,
+        "context deadline exceeded"
+    );
+    assert_eq!(
+        mock.request_count(),
+        1,
+        "a turn past its deadline must not retry"
+    );
+}
+
+#[tokio::test]
+async fn list_models_retries_retryable_statuses() {
+    let mock = Mock::start(vec![
+        Scripted::status(
+            503,
+            br#"{"type":"error","error":{"type":"overloaded_error","message":"try later"}}"#
+                .to_vec(),
+        ),
+        Scripted::json(br#"{"data":[{"id":"model-a"}],"has_more":false}"#.to_vec()),
+    ])
+    .await;
+    let mut provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+    provider.set_retry_delay(no_wait());
+
+    let ids = provider
+        .list_models()
+        .await
+        .expect("list models after retry")
+        .into_iter()
+        .map(|info| info.id)
+        .collect::<Vec<_>>();
+    assert_eq!(ids, vec!["model-a"]);
+    assert_eq!(mock.request_count(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency: one pool per endpoint, one key per session
+// ---------------------------------------------------------------------------
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_sessions_keep_keys_on_shared_pool() {
+    const SESSIONS: usize = 24;
+    let scripts: Vec<Scripted> = (0..SESSIONS / 2)
+        .map(|_| ScriptMessage::text("ok").scripted())
+        .collect();
+    let first = Mock::start(scripts.clone()).await;
+    let second = Mock::start(scripts).await;
+
+    let mut handles = Vec::new();
+    for index in 0..SESSIONS {
+        let mut cfg = if index % 2 == 0 {
+            first.config(1000)
+        } else {
+            second.config(1000)
+        };
+        cfg.key = Some(format!("key-{index:02}"));
+        handles.push(tokio::spawn(async move {
+            let provider = Messages::new(&format!("session-{index}"), &cfg).unwrap();
+            let (result, _) =
+                run_turn(&provider, request(&format!("model-{index}"), user_only())).await;
+            result.expect("concurrent turn").text
+        }));
+    }
+    for handle in handles {
+        assert_eq!(handle.await.expect("join"), "ok");
+    }
+
+    for mock in [&first, &second] {
+        assert_eq!(mock.request_count(), SESSIONS / 2);
+        for index in 0..mock.request_count() {
+            let recorded = mock.request(index);
+            let model = recorded.json()["model"].as_str().unwrap().to_string();
+            let session: usize = model.trim_start_matches("model-").parse().unwrap();
+            assert_eq!(
+                recorded.header("x-api-key"),
+                Some(format!("key-{session:02}").as_str()),
+                "{model} carried another session's key"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Redacted thinking blocks survive opaque replay
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn redacted_thinking_is_preserved_on_replay() {
+    let scripts = [
+        ScriptMessage {
+            blocks: vec![
+                ScriptBlock::Redacted {
+                    data: "opaque-redacted".to_string(),
+                },
+                ScriptBlock::Text("done".to_string()),
+            ],
+            ..ScriptMessage::default()
+        },
+        ScriptMessage::text("second"),
+    ];
+    let mock = Mock::start(scripts.iter().map(ScriptMessage::scripted).collect()).await;
+    let provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+
+    let (result, _) = run_turn(&provider, request("claude-x", user_only())).await;
+    let result = result.expect("redacted turn");
+    assert_eq!(result.text, "done");
+
+    let mut history = user_only();
+    history.push(assistant_from(&result));
+    run_turn(&provider, request("claude-x", history))
+        .await
+        .0
+        .expect("replay turn");
+
+    let content = mock.request(1).json()["messages"][1]["content"].clone();
+    let content = content.as_array().expect("assistant content");
+    assert_eq!(content[0]["type"], json!("redacted_thinking"));
+    assert_eq!(content[0]["data"], json!("opaque-redacted"));
+}
+
+// ---------------------------------------------------------------------------
+// Cancellation and the run deadline stop a waiting stream
+// ---------------------------------------------------------------------------
+
+async fn wait_for_request(mock: &Mock) {
+    for _ in 0..400 {
+        if mock.request_count() > 0 {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the mock never received the request");
+}
+
+#[tokio::test]
+async fn cancellation_stops_a_waiting_stream() {
+    let mock = Mock::start(vec![Scripted::stall(
+        b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n".to_vec(),
+    )])
+    .await;
+    let provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+    let token = CancellationToken::new();
+    let cancel = token.clone();
+    let handle = tokio::spawn(async move {
+        provider
+            .turn(
+                RunContext {
+                    cancel: token,
+                    deadline: None,
+                },
+                request("claude-x", user_only()),
+                Box::new(|_: String| {}),
+            )
+            .await
+    });
+
+    wait_for_request(&mock).await;
+    cancel.cancel();
+    let error = handle.await.expect("join").expect_err("canceled stream");
+    assert_eq!(error.message, "context canceled");
+}
+
+#[tokio::test]
+async fn deadline_stops_a_waiting_stream() {
+    let mock = Mock::start(vec![Scripted::stall(
+        b"event: message_start\ndata: {\"type\":\"message_start\"}\n\n".to_vec(),
+    )])
+    .await;
+    let provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+    let result = provider
+        .turn(
+            RunContext {
+                cancel: CancellationToken::new(),
+                deadline: Some(tokio::time::Instant::now() + Duration::from_millis(100)),
+            },
+            request("claude-x", user_only()),
+            Box::new(|_: String| {}),
+        )
+        .await;
+    assert_eq!(
+        result.expect_err("deadline").message,
+        "context deadline exceeded"
     );
 }
