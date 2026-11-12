@@ -15,9 +15,10 @@
 
 use std::ffi::OsString;
 use std::fs;
+use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::Stdio;
-use std::sync::Mutex;
+use std::sync::{Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use subagent_mcp::policy::path::inside_relative;
@@ -251,44 +252,63 @@ fn process_cleanup_terminates_the_whole_job() {
 }
 
 // ---------------------------------------------------------------------------
-// SIGTERM with stdin open (Task 25 invariant, platform repeat)
+// Terminate with stdin open (Task 25 invariant, platform repeat)
 // ---------------------------------------------------------------------------
 
-/// SKELETON — ignored until Task 25 lands the serve lifecycle.
+/// Windows has no SIGTERM. The shutdown primitive available to the supervisor
+/// is `TerminateProcess` (the Job Object path is covered above); this test pins
+/// the invariant that matters for the serve loop: a server blocked on an open,
+/// idle stdin pipe is still terminated within the 10 s budget.
 ///
-/// Windows has no SIGTERM. The shutdown primitives available to the supervisor
-/// are Job Object termination (covered by `process_cleanup_terminates_the_whole_job`)
-/// and `TerminateProcess`; this skeleton pins the invariant that matters for
-/// the serve loop: a child blocked on an open, idle stdin pipe must still be
-/// terminated within the 10 s budget.
-///
-/// No crate code runs on this path until Task 25's `cli::serve` exists, so it
-/// must not be claimed as a gate. Task 25 must replace the `cmd /C pause` child
-/// with the real `subagent-mcp` server (open stdin, initialize, then the
-/// platform shutdown signal) and remove `#[ignore]`.
+/// The real `subagent-mcp` server is started and driven through an MCP
+/// `initialize` exchange first, so termination lands on a serving process.
 #[test]
-#[ignore = "requires Task 25 serve lifecycle"]
 fn terminate_process_with_stdin_open_is_bounded() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| OsString::from("cmd.exe"));
-    let mut child = std::process::Command::new(comspec)
-        .args(["/C", "pause"])
+    let home = tempfile::tempdir().unwrap();
+    let config = write_server_config(home.path());
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_subagent-mcp"))
+        .env("SUBAGENT_MCP_CONFIG", &config)
+        .env("HOME", home.path())
         .stdin(Stdio::piped())
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .expect("spawn stdin-blocked child");
+        .expect("spawn subagent-mcp");
 
-    // Hold the write end open: stdin is never written and never closed.
-    let stdin = child.stdin.take().expect("stdin is piped");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    let mut stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
+    let (sender, lines) = mpsc::channel();
+    let reader = std::thread::spawn(move || {
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match stdout.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    if sender.send(line.clone()).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    stdin
+        .write_all(initialize_frame().as_bytes())
+        .expect("write initialize");
+    stdin.flush().expect("flush initialize");
+    let response = lines
+        .recv_timeout(Duration::from_secs(20))
+        .expect("server never answered initialize");
+    assert!(
+        response.contains("\"serverInfo\""),
+        "initialize response = {response:?}"
+    );
+
+    // Hold the write end open: stdin is never written again and never closed.
     let pid = child.id();
-
-    // The child must be running (blocked in the pause read) before termination.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while !process_alive(pid) && Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(25));
-    }
-    assert!(process_alive(pid), "child {pid} never reached the pause");
+    assert!(process_alive(pid), "child {pid} exited before termination");
 
     let start = Instant::now();
     // SAFETY: OpenProcess/TerminateProcess/CloseHandle on a PID this test owns.
@@ -308,6 +328,34 @@ fn terminate_process_with_stdin_open_is_bounded() {
     );
     assert!(!status.success(), "terminated child reported success");
     drop(stdin);
+    drop(lines);
+    let _ = reader.join();
+}
+
+/// The provider config the platform termination test starts: a valid chat
+/// completions provider whose key is unset, so startup never needs the network.
+fn write_server_config(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("config.toml");
+    fs::write(
+        &path,
+        r#"
+[providers.test]
+api = "chat-completions"
+env_key = "SUBAGENT_PLATFORM_TEST_KEY"
+default_model = "test-model"
+models = [{ id = "test-model" }]
+"#,
+    )
+    .unwrap();
+    path
+}
+
+fn initialize_frame() -> String {
+    concat!(
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"platform-test","version":"1"}}}"#,
+        "\n"
+    )
+    .to_string()
 }
 
 /// The stdout/stderr merge and 16 KiB truncation contract holds on the Windows
