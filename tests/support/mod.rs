@@ -93,6 +93,19 @@ impl Scripted {
         }
     }
 
+    /// A non-2xx response whose body never finishes: the retry path must not
+    /// read it before retrying.
+    pub fn stall_status(status: u16, prefix: impl Into<Vec<u8>>) -> Self {
+        Self {
+            status,
+            content_type: "application/json".into(),
+            body: prefix.into(),
+            headers: Vec::new(),
+            drop_connection: false,
+            stall: true,
+        }
+    }
+
     pub fn with_headers(mut self, headers: &[(&str, &str)]) -> Self {
         self.headers = headers
             .iter()

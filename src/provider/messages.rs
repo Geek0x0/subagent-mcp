@@ -169,24 +169,10 @@ impl Messages {
                     message: reason.to_string(),
                 });
             }
-            let outcome = tokio::select! {
-                response = self.client.execute_json(url.clone(), headers.clone(), body) => {
-                    match response {
-                        Ok(response) => self.classify(response).await,
-                        Err(error) => Err(AttemptError::Connection(error.message)),
-                    }
-                }
-                _ = ctx.cancel.cancelled() => Err(AttemptError::Context("context canceled")),
-                _ = wait_deadline(ctx.deadline) => {
-                    Err(AttemptError::Context("context deadline exceeded"))
-                }
-            };
-            match outcome {
-                Ok(response) => return Ok(response),
-                Err(failure) => {
-                    let delay = next_retry("POST", url, attempt, failure, &self.retry_delay)?;
-                    wait_for_backoff(ctx, delay).await?;
-                    attempt += 1;
+            match self.send_json_once(ctx, url, headers, body, attempt).await {
+                SendOutcome::Success(response) => return Ok(response),
+                SendOutcome::Failed(failure) => {
+                    attempt = self.retry_or_fail(ctx, attempt, failure).await?;
                 }
             }
         }
@@ -206,50 +192,124 @@ impl Messages {
                     message: reason.to_string(),
                 });
             }
-            let outcome = {
-                let mut request = reqwest::Request::new(reqwest::Method::GET, url.clone());
-                *request.headers_mut() = headers.clone();
-                tokio::select! {
-                    response = self.client.execute(request) => {
-                        match response {
-                            Ok(response) => self.classify(response).await,
-                            Err(error) => Err(AttemptError::Connection(error.message)),
-                        }
-                    }
-                    _ = ctx.cancel.cancelled() => Err(AttemptError::Context("context canceled")),
-                    _ = wait_deadline(ctx.deadline) => {
-                        Err(AttemptError::Context("context deadline exceeded"))
-                    }
-                }
-            };
-            match outcome {
-                Ok(response) => return Ok(response),
-                Err(failure) => {
-                    let delay = next_retry("GET", url, attempt, failure, &self.retry_delay)?;
-                    wait_for_backoff(ctx, delay).await?;
-                    attempt += 1;
+            match self.send_get_once(ctx, url, headers, attempt).await {
+                SendOutcome::Success(response) => return Ok(response),
+                SendOutcome::Failed(failure) => {
+                    attempt = self.retry_or_fail(ctx, attempt, failure).await?;
                 }
             }
         }
     }
 
-    /// A 2xx response is returned as-is; anything else is drained and reported
-    /// as a status failure so the retry loop can classify it.
-    async fn classify(&self, mut response: PooledResponse) -> Result<PooledResponse, AttemptError> {
+    async fn send_json_once(
+        &self,
+        ctx: &RunContext,
+        url: &Url,
+        headers: &HeaderMap,
+        body: &[u8],
+        attempt: usize,
+    ) -> SendOutcome {
+        tokio::select! {
+            response = self.client.execute_json(url.clone(), headers.clone(), body) => {
+                match response {
+                    Ok(response) => self.classify("POST", url, response, attempt).await,
+                    Err(error) => SendOutcome::Failed(AttemptFailure::Connection(error.message)),
+                }
+            }
+            _ = ctx.cancel.cancelled() => {
+                SendOutcome::Failed(AttemptFailure::Context("context canceled"))
+            }
+            _ = wait_deadline(ctx.deadline) => {
+                SendOutcome::Failed(AttemptFailure::Context("context deadline exceeded"))
+            }
+        }
+    }
+
+    async fn send_get_once(
+        &self,
+        ctx: &RunContext,
+        url: &Url,
+        headers: &HeaderMap,
+        attempt: usize,
+    ) -> SendOutcome {
+        let mut request = reqwest::Request::new(reqwest::Method::GET, url.clone());
+        *request.headers_mut() = headers.clone();
+        tokio::select! {
+            response = self.client.execute(request) => {
+                match response {
+                    Ok(response) => self.classify("GET", url, response, attempt).await,
+                    Err(error) => SendOutcome::Failed(AttemptFailure::Connection(error.message)),
+                }
+            }
+            _ = ctx.cancel.cancelled() => {
+                SendOutcome::Failed(AttemptFailure::Context("context canceled"))
+            }
+            _ = wait_deadline(ctx.deadline) => {
+                SendOutcome::Failed(AttemptFailure::Context("context deadline exceeded"))
+            }
+        }
+    }
+
+    /// Classify one response. A retryable failure is closed **unread**, like Go
+    /// (`res.Body.Close()` before retrying): reading a slow or stalled error
+    /// body here would delay the retry and mask the `Retry-After` delay. Only a
+    /// failure that ends the turn reads its body for the error text.
+    async fn classify(
+        &self,
+        method: &str,
+        url: &Url,
+        mut response: PooledResponse,
+        attempt: usize,
+    ) -> SendOutcome {
         let status = response
             .status()
             .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
         if status.is_success() {
-            return Ok(response);
+            return SendOutcome::Success(response);
         }
         let headers = response.headers().cloned().unwrap_or_default();
+        if should_retry(status.as_u16(), &headers) && attempt < MAX_RETRIES {
+            // Dropping the response runs the transport's bounded background
+            // drain (64 KiB / 250 ms) without blocking the retry.
+            drop(response);
+            return SendOutcome::Failed(AttemptFailure::Retry {
+                retry_after: parse_retry_after(&headers),
+            });
+        }
         let body = read_body(&mut response).await;
         response.close().await;
-        Err(AttemptError::Status {
-            status,
-            headers,
-            body,
-        })
+        SendOutcome::Failed(AttemptFailure::Failure(ProviderError {
+            message: api_error(method, url, status, &body),
+        }))
+    }
+
+    /// Either return the terminal error or wait out the retry delay and return
+    /// the next attempt index.
+    async fn retry_or_fail(
+        &self,
+        ctx: &RunContext,
+        attempt: usize,
+        failure: AttemptFailure,
+    ) -> Result<usize, ProviderError> {
+        match failure {
+            AttemptFailure::Context(reason) => Err(ProviderError {
+                message: reason.to_string(),
+            }),
+            AttemptFailure::Failure(error) => Err(error),
+            AttemptFailure::Retry { retry_after } => {
+                let delay = (self.retry_delay)(attempt, retry_after);
+                wait_for_backoff(ctx, delay).await?;
+                Ok(attempt + 1)
+            }
+            AttemptFailure::Connection(message) => {
+                if attempt >= MAX_RETRIES {
+                    return Err(ProviderError { message });
+                }
+                let delay = (self.retry_delay)(attempt, None);
+                wait_for_backoff(ctx, delay).await?;
+                Ok(attempt + 1)
+            }
+        }
     }
 
     /// Accumulate one message from the SSE stream. `on_delta` receives text
@@ -1209,64 +1269,24 @@ async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
 
 // --- Retry policy (Go SDK requestconfig) -----------------------------------
 
-/// One failed request attempt, classified for the retry decision.
-enum AttemptError {
+/// The result of one send attempt.
+enum SendOutcome {
+    /// A 2xx response ready to stream.
+    Success(PooledResponse),
+    /// The attempt failed; `retry_or_fail` decides whether to retry.
+    Failed(AttemptFailure),
+}
+
+/// One failed attempt, already classified for the retry decision.
+enum AttemptFailure {
     /// Cancellation or the run deadline: never retried.
     Context(&'static str),
     /// A transport/connection failure: retried (Go `res == nil`).
     Connection(String),
-    /// A non-2xx response; retryability comes from the status and headers.
-    Status {
-        status: StatusCode,
-        headers: HeaderMap,
-        body: Vec<u8>,
-    },
-}
-
-impl AttemptError {
-    fn retryable(&self) -> bool {
-        match self {
-            AttemptError::Context(_) => false,
-            AttemptError::Connection(_) => true,
-            AttemptError::Status {
-                status, headers, ..
-            } => should_retry(status.as_u16(), headers),
-        }
-    }
-
-    fn retry_after(&self) -> Option<Duration> {
-        match self {
-            AttemptError::Status { headers, .. } => parse_retry_after(headers),
-            _ => None,
-        }
-    }
-
-    fn into_error(self, method: &str, url: &Url) -> ProviderError {
-        match self {
-            AttemptError::Context(reason) => ProviderError {
-                message: reason.to_string(),
-            },
-            AttemptError::Connection(message) => ProviderError { message },
-            AttemptError::Status { status, body, .. } => ProviderError {
-                message: api_error(method, url, status, &body),
-            },
-        }
-    }
-}
-
-/// The delay before the next attempt, or the final error once the attempt is
-/// not retryable or the `MaxRetries` budget is spent.
-fn next_retry(
-    method: &str,
-    url: &Url,
-    attempt: usize,
-    failure: AttemptError,
-    retry_delay: &RetryDelay,
-) -> Result<Duration, ProviderError> {
-    if !failure.retryable() || attempt >= MAX_RETRIES {
-        return Err(failure.into_error(method, url));
-    }
-    Ok(retry_delay(attempt, failure.retry_after()))
+    /// A retryable HTTP failure whose response was closed unread.
+    Retry { retry_after: Option<Duration> },
+    /// A failure that ends the turn; its error text is already built.
+    Failure(ProviderError),
 }
 
 /// Go SDK `shouldRetry`: explicit `x-should-retry` wins over the status.
