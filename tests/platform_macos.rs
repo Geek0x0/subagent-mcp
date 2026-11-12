@@ -167,12 +167,17 @@ fn process_group_cleanup_kills_backgrounded_descendant() {
 // SIGTERM with stdin open (Task 25 invariant, platform repeat)
 // ---------------------------------------------------------------------------
 
-/// A process whose stdin pipe is held open and idle must still exit within the
-/// 10 s shutdown budget when it receives SIGTERM. The child reproduces the
-/// serve loop's shape: it blocks in `read` on an open pipe and exits from the
-/// SIGTERM trap, so a platform that cannot deliver SIGTERM or that lets the
-/// stdin read own shutdown fails here.
+/// SKELETON — ignored until Task 25 lands the serve lifecycle.
+///
+/// A process whose stdin pipe is held open and idle must exit within the 10 s
+/// shutdown budget when it receives SIGTERM. The production serve loop that
+/// installs the handler is Task 25's `cli::serve`; until it exists there is no
+/// crate code on this path, so this test only pins the OS-level shell behavior
+/// and must not be claimed as a gate. Task 25 must replace the `sh` child with
+/// the real `subagent-mcp` server (open stdin, initialize, SIGTERM) and remove
+/// `#[ignore]`.
 #[test]
+#[ignore = "requires Task 25 serve lifecycle"]
 fn sigterm_with_stdin_open_exits_within_budget() {
     let mut child = std::process::Command::new("sh")
         .args([

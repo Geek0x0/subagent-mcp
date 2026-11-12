@@ -254,15 +254,20 @@ fn process_cleanup_terminates_the_whole_job() {
 // SIGTERM with stdin open (Task 25 invariant, platform repeat)
 // ---------------------------------------------------------------------------
 
-/// Windows has no SIGTERM. The shutdown primitives available to the supervisor
-/// are Job Object termination (covered above) and `TerminateProcess`; this test
-/// pins the invariant that matters for the serve loop: a child blocked on an
-/// open, idle stdin pipe must still be terminated within the 10 s budget.
+/// SKELETON — ignored until Task 25 lands the serve lifecycle.
 ///
-/// `cmd /C pause` blocks reading stdin, and the parent holds the write end open
-/// for the whole test. A platform whose termination path waits for that read
-/// fails here.
+/// Windows has no SIGTERM. The shutdown primitives available to the supervisor
+/// are Job Object termination (covered by `process_cleanup_terminates_the_whole_job`)
+/// and `TerminateProcess`; this skeleton pins the invariant that matters for
+/// the serve loop: a child blocked on an open, idle stdin pipe must still be
+/// terminated within the 10 s budget.
+///
+/// No crate code runs on this path until Task 25's `cli::serve` exists, so it
+/// must not be claimed as a gate. Task 25 must replace the `cmd /C pause` child
+/// with the real `subagent-mcp` server (open stdin, initialize, then the
+/// platform shutdown signal) and remove `#[ignore]`.
 #[test]
+#[ignore = "requires Task 25 serve lifecycle"]
 fn terminate_process_with_stdin_open_is_bounded() {
     let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| OsString::from("cmd.exe"));

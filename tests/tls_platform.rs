@@ -49,7 +49,10 @@ const LOCAL_SAN: &str = "127.0.0.1";
 struct TestCert {
     /// Trust anchor the tests install as an extra root or platform root.
     root: CertificateDer<'static>,
-    /// PEM encoding of `root`, for `SSL_CERT_FILE` / platform store installs.
+    /// PEM encoding of `root`, for the Linux `SSL_CERT_FILE` bundle and the
+    /// macOS store install. Windows writes the DER form instead, so the field
+    /// is compiled out there to keep `-D warnings` clean.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     root_pem: String,
     /// Chain served by the test server: leaf first, then intermediates.
     chain: Vec<CertificateDer<'static>>,
@@ -89,6 +92,7 @@ fn ca_signed(san: &str, common_name: &str) -> TestCert {
     let leaf = leaf_params(san).signed_by(&leaf_key, &ca).unwrap();
     TestCert {
         root: ca.der().clone(),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         root_pem: ca.pem(),
         chain: vec![leaf.der().clone()],
         key: leaf_key.serialize_der(),
@@ -112,6 +116,7 @@ fn expired_ca_signed(san: &str, common_name: &str) -> TestCert {
     let leaf = params.signed_by(&leaf_key, &ca).unwrap();
     TestCert {
         root: ca.der().clone(),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         root_pem: ca.pem(),
         chain: vec![leaf.der().clone()],
         key: leaf_key.serialize_der(),
@@ -148,6 +153,7 @@ fn intermediate_chain(san: &str, send_intermediate: bool, common_name: &str) -> 
     }
     TestCert {
         root: root.der().clone(),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         root_pem: root.pem(),
         chain,
         key: leaf_key.serialize_der(),
@@ -162,6 +168,7 @@ fn self_signed(san: &str) -> TestCert {
     let cert = leaf_params(san).self_signed(&key).unwrap();
     TestCert {
         root: cert.der().clone(),
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         root_pem: cert.pem(),
         chain: vec![cert.der().clone()],
         key: key.serialize_der(),
@@ -407,9 +414,13 @@ impl Drop for EnvVarGuard {
 /// Linux trusts the system CA bundle. A bundle that does not contain the
 /// enterprise CA rejects the leaf; the same bundle with the CA added accepts
 /// it, proving the native-root path is the deciding trust input.
+///
+/// This is an *absent root* case, not an explicit distrust marker: Linux has no
+/// per-user distrust store in this crate's trust path. The explicit-distrust
+/// evidence is the macOS `deny` / Windows `Disallowed` store case below.
 #[cfg(target_os = "linux")]
 #[test]
-fn distrusted_root_is_rejected_by_the_native_bundle() {
+fn absent_root_is_rejected_by_the_native_bundle() {
     let _g = lock();
     let cert = ca_signed(LOCAL_SAN, "subagent-mcp native bundle CA");
     let unrelated = ca_signed(LOCAL_SAN, "subagent-mcp unrelated CA");
@@ -420,7 +431,7 @@ fn distrusted_root_is_rejected_by_the_native_bundle() {
     std::fs::write(&distrusted, unrelated.root_pem.as_bytes()).unwrap();
     let _env = EnvVarGuard::set("SSL_CERT_FILE", &distrusted);
     let config = tls::client_config().expect("native bundle with an unrelated root");
-    let err = connect(&config, port, LOCAL_SAN).expect_err("distrusted root accepted");
+    let err = connect(&config, port, LOCAL_SAN).expect_err("root absent from the bundle accepted");
     assert_certificate_rejection(&err, "native bundle without the enterprise CA");
     drop(_env);
 
@@ -436,16 +447,20 @@ fn distrusted_root_is_rejected_by_the_native_bundle() {
 // Platform trust store: macOS and Windows
 // ---------------------------------------------------------------------------
 
+/// The store case mutates machine/user trust state, so it is `#[ignore]`d:
+/// an ordinary `cargo test --all-targets` reports it as ignored (visible, never
+/// a silent pass) and the dedicated CI jobs run it with `--ignored` plus this
+/// variable. Running `--ignored` without the variable fails loudly instead of
+/// touching the developer's store.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
-fn platform_trust_tests_enabled() -> bool {
-    if std::env::var("SUBAGENT_MCP_PLATFORM_TRUST_TESTS").as_deref() == Ok("1") {
-        return true;
-    }
-    eprintln!(
-        "skip: set SUBAGENT_MCP_PLATFORM_TRUST_TESTS=1 to install/remove a temporary root in the \
-         platform trust store (the platform-macos-* / platform-windows-* CI jobs set it)"
+fn require_platform_trust_env() {
+    assert_eq!(
+        std::env::var("SUBAGENT_MCP_PLATFORM_TRUST_TESTS").as_deref(),
+        Ok("1"),
+        "this test installs and removes a temporary root in the platform trust store; set \
+         SUBAGENT_MCP_PLATFORM_TRUST_TESTS=1 to run it (the platform-macos-* / \
+         platform-windows-* CI jobs do)"
     );
-    false
 }
 
 /// Fixed common name of the temporary root, so the CI cleanup step and
@@ -583,12 +598,15 @@ fn run_certutil(args: &[&str]) {
 /// through `client_config()` (no extra roots), and the same root marked
 /// distrusted is rejected. This proves the platform verifier consults OS trust
 /// policy rather than a static root list.
+///
+/// Ignored by default so the general `verify` matrix reports it as ignored
+/// rather than a pass; the dedicated macOS/Windows jobs run it with
+/// `--ignored` and `SUBAGENT_MCP_PLATFORM_TRUST_TESTS=1`.
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[test]
+#[ignore = "mutates the platform trust store; run with --ignored and SUBAGENT_MCP_PLATFORM_TRUST_TESTS=1"]
 fn platform_store_trust_and_distrust_apply() {
-    if !platform_trust_tests_enabled() {
-        return;
-    }
+    require_platform_trust_env();
     let _g = lock();
     let cert = ca_signed(LOCAL_SAN, STORE_TEST_CA_NAME);
     let port = serve(&cert);

@@ -11,7 +11,8 @@
 #
 # Linux has no per-user root store in this crate's trust path: the native bundle
 # loaded by rustls-native-certs is the store, so `install-ca` writes a bundle and
-# prints the `SSL_CERT_FILE` export to use.
+# prints the `SSL_CERT_FILE` export to use. `install-ca --deny` is unsupported
+# there (it exits non-zero): omit the CA from the bundle instead.
 #
 # Usage:
 #   scripts/tls-test-fixtures.sh generate <dir>
@@ -29,7 +30,7 @@ set -euo pipefail
 TEST_CA_NAME="subagent-mcp platform trust test CA"
 
 usage() {
-	sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
 	exit "${1:-2}"
 }
 
@@ -76,6 +77,9 @@ cmd_install() {
 
 	case "$(platform)" in
 	linux)
+		if [ "$trust" = deny ]; then
+			die "Linux has no per-user distrust store in this trust path: omit the CA from the SSL_CERT_FILE bundle instead of marking it denied"
+		fi
 		local bundle
 		bundle="$(cd "$(dirname "$pem")" && pwd)/ca-bundle.pem"
 		cat "$pem" >>"$bundle"

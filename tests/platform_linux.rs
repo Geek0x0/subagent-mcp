@@ -83,6 +83,28 @@ fn read_pid(path: &Path) -> i32 {
         .unwrap_or_else(|e| panic!("parse pid from {}: {e}", path.display()))
 }
 
+/// Whether a missing kernel feature must fail instead of skip. CI sets this so
+/// the Linux gate cannot pass on a kernel without Landlock.
+fn landlock_required() -> bool {
+    std::env::var("SUBAGENT_MCP_REQUIRE_LANDLOCK").as_deref() == Ok("1")
+}
+
+/// Return false (with a visible skip line) when Landlock is unavailable, or
+/// panic when the run declares Landlock mandatory.
+fn landlock_available_or_skip(test: &str) -> bool {
+    if available() {
+        return true;
+    }
+    if landlock_required() {
+        panic!("{test}: SUBAGENT_MCP_REQUIRE_LANDLOCK=1 but Landlock is unavailable");
+    }
+    eprintln!(
+        "skip: {test}: landlock unavailable on this kernel (set \
+         SUBAGENT_MCP_REQUIRE_LANDLOCK=1 to fail instead)"
+    );
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Landlock helper (real binary, Task 20)
 // ---------------------------------------------------------------------------
@@ -91,8 +113,7 @@ fn read_pid(path: &Path) -> i32 {
 /// them everywhere else, while reads, exec, and device writes still work.
 #[test]
 fn landlock_helper_restricts_writes() {
-    if !available() {
-        eprintln!("skip: landlock unavailable on this kernel");
+    if !landlock_available_or_skip("landlock_helper_restricts_writes") {
         return;
     }
     let inside = tempfile::tempdir().unwrap();
@@ -174,6 +195,13 @@ fn openat2_bound_directory_denies_symlink_escape() {
     let dir = BoundDirectory::open(&root).unwrap();
     let fs: &dyn FS = dir.fs().expect("Linux BoundDirectory exposes a bound fs");
     let p = |rel: &str| dir.path().join(rel);
+
+    // Positive control first: the same handle must succeed on safe paths, so a
+    // wholly broken `fs()` cannot make the escape assertions below pass.
+    fs.write(&p("safe.txt"), b"safe", 0o644).unwrap();
+    assert_eq!(fs.read(&p("safe.txt")).unwrap(), b"safe");
+    symlink("safe.txt", root.join("inside-link")).unwrap();
+    assert_eq!(fs.read(&p("inside-link")).unwrap(), b"safe");
 
     for rel in ["abs/new.txt", "rel/new.txt", "abs/secret", "rel/secret"] {
         assert!(
@@ -301,15 +329,17 @@ fn wait_delay_nonzero_exit_precedence_when_descendant_holds_pipes() {
 // SIGTERM with stdin open (Task 25 invariant, platform repeat)
 // ---------------------------------------------------------------------------
 
-/// A process whose stdin pipe is held open and idle must still exit within the
-/// 10 s shutdown budget when it receives SIGTERM.
+/// SKELETON — ignored until Task 25 lands the serve lifecycle.
 ///
-/// The production serve loop that installs the handler is Task 25's
-/// `cli::serve`; this platform test pins the OS-level invariant that design
-/// depends on (the detached, unjoinable stdin read must never own shutdown).
-/// The child reproduces the serve loop's shape: it blocks in `read` on an open
-/// pipe and exits from the SIGTERM trap.
+/// A process whose stdin pipe is held open and idle must exit within the 10 s
+/// shutdown budget when it receives SIGTERM. The production serve loop that
+/// installs the handler is Task 25's `cli::serve`; until it exists there is no
+/// crate code on this path, so this test only pins the OS-level shell behavior
+/// and must not be claimed as a gate. Task 25 must replace the `sh` child with
+/// the real `subagent-mcp` server (open stdin, initialize, SIGTERM) and remove
+/// `#[ignore]`.
 #[test]
+#[ignore = "requires Task 25 serve lifecycle"]
 fn sigterm_with_stdin_open_exits_within_budget() {
     let mut child = std::process::Command::new("sh")
         .args([
