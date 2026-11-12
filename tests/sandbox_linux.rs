@@ -323,6 +323,55 @@ fn dedupe_paths_and_writable_roots() {
     assert!(writable_roots(&[], &[]).is_empty());
 }
 
+/// Task 20's root helpers dedupe by raw string spelling only — no cleaning,
+/// symlink resolution, or `os.SameFile` inode dedup (that is Task 22's job).
+/// This pins the Go-faithful string-spelling + `/proc/self/fd` behavior; the
+/// real cwd//tmp/$TMPDIR/configured default root set and session-root inode
+/// dedup are deliberately NOT built or tested here (Task 22 handoff).
+#[test]
+fn writable_roots_dedupes_by_string_spelling_and_fd_paths() {
+    // Different spellings of one place are distinct entries: dedupe is a
+    // HashSet over the raw OsString, not over inodes or cleaned paths.
+    let given = vec![
+        PathBuf::from("/a"),
+        PathBuf::from("/a/"), // different spelling -> kept
+        PathBuf::from("/a"),  // exact duplicate -> dropped
+        PathBuf::from("/b"),
+    ];
+    let spellings: Vec<String> = dedupe_paths(&given)
+        .iter()
+        .map(|p| p.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(spellings, vec!["/a", "/a/", "/b"]);
+
+    // writable_roots = explicit roots (first-seen, deduped) then one
+    // /proc/self/fd/<fd> per fd number, in one final dedupe pass.
+    let roots = writable_roots(
+        &[
+            PathBuf::from("/x"),
+            PathBuf::from("/x"),
+            PathBuf::from("/proc/self/fd/3"),
+        ],
+        &[3, 4],
+    );
+    assert_eq!(
+        roots,
+        vec![
+            PathBuf::from("/x"),
+            PathBuf::from("/proc/self/fd/3"),
+            PathBuf::from("/proc/self/fd/4"),
+        ]
+    );
+
+    // An fd-derived root spelled exactly like an explicit root collapses.
+    assert_eq!(
+        writable_roots(&[PathBuf::from("/proc/self/fd/5")], &[5]),
+        vec![PathBuf::from("/proc/self/fd/5")]
+    );
+    // Empty roots + no fds => read-only mode (no writable roots).
+    assert!(writable_roots(&[], &[]).is_empty());
+}
+
 #[test]
 fn landlock_abi_is_consistent_with_available() {
     match landlock_abi() {
