@@ -568,6 +568,19 @@ impl McpServer {
         let _ = self.state.wait_idle(deadline).await;
     }
 
+    /// Number of calls still running after [`Self::close`]. The shutdown path
+    /// logs this because a dependency that ignores cancellation is the only way
+    /// the grace period elapses.
+    pub fn active_calls(&self) -> usize {
+        self.state.active_count()
+    }
+
+    /// Number of notifications the client's bounded channel refused. The
+    /// shutdown path reports it so a client that could not keep up is visible.
+    pub fn dropped_notifications(&self) -> u64 {
+        self.state.dropped.load(Ordering::SeqCst)
+    }
+
     fn initialize_result(&self, params: Option<&Value>) -> Value {
         let requested = params
             .and_then(|params| params.get("protocolVersion"))

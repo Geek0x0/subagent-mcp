@@ -1,22 +1,36 @@
-//! Command-line entry point and flag parsing.
+//! Command-line entry point, flag parsing, and the serve lifecycle.
 //!
-//! Ports Go `cmd/subagent-mcp/main.go` (subagent-mcp v0.13.1) up to the serve
-//! lifecycle. The parser reproduces Go `flag` semantics: `-flag` and `--flag`
-//! are equivalent, parsing stops at the first positional argument, `--` ends
-//! flags, an unknown flag prints `flag provided but not defined: -x` plus usage
-//! to stderr and exits 2, and help exits 0.
+//! Ports Go `cmd/subagent-mcp/main.go` (subagent-mcp v0.13.1). The parser
+//! reproduces Go `flag` semantics: `-flag` and `--flag` are equivalent, parsing
+//! stops at the first positional argument, `--` ends flags, an unknown flag
+//! prints `flag provided but not defined: -x` plus usage to stderr and exits 2,
+//! and help exits 0.
 //!
 //! Task 25A owns the flags, `--check-config`, and the main-process setup
-//! (non-dumpable on Linux, scrubbed environment, protected config file). The
-//! stdio serve loop is Task 25B: [`serve`] returns a clear error until then.
+//! (non-dumpable on Linux, scrubbed environment, protected config file). Task
+//! 25B owns the stdio serve lifecycle: the detached stdin reader and stdout
+//! writer, first-signal graceful shutdown, second-signal exit 130, stdin EOF
+//! cleanup, and the shared ten-second shutdown budget.
 
 use std::ffi::OsString;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::time::Duration;
 
+use tokio_util::sync::CancellationToken;
+
+use crate::agent::session::SessionManager;
 use crate::check;
 use crate::config::{self, Config};
+use crate::mcp::server::{McpError, McpServer, ToolHandler};
+use crate::mcp::stdio::{self, StdoutWriter};
+use crate::mcp::tools::SubagentTools;
 use crate::util::json::go_quote;
+
+/// Go `shutdownGrace`: how long the process waits for in-flight runs to unwind
+/// and for sessions and provider resources to be released.
+pub const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// A CLI failure with the exact operator-facing message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,9 +106,210 @@ pub fn validate_tool_name(name: &str) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Serve the MCP stdio protocol. The lifecycle belongs to Task 25B.
-pub fn serve(_config: Config, _tool_name: String) -> Result<(), CliError> {
-    Err(err("serve lifecycle is implemented in Task 25B"))
+/// Serve the MCP stdio protocol until stdin reaches EOF or a signal asks the
+/// server to stop, then shut down within [`SHUTDOWN_GRACE`].
+///
+/// The process exits through [`std::process::exit`] after the writer drains, so
+/// the detached stdin thread is never joined and a dependency that ignores
+/// cancellation cannot keep the process alive. Setup failures return an error
+/// before the loop starts.
+pub async fn serve(config: Config, tool_name: String) -> Result<(), CliError> {
+    let mut signals =
+        Signals::new().map_err(|error| err(format!("install the signal handler: {error}")))?;
+
+    let manager = Arc::new(SessionManager::new());
+    let tools: Arc<dyn ToolHandler> = Arc::new(SubagentTools::new(
+        tool_name,
+        Arc::new(config),
+        Arc::clone(&manager),
+    ));
+    let server = McpServer::new(
+        "subagent-mcp".to_string(),
+        crate::VERSION.to_string(),
+        tools,
+    );
+
+    let frames = stdio::spawn_stdin_reader();
+    let writer = StdoutWriter::spawn();
+    let out = writer.sender();
+
+    // The serve loop runs as a task so a signal can stop it while it is parked
+    // on stdin; the loop itself returns cleanly on EOF and on `close`.
+    let serve_server = server.clone();
+    let mut serve_task = tokio::spawn(async move { serve_server.serve(frames, out).await });
+
+    let stop = tokio::select! {
+        joined = &mut serve_task => Stop::Served(joined),
+        name = signals.next() => Stop::Signal(name),
+    };
+    let signal_path = matches!(&stop, Stop::Signal(_));
+
+    let mut code = 0;
+    let mut pending: Option<tokio::task::JoinHandle<Result<(), McpError>>> = None;
+    match stop {
+        Stop::Served(joined) => match joined {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                log_line(&error);
+                code = 1;
+            }
+            Err(error) => {
+                log_line(format!("serve task failed: {error}"));
+                code = 1;
+            }
+        },
+        Stop::Signal(name) => {
+            log_line(format!("received {name}; shutting down"));
+            pending = Some(serve_task);
+        }
+    }
+
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_GRACE;
+    let cleanup = async {
+        // Stop reading, cancel every active call, and wait for the handlers.
+        // Queued calls are cancelled as they begin because `close` sets the
+        // closing flag first.
+        server.close(remaining(deadline)).await;
+        if server.active_calls() > 0 {
+            log_line("shutdown: in-flight calls did not finish in time; releasing sessions anyway");
+        }
+
+        // Sessions go next: releasing their bound directories and closing their
+        // provider threads (which interrupts a pending Codex turn) is what makes
+        // the provider pool safe to release.
+        let session_cancel = CancellationToken::new();
+        match tokio::time::timeout(remaining(deadline), manager.close(&session_cancel)).await {
+            Ok(()) => {}
+            Err(_) => {
+                log_line("shutdown: a session is still busy; leaving it to process exit");
+            }
+        }
+
+        // On the signal path, ending the serve loop is how `close` stops it;
+        // the loop reports success rather than the cancellation Go's mcp-go
+        // loop returns, so only a genuine error changes the exit code.
+        if let Some(task) = pending.as_mut() {
+            match tokio::time::timeout(remaining(deadline), task).await {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(error))) => {
+                    log_line(&error);
+                    code = 1;
+                }
+                Ok(Err(error)) => {
+                    log_line(format!("serve task failed: {error}"));
+                    code = 1;
+                }
+                Err(_) => log_line(format!(
+                    "shutdown: the stdio loop did not stop within {}s",
+                    SHUTDOWN_GRACE.as_secs()
+                )),
+            }
+        }
+
+        let dropped = server.dropped_notifications();
+        if dropped > 0 {
+            log_line(format!(
+                "shutdown: the client's notification channel refused {dropped} event(s); the client was not keeping up"
+            ));
+        }
+
+        // Provider resources go last, and within the same budget: a pool whose
+        // child is being dialed holds its gate until that dial returns, and
+        // shutdown must not outlast the grace period it promises.
+        let shutdown = tokio::task::spawn_blocking(crate::provider::shutdown);
+        match tokio::time::timeout(remaining(deadline), shutdown).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => log_line(format!("shutdown: provider cleanup task failed: {error}")),
+            Err(_) => log_line(format!(
+                "shutdown: a provider did not release its resources within {}s",
+                SHUTDOWN_GRACE.as_secs()
+            )),
+        }
+
+        // Drain every frame already handed to the writer before exiting; the
+        // detached stdin thread is deliberately not joined.
+        match tokio::time::timeout(remaining(deadline), writer.flush()).await {
+            Ok(()) => {}
+            Err(_) => log_line("shutdown: the client's output did not drain in time"),
+        }
+    };
+
+    if signal_path {
+        // A second signal abandons the wait: an operator must always be able to
+        // stop a server parked on a dependency that ignores cancellation.
+        tokio::select! {
+            _ = cleanup => {}
+            name = signals.next() => {
+                log_line(format!("received a second signal ({name}); exiting immediately"));
+                std::process::exit(130);
+            }
+        }
+    } else {
+        cleanup.await;
+    }
+
+    std::process::exit(code);
+}
+
+/// Why the serve loop stopped. `Served` carries the task result so EOF reports
+/// a channel failure exactly once.
+enum Stop {
+    Served(Result<Result<(), McpError>, tokio::task::JoinError>),
+    Signal(&'static str),
+}
+
+/// The remaining slice of the shared shutdown budget.
+fn remaining(deadline: tokio::time::Instant) -> Duration {
+    deadline.saturating_duration_since(tokio::time::Instant::now())
+}
+
+/// The one stderr logger for the serve path, shaped like Go's `log` package.
+/// API keys, config values, and request bodies are never passed here.
+fn log_line(message: impl std::fmt::Display) {
+    eprintln!(
+        "{} {message}",
+        chrono::Local::now().format("%Y/%m/%d %H:%M:%S")
+    );
+}
+
+/// SIGINT/SIGTERM on Unix; Ctrl-C on Windows, which has no SIGTERM.
+#[cfg(unix)]
+struct Signals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl Signals {
+    fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+        Ok(Self {
+            interrupt: signal(SignalKind::interrupt())?,
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    async fn next(&mut self) -> &'static str {
+        tokio::select! {
+            _ = self.interrupt.recv() => "SIGINT",
+            _ = self.terminate.recv() => "SIGTERM",
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct Signals;
+
+#[cfg(not(unix))]
+impl Signals {
+    fn new() -> io::Result<Self> {
+        Ok(Self)
+    }
+
+    async fn next(&mut self) -> &'static str {
+        let _ = tokio::signal::ctrl_c().await;
+        "SIGINT"
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -238,14 +453,14 @@ fn run_serve() -> i32 {
     let path = match config::default_path() {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("{error}");
+            log_line(&error);
             return 1;
         }
     };
     let config = match config::load(&path) {
         Ok(config) => config,
         Err(error) => {
-            eprintln!("{error}");
+            log_line(&error);
             return 1;
         }
     };
@@ -256,17 +471,30 @@ fn run_serve() -> i32 {
         let value = value.to_string_lossy().into_owned();
         if !value.is_empty() {
             if let Err(error) = validate_tool_name(&value) {
-                eprintln!("{error}");
+                log_line(&error);
                 return 1;
             }
             tool_name = value;
         }
     }
 
-    match serve(config, tool_name) {
+    // The helper has already run, so this is the first Tokio runtime in the
+    // process. `serve` exits through `std::process::exit` once the writer has
+    // drained; only a setup failure returns here.
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            log_line(format!("start the async runtime: {error}"));
+            return 1;
+        }
+    };
+    match runtime.block_on(serve(config, tool_name)) {
         Ok(()) => 0,
         Err(error) => {
-            eprintln!("{error}");
+            log_line(&error);
             1
         }
     }
