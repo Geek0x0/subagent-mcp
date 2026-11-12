@@ -12,9 +12,11 @@
 //! drain-on-drop, and JSON replay helpers), and [`sse`] (a byte/line reader
 //! only; provider-specific framing state machines belong to the later adapter
 //! tasks). Task 10 adds the first adapter, [`chat_completions`]; Task 11 adds
-//! the [`responses`] adapter.
+//! the [`responses`] adapter; Task 12 adds the [`messages`] adapter; Task 13A
+//! adds the [`codex`] client and process pool.
 
 pub mod chat_completions;
+pub mod codex;
 pub mod factory;
 pub mod messages;
 pub mod responses;
