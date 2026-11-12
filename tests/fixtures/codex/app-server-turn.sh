@@ -12,7 +12,10 @@
 # Scripted turn: one agentMessage ("hello from codex") delivered as two
 # item/agentMessage/delta events plus the completed item, then turn/completed.
 IFS= read -r line || exit 0
-RECORD="${FAKE_CODEX_RECORD:-/dev/null}"
+# The pool dialer scrubs the child environment, so the record path is a fixed
+# well-known file under /tmp rather than an env var. The differential tests
+# delete it before and after each run and serialize codex scenarios on a mutex.
+RECORD="${FAKE_CODEX_RECORD:-/tmp/subagent-mcp-codex-app-server-record.jsonl}"
 
 while true; do
   printf '%s\n' "$line" >> "$RECORD"

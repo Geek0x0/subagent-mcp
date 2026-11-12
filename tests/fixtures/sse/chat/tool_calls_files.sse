@@ -1,0 +1,8 @@
+data: {"id": "c1", "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_s", "type": "function", "function": {"name": "shell", "arguments": "{\"command\": \"ls\"}"}}, {"index": 1, "id": "call_r", "type": "function", "function": {"name": "read_file", "arguments": "{\"path\": \"a.txt\"}"}}, {"index": 2, "id": "call_w", "type": "function", "function": {"name": "write_file", "arguments": "{\"path\": \"out.txt\", \"content\": \"written by tool\\n\"}"}}]}}]}
+
+data: {"id": "c1", "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]}
+
+data: {"id": "c1", "choices": [], "usage": {"prompt_tokens": 11, "completion_tokens": 12, "total_tokens": 23}}
+
+data: [DONE]
+

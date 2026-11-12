@@ -5,6 +5,8 @@
 //! the documented volatile fields. Task 27 builds its scenarios on these
 //! interfaces.
 
+pub mod golden;
+pub mod mock_http;
 pub mod normalize;
 
 use std::env;
@@ -301,6 +303,19 @@ impl McpProcess {
     /// Frames without a matching id are retained for
     /// [`McpProcess::notifications`].
     pub fn request(&mut self, request: Value) -> Value {
+        self.request_with_hook(request, |_| None)
+    }
+
+    /// Send a request and return the response with the same id, running
+    /// `hook` for every non-response frame observed while waiting (in arrival
+    /// order). A hook may answer with a frame to send back (e.g. a
+    /// `notifications/cancelled` the instant the first `subagent/event`
+    /// arrives) or `None` to do nothing.
+    pub fn request_with_hook(
+        &mut self,
+        request: Value,
+        mut hook: impl FnMut(&Value) -> Option<Value>,
+    ) -> Value {
         let id = request
             .get("id")
             .cloned()
@@ -317,6 +332,11 @@ impl McpProcess {
                 Ok(Ok(frame)) => {
                     if frame.get("method").is_none() && frame.get("id") == Some(&id) {
                         return frame;
+                    }
+                    if let Some(reply) = hook(&frame) {
+                        self.send(&reply).unwrap_or_else(|error| {
+                            panic!("write MCP hook frame: {error}; stderr:\n{}", self.stderr())
+                        });
                     }
                     self.notifications.push(frame);
                 }

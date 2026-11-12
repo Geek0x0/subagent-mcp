@@ -19,3 +19,15 @@ mod cli_config;
 
 #[path = "differential/mcp.rs"]
 mod mcp;
+
+#[path = "differential/agent.rs"]
+mod agent;
+
+#[path = "differential/providers.rs"]
+mod providers;
+
+#[path = "differential/tools.rs"]
+mod tools;
+
+#[path = "differential/rollout.rs"]
+mod rollout;
