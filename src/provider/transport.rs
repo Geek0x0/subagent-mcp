@@ -406,10 +406,9 @@ impl PooledResponse {
         self.inner.as_ref().map(|r| r.status())
     }
 
-    /// Response headers. Adapters that port an SDK retry policy need the
-    /// server-directed hints (`x-should-retry`, `Retry-After-Ms`,
-    /// `Retry-After`) before the body is consumed. Read-only: the body still
-    /// streams lazily through [`PooledResponse::chunk`].
+    /// Response headers of the held response. Adapters need `Retry-After` /
+    /// `x-should-retry` to apply the SDK retry policy. Read-only: the body
+    /// still streams lazily through [`PooledResponse::chunk`].
     pub fn headers(&self) -> Option<&reqwest::header::HeaderMap> {
         self.inner.as_ref().map(|r| r.headers())
     }

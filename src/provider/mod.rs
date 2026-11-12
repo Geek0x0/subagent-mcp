@@ -16,6 +16,7 @@
 
 pub mod chat_completions;
 pub mod factory;
+pub mod messages;
 pub mod responses;
 pub mod sse;
 pub mod tls;
@@ -27,6 +28,7 @@ pub mod types;
 pub use factory::{register_shutdown, shutdown};
 
 pub use chat_completions::ChatCompletions;
+pub use messages::Messages;
 pub use responses::Responses;
 
 pub use types::{
