@@ -36,7 +36,7 @@ pub const MAX_QUEUED_EVENTS: usize = 4096;
 const DELTA_METHOD: &str = "item/agentMessage/delta";
 
 /// Exact subagent-mcp-authored refusal for a server request no thread consumes.
-const UNSUPPORTED_REQUEST: &str = "not supported by subagent-mcp";
+pub(crate) const UNSUPPORTED_REQUEST: &str = "not supported by subagent-mcp";
 
 /// Exact subagent-mcp-authored error after a thread subscription is closed.
 const SUBSCRIPTION_CLOSED: &str = "codex app-server subscription closed";
@@ -864,7 +864,7 @@ impl Subscription {
         self.inner.state.lock().unwrap().permanent
     }
 
-    fn enqueue(&self, message: Message) {
+    pub(crate) fn enqueue(&self, message: Message) {
         let mut state = self.inner.state.lock().unwrap();
         if state.error.is_some() {
             return;
@@ -928,7 +928,7 @@ impl Subscription {
         }
     }
 
-    fn close(&self, error: ClientError) -> Vec<Message> {
+    pub(crate) fn close(&self, error: ClientError) -> Vec<Message> {
         let mut state = self.inner.state.lock().unwrap();
         if state.error.is_some() {
             return Vec::new();
