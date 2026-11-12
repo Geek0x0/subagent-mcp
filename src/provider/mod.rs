@@ -14,6 +14,7 @@
 //! tasks).
 
 pub mod factory;
+pub mod messages;
 pub mod sse;
 pub mod tls;
 pub mod transport;

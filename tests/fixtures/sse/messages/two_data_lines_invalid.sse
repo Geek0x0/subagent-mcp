@@ -1,0 +1,4 @@
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[]}}
+data: {"type":"message_start","message":{"id":"msg_2","type":"message","role":"assistant","content":[]}}
+
