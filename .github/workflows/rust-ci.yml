@@ -13,6 +13,7 @@ jobs:
   verify:
     name: fmt / clippy / test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -33,6 +34,119 @@ jobs:
 
       # Differential tests are cfg-gated to Linux x86_64; on macOS/Windows they
       # report zero differential tests instead of trying to run the Linux
-      # reference binary.
+      # reference binary. Platform files are crate-level cfg-gated, so each
+      # runner compiles all of them and runs only the applicable one.
       - name: tests
         run: cargo test --all-targets
+
+  # ---------------------------------------------------------------------------
+  # Platform runtime and TLS trust gates (Task 28).
+  #
+  # Each job runs the platform's own test binary plus the shared TLS trust
+  # matrix. These are native runs: no cross-build is accepted as evidence for a
+  # target that is not the runner's architecture. Results are recorded in
+  # docs/release/live-smoke-evidence.md.
+  # ---------------------------------------------------------------------------
+  platform-linux:
+    name: platform (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+    env:
+      # The Landlock case must fail, not skip, on a CI kernel without it.
+      SUBAGENT_MCP_REQUIRE_LANDLOCK: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      # Linux has no per-user trust store in the crate's path: the tests use
+      # SSL_CERT_FILE with a generated bundle, so no store mutation is needed.
+      - name: platform runtime + TLS trust tests
+        run: cargo test --test platform_linux --test tls_platform -v
+
+  platform-macos:
+    name: platform (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-x86_64
+            runner: macos-15-intel
+          - name: macos-arm64
+            runner: macos-15
+    env:
+      # tls_platform installs a temporary root in the login keychain to prove
+      # Security.framework trust and distrust, then removes it.
+      SUBAGENT_MCP_PLATFORM_TRUST_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: platform runtime + TLS trust tests
+        run: cargo test --test platform_macos --test tls_platform -v
+
+      # The store case is #[ignore]d so a missing env var can never count as a
+      # pass in the general matrix. This job must run it.
+      - name: platform trust-store tests
+        run: cargo test --test tls_platform -- --ignored -v
+
+      - name: Remove the temporary trust root
+        if: always()
+        run: bash scripts/tls-test-fixtures.sh cleanup "subagent-mcp platform trust test CA"
+
+  platform-windows:
+    name: platform (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            runner: windows-2022
+          # GitHub-hosted Windows arm64. If this runner label is unavailable,
+          # run the same commands on a Windows arm64 VM and record the test
+          # command, binary SHA-256, Windows build number, and pass/fail result
+          # in docs/release/live-smoke-evidence.md. A cargo-xwin cross-build is
+          # not acceptance.
+          - name: windows-arm64
+            runner: windows-11-arm
+    env:
+      # tls_platform installs a temporary root in the CurrentUser Root store to
+      # prove CryptoAPI trust and distrust, then removes it.
+      SUBAGENT_MCP_PLATFORM_TRUST_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: platform runtime + TLS trust tests
+        shell: pwsh
+        run: cargo test --test platform_windows --test tls_platform -v
+
+      # The store case is #[ignore]d so a missing env var can never count as a
+      # pass in the general matrix. This job must run it.
+      - name: platform trust-store tests
+        shell: pwsh
+        run: cargo test --test tls_platform -- --ignored -v
+
+      - name: Remove the temporary trust root
+        if: always()
+        shell: pwsh
+        run: |
+          certutil -delstore -user Root "subagent-mcp platform trust test CA" 2>$null
+          certutil -delstore -user Disallowed "subagent-mcp platform trust test CA" 2>$null
