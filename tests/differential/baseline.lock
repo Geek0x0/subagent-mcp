@@ -1,0 +1,10 @@
+# Pinned Go baseline for the differential harness.
+#
+# Captured from the v0.13.1 release. Do not edit by hand: bump the version,
+# commit, artifact, and SHA-256 together when the baseline moves.
+version = "0.13.1"
+commit = "fe563a12ad30046c0d5be27fdddf9f18d39e8e47"
+repo = "Geek0x0/subagent-mcp"
+artifact = "subagent-mcp_0.13.1_linux_amd64.tar.gz"
+sha256 = "7ead1f164a1c8e05a4cf5e5d2f22f19746ffa5f315f44f13b0b505c6034f13dc"
+binary = "subagent-mcp"

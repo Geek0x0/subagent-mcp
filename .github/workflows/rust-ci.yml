@@ -37,12 +37,40 @@ jobs:
       - name: codex fake fixture version
         run: cargo test --test codex_fake -- --exact fixture_version_is_pinned
 
-      # Differential tests are cfg-gated to Linux x86_64; on macOS/Windows they
-      # report zero differential tests instead of trying to run the Linux
-      # reference binary. Platform files are crate-level cfg-gated, so each
-      # runner compiles all of them and runs only the applicable one.
+      # Differential tests are cfg-gated to Linux x86_64 and need the pinned Go
+      # reference artifact. The `differential` job below fetches that artifact
+      # and runs them; every runner here skips the `differential_` test names so
+      # a missing artifact cannot turn into a silent pass. Platform files are
+      # crate-level cfg-gated, so each runner compiles all of them and runs only
+      # the applicable one.
       - name: tests
-        run: cargo test --all-targets
+        run: cargo test --all-targets -- --skip differential_
+
+  # ---------------------------------------------------------------------------
+  # Differential harness (Task 26).
+  #
+  # The reference is the pinned Go v0.13.1 linux_amd64 release. The fetch
+  # script verifies its SHA-256 before extracting it; this job then requires the
+  # artifact (`SUBAGENT_MCP_REQUIRE_BASELINE=1`) so a download regression fails
+  # instead of skipping the differential assertions.
+  # ---------------------------------------------------------------------------
+  differential:
+    name: differential (linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Fetch pinned Go 0.13.1 baseline
+        run: bash scripts/fetch-baseline.sh
+
+      - name: differential tests
+        env:
+          SUBAGENT_MCP_REQUIRE_BASELINE: "1"
+        run: cargo test --test differential -v
 
   # ---------------------------------------------------------------------------
   # Packaging test (Task 29A).
