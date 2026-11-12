@@ -400,7 +400,9 @@ struct ProcessInner {
 
 impl ProcessInner {
     async fn close(mut self) {
-        // Closing stdin lets the app-server exit on its own.
+        // Closing stdin lets the app-server exit on its own. `close_writer` does
+        // not wait for an in-flight write, so a wedged child cannot delay the
+        // timer below; it falls through to the kill path.
         self.client.close_writer().await;
         if tokio::time::timeout(CLOSE_TIMEOUT, self.child.wait())
             .await

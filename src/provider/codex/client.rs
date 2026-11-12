@@ -631,8 +631,16 @@ impl Client {
     }
 
     /// Drop the write half, which closes the child's stdin.
+    ///
+    /// This must never wait for an in-flight write: a wedged child leaves
+    /// `write_all`/`flush` pending while holding the writer, and the caller's
+    /// kill timer only starts after this returns. Go's `stdin.Close()` is
+    /// immediate, so a busy writer is left for the caller's kill path instead of
+    /// blocking close/shutdown.
     pub async fn close_writer(&self) {
-        self.inner.writer.lock().await.take();
+        if let Ok(mut writer) = self.inner.writer.try_lock() {
+            writer.take();
+        }
     }
 
     /// Stop the reader and fail every pending call and subscription.
@@ -670,7 +678,13 @@ impl Inner {
         bytes.push(b'\n');
         let mut writer = self.writer.lock().await;
         let Some(writer) = writer.as_mut() else {
-            return Err(ClientError::message("codex app-server writer closed"));
+            // Classify like Go's `processWriter`: a write to the closed stdin is
+            // a closed pipe, so `Conn::failure` reaps the child and reports its
+            // stderr instead of surfacing a bare writer error.
+            return Err(ClientError::Io(Arc::new(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "codex app-server writer closed",
+            ))));
         };
         writer.write_all(&bytes).await?;
         writer.flush().await?;

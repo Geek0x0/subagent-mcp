@@ -7,15 +7,17 @@
 
 use std::collections::VecDeque;
 use std::future::Future;
+use std::io;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use serde_json::value::RawValue;
 use serde_json::{Value, json};
 use tokio::io::{
-    AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf, split,
+    AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf, split,
 };
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -124,6 +126,31 @@ fn new_peer() -> (Arc<Client>, Peer) {
             writer: peer_write,
         },
     )
+}
+
+/// A writer whose first write never completes, like a child that stopped
+/// draining its stdin.
+struct WedgedWriter {
+    started: Arc<Notify>,
+}
+
+impl AsyncWrite for WedgedWriter {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        _buffer: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.started.notify_one();
+        Poll::Pending
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Poll::Ready(Ok(()))
+    }
 }
 
 /// Wait until the reader has consumed every message written before this call.
@@ -390,6 +417,46 @@ async fn eof_fails_pending_calls_and_subscriptions() {
             .is_eof()
     );
     peer_task.await.unwrap();
+}
+
+#[tokio::test]
+async fn close_writer_does_not_wait_for_wedged_write() {
+    let (client_side, _peer_side) = tokio::io::duplex(64);
+    let (client_read, _client_write) = split(client_side);
+    let started = Arc::new(Notify::new());
+    let client = Client::new(
+        client_read,
+        WedgedWriter {
+            started: started.clone(),
+        },
+    );
+
+    let writer = client.clone();
+    let write = tokio::spawn(async move { writer.notify("wedged", None).await });
+    tokio::time::timeout(Duration::from_secs(2), started.notified())
+        .await
+        .expect("write never started");
+
+    // A child that stops reading its stdin leaves the write pending while it
+    // holds the writer; close must still return so the caller's kill timer runs.
+    tokio::time::timeout(Duration::from_secs(2), client.close_writer())
+        .await
+        .expect("close_writer waited for an in-flight write");
+
+    write.abort();
+}
+
+#[tokio::test]
+async fn write_after_close_is_classified_closed_pipe() {
+    let (client, _peer) = new_peer();
+    client.close_writer().await;
+
+    let err = client
+        .notify("after-close", None)
+        .await
+        .expect_err("write after close");
+    assert!(err.is_closed_pipe(), "post-close write error = {err}");
+    assert_eq!(err.to_string(), "codex app-server writer closed");
 }
 
 #[tokio::test]
@@ -714,6 +781,14 @@ impl pool::Closer for FakeCloser {
 }
 
 fn fake_dialer(scripts: Vec<PeerScript>, stats: Arc<DialStats>) -> Dialer {
+    fake_dialer_with_tail(scripts, stats, None)
+}
+
+fn fake_dialer_with_tail(
+    scripts: Vec<PeerScript>,
+    stats: Arc<DialStats>,
+    stderr_tail: Option<&'static str>,
+) -> Dialer {
     let scripts = Arc::new(Mutex::new(VecDeque::from(scripts)));
     Arc::new(move || {
         let scripts = scripts.clone();
@@ -727,13 +802,16 @@ fn fake_dialer(scripts: Vec<PeerScript>, stats: Arc<DialStats>) -> Dialer {
             stats.dials.fetch_add(1, Ordering::SeqCst);
             let (client, peer) = new_peer();
             let handle = tokio::spawn(script(peer, stats.clone()));
+            let stderr_tail = stderr_tail.map(|tail| {
+                Arc::new(move || tail.to_string()) as Arc<dyn Fn() -> String + Send + Sync>
+            });
             Ok(Dialed {
                 client,
                 closer: Arc::new(FakeCloser {
                     handle: Mutex::new(Some(handle)),
                     stats,
                 }),
-                stderr_tail: None,
+                stderr_tail,
             })
         })
     })
@@ -864,6 +942,60 @@ async fn pool_waiting_caller_can_cancel() {
     let err = first.await.unwrap().expect_err("canceled initializer");
     assert!(err.is_cancelled(), "initializing acquire error = {err}");
     pool.close().await;
+}
+
+#[tokio::test]
+async fn pool_failure_reports_child_exit_with_stderr_tail() {
+    let stats = Arc::new(DialStats::default());
+    let crash = Arc::new(Notify::new());
+    let dialer = fake_dialer_with_tail(
+        vec![handshake_script(crash.clone(), "fake-codex")],
+        stats.clone(),
+        Some("fatal: boom"),
+    );
+    let pool = Arc::new(Pool::new(dialer));
+    let conn = pool.get(&ctx()).await.expect("acquire");
+
+    crash.notify_one();
+    tokio::time::timeout(Duration::from_secs(2), conn.client.done().cancelled())
+        .await
+        .expect("reader saw EOF");
+
+    // EOF is the transport telling us the child went away: report why, not EOF.
+    let err = conn
+        .failure(ClientError::Io(Arc::new(io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            "EOF",
+        ))))
+        .await;
+    assert_eq!(err.to_string(), "codex app-server exited: fatal: boom");
+    assert_eq!(stats.closed.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn pool_failure_reports_child_exit_on_closed_pipe_write() {
+    let stats = Arc::new(DialStats::default());
+    let crash = Arc::new(Notify::new());
+    let dialer = fake_dialer_with_tail(
+        vec![handshake_script(crash, "fake-codex")],
+        stats.clone(),
+        Some("fatal: boom"),
+    );
+    let pool = Arc::new(Pool::new(dialer));
+    let conn = pool.get(&ctx()).await.expect("acquire");
+
+    // A write to a closed stdin can fail before the reader observes EOF.
+    conn.client.close_writer().await;
+    let write = conn
+        .client
+        .notify("after-close", None)
+        .await
+        .expect_err("write after close");
+    assert!(write.is_closed_pipe(), "post-close write error = {write}");
+
+    let err = conn.failure(write).await;
+    assert_eq!(err.to_string(), "codex app-server exited: fatal: boom");
+    assert_eq!(stats.closed.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
