@@ -1042,7 +1042,9 @@ async fn invalid_retry_after_headers_clamp_to_zero_like_go() {
     for (name, value) in [
         ("Retry-After-Ms", "-1"),
         ("Retry-After-Ms", "NaN"),
+        ("Retry-After-Ms", "1e13"),
         ("Retry-After", "inf"),
+        ("Retry-After", "1e10"),
         ("Retry-After", "1e300"),
     ] {
         let mock = Mock::start(vec![

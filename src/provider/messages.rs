@@ -1317,15 +1317,20 @@ fn resolve_endpoint(base_url: &str, path: &str) -> Result<Url, ProviderError> {
     })
 }
 
-/// Convert untrusted `Retry-After` seconds into a `Duration` without the
-/// panics `Duration::from_secs_f64` has for negatives, `NaN`, infinities and
-/// overflow. Go's `retryDelay` clamps with `max(0, d)`, so every invalid value
-/// becomes an immediate retry.
-fn retry_after_duration(seconds: f64) -> Duration {
-    if !seconds.is_finite() || seconds < 0.0 {
+/// Convert an untrusted `Retry-After` delay, in nanoseconds, into a `Duration`
+/// without the panics `Duration::from_secs_f64` has for negatives, `NaN`,
+/// infinities and overflow. Go converts the float to a signed 64-bit
+/// nanosecond count and then clamps with `max(0, d)`: negatives, `NaN`,
+/// infinities, and values at or above `2^63` ns (which wrap negative in int64)
+/// all become an immediate retry.
+fn retry_after_duration(nanoseconds: f64) -> Duration {
+    if !nanoseconds.is_finite() || nanoseconds < 0.0 {
         return Duration::ZERO;
     }
-    Duration::try_from_secs_f64(seconds).unwrap_or(Duration::ZERO)
+    if nanoseconds >= i64::MAX as f64 {
+        return Duration::ZERO;
+    }
+    Duration::from_nanos(nanoseconds as u64)
 }
 
 /// Go SDK `parseRetryAfterHeader`: `Retry-After-Ms` first, then `Retry-After`
@@ -1341,11 +1346,11 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     if let Some(value) = value("retry-after-ms")
         && let Ok(milliseconds) = value.parse::<f64>()
     {
-        return Some(retry_after_duration(milliseconds / 1000.0));
+        return Some(retry_after_duration(milliseconds * 1_000_000.0));
     }
     let value = value("retry-after")?;
     if let Ok(seconds) = value.parse::<f64>() {
-        return Some(retry_after_duration(seconds));
+        return Some(retry_after_duration(seconds * 1_000_000_000.0));
     }
     let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
     let remaining = when.with_timezone(&chrono::Utc) - chrono::Utc::now();
@@ -1534,10 +1539,12 @@ mod tests {
             ("retry-after-ms", "-1"),
             ("retry-after-ms", "NaN"),
             ("retry-after-ms", "inf"),
+            ("retry-after-ms", "1e13"),
             ("retry-after-ms", "1e300"),
             ("retry-after", "-1"),
             ("retry-after", "NaN"),
             ("retry-after", "inf"),
+            ("retry-after", "1e10"),
             ("retry-after", "1e300"),
         ] {
             assert_eq!(
