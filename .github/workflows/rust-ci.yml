@@ -226,7 +226,7 @@ jobs:
       # The store case is #[ignore]d so a missing env var can never count as a
       # pass in the general matrix. This job must run it.
       - name: platform trust-store tests
-        run: cargo test --test tls_platform -- --ignored -v
+        run: cargo test --test tls_platform -- --ignored
 
       - name: Remove the temporary trust root
         if: always()
@@ -267,7 +267,7 @@ jobs:
       # pass in the general matrix. This job must run it.
       - name: platform trust-store tests
         shell: pwsh
-        run: cargo test --test tls_platform -- --ignored -v
+        run: cargo test --test tls_platform -- --ignored
 
       - name: Remove the temporary trust root
         if: always()

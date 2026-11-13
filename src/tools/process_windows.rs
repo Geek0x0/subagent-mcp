@@ -435,7 +435,7 @@ impl ProcThreadAttributeList {
                 0,
                 PROC_THREAD_ATTRIBUTE_HANDLE_LIST as usize,
                 handles.as_ptr() as *const c_void,
-                handles.len() * size_of::<HANDLE>(),
+                std::mem::size_of_val(handles),
                 std::ptr::null_mut(),
                 std::ptr::null(),
             )

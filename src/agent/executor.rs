@@ -50,7 +50,9 @@ use crate::policy::{
     Decision, PolicyError, PolicyRequest, Sandbox, ToolKind, bound_path, evaluate_with_reason,
 };
 use crate::provider::{ToolCall, ToolSpec};
-use crate::sandbox::{BoundDirectory, BoundSandbox, Sandbox as LandlockLauncher};
+#[cfg(unix)]
+use crate::sandbox::BoundSandbox;
+use crate::sandbox::{BoundDirectory, Sandbox as LandlockLauncher};
 use crate::tools::files::read_file_range;
 use crate::tools::shell::{SandboxLauncher, ShellResult, run_shell};
 use crate::util::approval::{ApprovalRequest, Approver};

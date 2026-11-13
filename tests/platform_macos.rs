@@ -21,7 +21,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use subagent_mcp::policy::path::inside_relative;
-use subagent_mcp::sandbox::{BoundDirectory, HELPER_ARG, available, command};
+use subagent_mcp::sandbox::{BoundDirectory, available, command};
 use subagent_mcp::tools::process::{CommandSpec, run_managed_command};
 use subagent_mcp::tools::shell::scrubbed_env;
 use tokio_util::sync::CancellationToken;
