@@ -1319,16 +1319,18 @@ fn resolve_endpoint(base_url: &str, path: &str) -> Result<Url, ProviderError> {
 
 /// Convert untrusted `Retry-After` seconds into a `Duration` without the
 /// panics `Duration::from_secs_f64` has for negatives, `NaN`, infinities and
-/// overflow. Invalid values fall back to the exponential default.
-fn retry_after_duration(seconds: f64) -> Option<Duration> {
+/// overflow. Go's `retryDelay` clamps with `max(0, d)`, so every invalid value
+/// becomes an immediate retry.
+fn retry_after_duration(seconds: f64) -> Duration {
     if !seconds.is_finite() || seconds < 0.0 {
-        return None;
+        return Duration::ZERO;
     }
-    Duration::try_from_secs_f64(seconds).ok()
+    Duration::try_from_secs_f64(seconds).unwrap_or(Duration::ZERO)
 }
 
 /// Go SDK `parseRetryAfterHeader`: `Retry-After-Ms` first, then `Retry-After`
-/// (fractional seconds or an RFC 1123 HTTP date).
+/// (fractional seconds or an RFC 1123 HTTP date). Invalid numeric values clamp
+/// to zero, matching Go's `max(0, retryAfterDelay)`.
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     let value = |name: &str| {
         headers
@@ -1339,11 +1341,11 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     if let Some(value) = value("retry-after-ms")
         && let Ok(milliseconds) = value.parse::<f64>()
     {
-        return retry_after_duration(milliseconds / 1000.0);
+        return Some(retry_after_duration(milliseconds / 1000.0));
     }
     let value = value("retry-after")?;
     if let Ok(seconds) = value.parse::<f64>() {
-        return retry_after_duration(seconds);
+        return Some(retry_after_duration(seconds));
     }
     let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
     let remaining = when.with_timezone(&chrono::Utc) - chrono::Utc::now();
@@ -1525,7 +1527,9 @@ mod tests {
     }
 
     #[test]
-    fn invalid_retry_after_values_fall_back_without_panicking() {
+    fn invalid_retry_after_values_clamp_to_zero_without_panicking() {
+        // Go parses any float and `retryDelay` clamps with max(0, d): NaN/inf/
+        // overflow convert to a negative duration, so all become immediate.
         for (name, value) in [
             ("retry-after-ms", "-1"),
             ("retry-after-ms", "NaN"),
@@ -1538,7 +1542,7 @@ mod tests {
         ] {
             assert_eq!(
                 parse_retry_after(&headers(&[(name, value)])),
-                None,
+                Some(Duration::ZERO),
                 "{name}: {value}"
             );
         }

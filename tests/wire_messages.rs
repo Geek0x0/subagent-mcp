@@ -1038,7 +1038,7 @@ async fn base_url_path_prefix_is_kept_on_the_wire() {
 }
 
 #[tokio::test]
-async fn invalid_retry_after_headers_fall_back_to_the_exponential_default() {
+async fn invalid_retry_after_headers_clamp_to_zero_like_go() {
     for (name, value) in [
         ("Retry-After-Ms", "-1"),
         ("Retry-After-Ms", "NaN"),
@@ -1049,7 +1049,7 @@ async fn invalid_retry_after_headers_fall_back_to_the_exponential_default() {
             ScriptMessage::http_error(429)
                 .scripted()
                 .with_headers(&[(name, value)]),
-            ScriptMessage::text("after fallback").scripted(),
+            ScriptMessage::text("after clamp").scripted(),
         ])
         .await;
 
@@ -1064,14 +1064,14 @@ async fn invalid_retry_after_headers_fall_back_to_the_exponential_default() {
         let (result, _) = run_turn(&provider, request("claude-x", user_only())).await;
         assert_eq!(
             result.expect("invalid Retry-After must not panic").text,
-            "after fallback",
+            "after clamp",
             "{name}: {value}"
         );
         assert_eq!(mock.request_count(), 2, "{name}: {value}");
         assert_eq!(
             *recorded.lock().unwrap(),
-            vec![(0, None)],
-            "{name}: {value} must fall back to the exponential default"
+            vec![(0, Some(Duration::ZERO))],
+            "{name}: {value} must clamp to an immediate retry like Go"
         );
     }
 }
