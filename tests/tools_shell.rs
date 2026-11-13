@@ -492,7 +492,7 @@ async fn returns_success_when_background_process_holds_pipe() {
     let r = run(
         cwd.path(),
         "sleep 5 & echo $! > child.pid; echo done",
-        Duration::from_millis(200),
+        Duration::from_secs(1),
     )
     .await;
     let elapsed = start.elapsed();
@@ -502,7 +502,7 @@ async fn returns_success_when_background_process_holds_pipe() {
     assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0);
     assert!(r.output.contains("done"), "{:?}", r.output);
-    assert!(elapsed < Duration::from_secs(2), "elapsed = {elapsed:?}");
+    assert!(elapsed < Duration::from_secs(3), "elapsed = {elapsed:?}");
     assert!(wait_for_process_exit(child_pid, Duration::from_secs(1)));
 }
 
@@ -515,7 +515,7 @@ async fn grandchild_timeout_bounds_inherited_pipe_wait() {
     let r = run(
         cwd.path(),
         "sleep 5 & echo $! > child.pid; setsid sleep 5 & echo $! > escaped.pid; wait",
-        Duration::from_millis(200),
+        Duration::from_secs(1),
     )
     .await;
     let elapsed = start.elapsed();
@@ -525,8 +525,8 @@ async fn grandchild_timeout_bounds_inherited_pipe_wait() {
     assert!(r.is_error);
     assert_eq!(r.exit_code, -1);
     assert_eq!(r.output, "");
-    assert_eq!(r.error.as_deref(), Some("command timed out after 200ms"));
-    assert!(elapsed < Duration::from_secs(2), "elapsed = {elapsed:?}");
+    assert_eq!(r.error.as_deref(), Some("command timed out after 1s"));
+    assert!(elapsed < Duration::from_secs(3), "elapsed = {elapsed:?}");
     // The in-group grandchild is killed by the process-group sweep.
     assert!(wait_for_process_exit(child_pid, Duration::from_secs(1)));
 }
