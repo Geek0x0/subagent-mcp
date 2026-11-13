@@ -181,8 +181,8 @@ pub(crate) mod test_support {
     use std::time::Duration;
 
     use rcgen::{
-        BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair, KeyUsagePurpose,
-        date_time_ymd,
+        BasicConstraints, CertificateParams, CertifiedIssuer, DnType, IsCa, KeyPair,
+        KeyUsagePurpose, date_time_ymd,
     };
     use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
     use rustls::{ClientConfig, ServerConfig};
@@ -200,10 +200,13 @@ pub(crate) mod test_support {
         pub key: Vec<u8>,
     }
 
-    fn ca_params(constraint: IsCa) -> CertificateParams {
+    fn ca_params(constraint: IsCa, common_name: &str) -> CertificateParams {
         let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = constraint;
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        params
+            .distinguished_name
+            .push(DnType::CommonName, common_name);
         params
     }
 
@@ -214,7 +217,10 @@ pub(crate) mod test_support {
     /// A leaf certificate signed by a temporary root that the tests inject.
     pub(crate) fn ca_signed(san: &str) -> TestCert {
         let ca = CertifiedIssuer::self_signed(
-            ca_params(IsCa::Ca(BasicConstraints::Unconstrained)),
+            ca_params(
+                IsCa::Ca(BasicConstraints::Unconstrained),
+                "subagent-mcp test root",
+            ),
             KeyPair::generate().unwrap(),
         )
         .unwrap();
@@ -231,7 +237,10 @@ pub(crate) mod test_support {
     /// case deterministic instead of depending on the wall clock.
     pub(crate) fn expired_ca_signed(san: &str) -> TestCert {
         let ca = CertifiedIssuer::self_signed(
-            ca_params(IsCa::Ca(BasicConstraints::Unconstrained)),
+            ca_params(
+                IsCa::Ca(BasicConstraints::Unconstrained),
+                "subagent-mcp test root",
+            ),
             KeyPair::generate().unwrap(),
         )
         .unwrap();
@@ -252,12 +261,18 @@ pub(crate) mod test_support {
     /// intermediate is what makes the chain verifiable.
     pub(crate) fn intermediate_chain(san: &str, send_intermediate: bool) -> TestCert {
         let root = CertifiedIssuer::self_signed(
-            ca_params(IsCa::Ca(BasicConstraints::Unconstrained)),
+            ca_params(
+                IsCa::Ca(BasicConstraints::Unconstrained),
+                "subagent-mcp test root",
+            ),
             KeyPair::generate().unwrap(),
         )
         .unwrap();
         let intermediate = CertifiedIssuer::signed_by(
-            ca_params(IsCa::Ca(BasicConstraints::Constrained(0))),
+            ca_params(
+                IsCa::Ca(BasicConstraints::Constrained(0)),
+                "subagent-mcp test intermediate",
+            ),
             KeyPair::generate().unwrap(),
             &root,
         )
