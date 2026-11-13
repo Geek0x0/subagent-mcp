@@ -13,21 +13,15 @@ subagent-mcp is one MCP server binary that exposes a coding agent — real shell
 
 1. Install the binary:
 
-   Download a prebuilt binary for Linux, macOS, or Windows (amd64/arm64) from a [GitHub release](https://github.com/Geek0x0/subagent-mcp/releases). On Windows, the shell tool needs `bash` on `PATH` (e.g. Git Bash); the Landlock sandbox is Linux-only.
+   Download a prebuilt binary for Linux, macOS, or Windows (amd64/arm64) from a [GitHub release](https://github.com/Geek0x0/subagent-mcp/releases). The archive contains `subagent-mcp`, `README.md`, and `config.example.toml`. Put `subagent-mcp` on `PATH`. On Windows, the shell tool needs `bash` on `PATH` (e.g. Git Bash); the Landlock sandbox is Linux-only.
 
-   Or install with Go:
-
-   ```bash
-   go install github.com/Geek0x0/subagent-mcp/cmd/subagent-mcp@latest
-   ```
-
-   Alternatively, from a local clone of the repository, run:
+   Or build from source with Rust 1.94.1:
 
    ```bash
-   go install ./cmd/subagent-mcp
+   cargo build --release --locked
    ```
 
-   Make sure `$(go env GOPATH)/bin` is on `PATH`.
+   The binary is `target/release/subagent-mcp`. The release archives are built with `scripts/package-rust-release.sh`; `go install` is no longer supported after 0.14.0.
 
    Linux is the supported platform. The kernel sandbox needs Landlock (Linux 5.13 or newer); on macOS or an older kernel the server still starts and the native `read_file`, `write_file`, and `apply_patch` tools work, but every auto-allowed `shell` call exits with code 126 rather than run unsandboxed (see [Kernel sandbox for shell calls](#kernel-sandbox-for-shell-calls)). `--check-config` prints a `sandbox  Landlock` line that says which case applies.
 

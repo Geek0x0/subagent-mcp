@@ -18,9 +18,11 @@ Run these checks with Bash:
    command -v subagent-mcp && subagent-mcp --version
    ```
 
-   If the binary is missing, tell the user to run `go install ./cmd/subagent-mcp`
-   from the subagent-mcp repository root and make sure `$(go env GOPATH)/bin` is
-   on PATH.
+   If the binary is missing, tell the user to download a prebuilt
+   `subagent-mcp` binary from the GitHub releases page (or install the Claude
+   Code plugin, whose launcher downloads it) and put it on PATH. Building from
+   source requires Rust 1.94.1 and `cargo build --release --locked`; `go install`
+   is no longer supported after 0.14.0.
 
 2. Validate the config file and each provider:
 

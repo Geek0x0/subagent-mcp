@@ -1,86 +1,233 @@
 name: Release
 
+# Publishing workflow for the Rust-only 0.14.0 release.
+#
+# A tag push is the only trigger. The build jobs package each target exactly
+# once with scripts/package-rust-release.sh; the checksums job downloads those
+# archives (never rebuilds) and writes checksums.txt; the publish job creates a
+# new GitHub release and uploads that same set. It fails if the release already
+# exists, so a rerun cannot silently replace archives or checksums.
+#
+# The runtime-gates job calls rust-ci.yml, which runs the native Linux/macOS/
+# Windows runtime and TLS trust gates. Publishing is blocked on it.
+
 on:
   push:
-    tags: ['v*']
+    tags: ["v*"]
 
 permissions:
   contents: read
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  verify:
-    runs-on: ubuntu-latest
+  verify-version:
+    name: verify tag and version sources
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: Check version
+
+      - name: Check Cargo.toml, VERSION, and tag agree
         run: |
-          version=$(sed -n 's/^const version = "\([^"]*\)"$/\1/p' cmd/subagent-mcp/main.go)
-          test -n "$version" && test "${GITHUB_REF_NAME#v}" = "$version" || {
-            echo "Tag $GITHUB_REF_NAME does not match version $version" >&2
-            exit 1
-          }
-          echo "Tag $GITHUB_REF_NAME matches version $version"
-      - run: go vet ./...
-      - run: go test ./...
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          lib_version=$(sed -n 's/^pub const VERSION: &str = "\(.*\)";$/\1/p' src/lib.rs)
+          test -n "$version"
+          test "$version" = "$lib_version"
+          test "v$version" = "$GITHUB_REF_NAME"
+          printf 'version=%s tag=%s\n' "$version" "$GITHUB_REF_NAME"
+
+  runtime-gates:
+    name: native runtime and TLS gates
+    uses: ./.github/workflows/rust-ci.yml
+    permissions:
+      contents: read
 
   build:
-    needs: verify
-    runs-on: ubuntu-latest
+    name: package (${{ matrix.name }})
+    needs: [verify-version]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
     strategy:
+      fail-fast: false
       matrix:
-        os: [linux, darwin, windows]
-        arch: [amd64, arm64]
+        include:
+          - name: linux-amd64-musl
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            musl: true
+          - name: linux-arm64-musl
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            musl: true
+          - name: macos-amd64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
+            deployment_target: "12.0"
+          - name: macos-arm64
+            target: aarch64-apple-darwin
+            runner: macos-15
+            deployment_target: "12.0"
+          - name: windows-amd64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            crt_static: true
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - name: Build and package
-        env:
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
-          CGO_ENABLED: 0
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Add Rust target
+        run: rustup target add --toolchain 1.94.1 ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: matrix.musl == true
         run: |
-          version=${GITHUB_REF_NAME#v}
-          name="subagent-mcp_${version}_${GOOS}_${GOARCH}"
-          binary=subagent-mcp
-          if [ "$GOOS" = windows ]; then binary+=.exe; fi
-          mkdir -p dist/package
-          go build -trimpath -ldflags "-s -w" -o "dist/package/$binary" ./cmd/subagent-mcp
-          cp README.md config.example.toml dist/package/
-          if [ "$GOOS" = windows ]; then
-            (cd dist/package && zip "../$name.zip" "$binary" README.md config.example.toml)
-          else
-            tar -C dist/package -czf "dist/$name.tar.gz" "$binary" README.md config.example.toml
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Package target
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          target='${{ matrix.target }}'
+          if [ '${{ matrix.musl }}' = 'true' ]; then
+            under=$(printf '%s' "$target" | tr '-' '_')
+            upper=$(printf '%s' "$target" | tr 'a-z-' 'A-Z_')
+            export "CC_${under}=musl-gcc"
+            export "CARGO_TARGET_${upper}_LINKER=musl-gcc"
           fi
+          if [ '${{ matrix.crt_static }}' = 'true' ]; then
+            upper=$(printf '%s' "$target" | tr 'a-z-' 'A-Z_')
+            export "CARGO_TARGET_${upper}_RUSTFLAGS=-C target-feature=+crt-static"
+          fi
+          bash scripts/package-rust-release.sh --version "$version" --target "$target" --out dist
+
       - uses: actions/upload-artifact@v4
         with:
-          name: subagent-mcp-${{ matrix.os }}-${{ matrix.arch }}
+          name: release-target-${{ matrix.target }}
           path: dist/subagent-mcp_*
           if-no-files-found: error
+          retention-days: 7
 
-  release:
-    needs: build
-    runs-on: ubuntu-latest
+  # Native Windows arm64 is a required release gate. A cargo-xwin cross-build
+  # is not acceptance for a published artifact.
+  windows_arm64:
+    name: package (windows-arm64, native)
+    needs: [verify-version]
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Add Rust target
+        run: rustup target add --toolchain 1.94.1 aarch64-pc-windows-msvc
+
+      - name: Package target
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static"
+          bash scripts/package-rust-release.sh --version "$version" --target aarch64-pc-windows-msvc --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-target-aarch64-pc-windows-msvc
+          path: dist/subagent-mcp_*
+          if-no-files-found: error
+          retention-days: 7
+
+  checksums:
+    name: checksums (six targets)
+    needs: [build, windows_arm64]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-target-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify the exact six release archives
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          expected=$(
+            printf '%s\n' \
+              "subagent-mcp_${version}_linux_amd64.tar.gz" \
+              "subagent-mcp_${version}_linux_arm64.tar.gz" \
+              "subagent-mcp_${version}_darwin_amd64.tar.gz" \
+              "subagent-mcp_${version}_darwin_arm64.tar.gz" \
+              "subagent-mcp_${version}_windows_amd64.zip" \
+              "subagent-mcp_${version}_windows_arm64.zip" | LC_ALL=C sort
+          )
+          actual=$(find dist -maxdepth 1 -type f -name 'subagent-mcp_*' -printf '%f\n' | LC_ALL=C sort)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::release archive set mismatch"
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+          while IFS= read -r name; do
+            test -s "dist/$name" || {
+              echo "::error::missing or empty archive: $name"
+              exit 1
+            }
+          done <<< "$expected"
+
+      - name: Generate checksums.txt from the final archives
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum subagent-mcp_* > checksums.txt
+          cat checksums.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-artifacts
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish GitHub release
+    needs: [runtime-gates, checksums]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
+          name: release-artifacts
           path: dist
-          merge-multiple: true
-      - name: Publish release
+
+      - name: Publish once
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
         run: |
-          cd dist
-          sha256sum subagent-mcp_* > checksums.txt
+          set -euo pipefail
           if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
-            gh release upload "$GITHUB_REF_NAME" --clobber subagent-mcp_* checksums.txt
-          else
-            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes subagent-mcp_* checksums.txt
+            echo "::error::release $GITHUB_REF_NAME already exists; refusing to replace archives/checksums"
+            exit 1
           fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag \
+            --generate-notes
