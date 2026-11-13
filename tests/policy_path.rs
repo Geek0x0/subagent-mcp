@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 use subagent_mcp::policy::lexer::analyze_shell;
 use subagent_mcp::policy::path::{bound_path, evaluate, evaluate_with_reason, inside_relative};
 use subagent_mcp::policy::{ApprovalPolicy, Decision, PolicyRequest, Sandbox, ToolKind};
+#[cfg(unix)]
 use subagent_mcp::util::fs::same_file;
 
 fn allowed(command: &str) -> bool {

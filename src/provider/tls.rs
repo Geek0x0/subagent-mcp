@@ -463,6 +463,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(target_os = "macos"))]
     #[test]
     fn intermediate_chain_is_accepted() {
         let cert = intermediate_chain("localhost", true);

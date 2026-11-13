@@ -515,7 +515,10 @@ impl PlatformStoreTrust {
             let der_path = dir.join("root.cer");
             std::fs::write(&der_path, &cert.root[..]).unwrap();
             let der = der_path.to_string_lossy().into_owned();
-            run_certutil(&["-addstore", "-f", "-user", "Root", &der]);
+            run_powershell(&format!(
+                "Import-Certificate -FilePath '{}' -CertStoreLocation Cert:\\CurrentUser\\Root",
+                der.replace('\'', "''")
+            ));
             Self {
                 der_path,
                 common_name: cert.common_name.clone(),
@@ -544,7 +547,10 @@ impl PlatformStoreTrust {
         #[cfg(target_os = "windows")]
         {
             let der = self.der_path.to_string_lossy().into_owned();
-            run_certutil(&["-addstore", "-f", "-user", "Disallowed", &der]);
+            run_powershell(&format!(
+                "Import-Certificate -FilePath '{}' -CertStoreLocation Cert:\\CurrentUser\\Disallowed",
+                der.replace('\'', "''")
+            ));
         }
     }
 }
@@ -602,6 +608,20 @@ fn run_security(args: &[&str]) {
         out.status.success(),
         "sudo security {} failed: {}",
         args.join(" "),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(target_os = "windows")]
+fn run_powershell(script: &str) {
+    let out = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .output()
+        .unwrap_or_else(|e| panic!("powershell: {e}"));
+    assert!(
+        out.status.success(),
+        "powershell failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
 }
