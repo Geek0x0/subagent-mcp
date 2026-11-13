@@ -20,6 +20,7 @@ mod tests {
     use super::*;
     use std::time::{Duration, UNIX_EPOCH};
 
+    #[cfg(not(windows))]
     #[test]
     fn rfc3339_nano_goldens() {
         // Goldens captured from Go 1.27
@@ -42,6 +43,16 @@ mod tests {
             let got = rfc3339_nano(t);
             assert_eq!(got, want, "sec={sec} nsec={nsec}");
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rfc3339_nano_uses_windows_100ns_precision() {
+        // `SystemTime` on Windows is a FILETIME (100 ns ticks), so the
+        // nanosecond field cannot represent 123456789; Go's clock has the same
+        // platform precision.
+        let t = UNIX_EPOCH + Duration::new(1700000000, 123456700);
+        assert_eq!(rfc3339_nano(t), "2023-11-14T22:13:20.1234567Z");
     }
 
     #[test]

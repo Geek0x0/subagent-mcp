@@ -633,13 +633,13 @@ mod tests {
     #[tokio::test]
     async fn build_http_client_uses_the_configured_tls_roots() {
         use crate::provider::tls;
-        let cert = tls::test_support::ca_signed("localhost");
+        let cert = tls::test_support::ca_signed("127.0.0.1");
         let port = tls::test_support::serve(&cert);
         let config = tls::client_config_with_extra_roots(std::slice::from_ref(&cert.root))
             .expect("config with temporary root");
         let client = build_http_client_with_tls(&cfg("key"), config).unwrap();
         let response = client
-            .get(format!("https://localhost:{port}/"))
+            .get(format!("https://127.0.0.1:{port}/"))
             .send()
             .await
             .expect("temporary root rejected by reqwest");

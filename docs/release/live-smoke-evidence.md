@@ -28,9 +28,9 @@ its OS-specific setup with `#[cfg(target_os = "...")]`.
 |---|---|---|---|---|---|
 | Linux x86_64 | `ubuntu-24.04` | `cargo test --test platform_linux --test tls_platform -v` | Landlock helper, `openat2`, process group, WaitDelay | native bundle (`SSL_CERT_FILE`) | **verified locally (see §2)** |
 | Linux arm64 | `ubuntu-24.04-arm` | same | same | same | **PENDING NATIVE EVIDENCE** |
-| macOS x86_64 | `macos-15-intel` | `cargo test --test platform_macos --test tls_platform -v` + `cargo test --test tls_platform -- --ignored -v` | path sandbox, process group | Security.framework, login keychain | **PENDING NATIVE EVIDENCE** |
+| macOS x86_64 | `macos-15-intel` | `cargo test --test platform_macos --test tls_platform -v` + `cargo test --test tls_platform -- --ignored` | path sandbox, process group | Security.framework, login keychain | **PENDING NATIVE EVIDENCE** |
 | macOS arm64 | `macos-15` | same | same | same | **PENDING NATIVE EVIDENCE** |
-| Windows x86_64 | `windows-2022` | `cargo test --test platform_windows --test tls_platform -v` + `cargo test --test tls_platform -- --ignored -v` | Job Object suspended start/assign/resume, path checks, whole-job cleanup | CryptoAPI, CurrentUser stores | **PENDING NATIVE EVIDENCE** |
+| Windows x86_64 | `windows-2022` | `cargo test --test platform_windows --test tls_platform -v` + `cargo test --test tls_platform -- --ignored` | Job Object suspended start/assign/resume, path checks, whole-job cleanup | CryptoAPI, CurrentUser stores | **PENDING NATIVE EVIDENCE** |
 | Windows arm64 | `windows-11-arm` | same | same | same | **PENDING NATIVE EVIDENCE** |
 
 The stdin-open shutdown tests now drive the real `subagent-mcp` lifecycle and
@@ -41,8 +41,11 @@ Task 28 output below predates the completed lifecycle and is retained as history
 
 The OS trust-store case (`platform_store_trust_and_distrust_apply`) is also
 `#[ignore]`d so the general `verify` matrix reports it as **ignored**, never as
-a pass. The dedicated macOS/Windows jobs run it explicitly with `--ignored`
-and `SUBAGENT_MCP_PLATFORM_TRUST_TESTS=1`.
+a pass. The macOS job runs it explicitly with `--ignored` and
+`SUBAGENT_MCP_PLATFORM_TRUST_TESTS=1`. Windows installs a trusted root through
+CryptUI, which needs an interactive desktop; GitHub's hosted Windows runner has
+none, so the Windows store case is run only on a native Windows VM and remains
+PENDING NATIVE EVIDENCE.
 
 What each platform file pins:
 
@@ -167,7 +170,7 @@ $ rustup toolchain install 1.94.1 --profile minimal --component rustfmt --compon
 $ cargo test --test platform_macos --test tls_platform -v
 # Runtime lifecycle tests run unignored; native results pending. Trust-store TLS case requires opt-in.
 $ SUBAGENT_MCP_PLATFORM_TRUST_TESTS=1 \
-    cargo test --test tls_platform -- --ignored -v
+    cargo test --test tls_platform -- --ignored
 # platform_store_trust_and_distrust_apply passes (trust, then explicit distrust)
 $ bash scripts/tls-test-fixtures.sh cleanup "subagent-mcp platform trust test CA"
 ```
@@ -190,7 +193,7 @@ rustup toolchain install 1.94.1 --profile minimal --component rustfmt --componen
 cargo test --test platform_windows --test tls_platform -v
 # Runtime lifecycle tests run unignored; native results pending. Trust-store TLS case requires opt-in.
 $env:SUBAGENT_MCP_PLATFORM_TRUST_TESTS = "1"
-cargo test --test tls_platform -- --ignored -v
+cargo test --test tls_platform -- --ignored
 certutil -delstore -user Root "subagent-mcp platform trust test CA" 2>$null
 certutil -delstore -user Disallowed "subagent-mcp platform trust test CA" 2>$null
 ```

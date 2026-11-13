@@ -418,11 +418,11 @@ mod tests {
 
     #[test]
     fn temporary_root_certificate_is_accepted() {
-        let cert = ca_signed("localhost");
+        let cert = ca_signed("127.0.0.1");
         let port = serve(&cert);
         let config = client_config_with_extra_roots(std::slice::from_ref(&cert.root))
             .expect("config with temporary root");
-        let body = connect(&config, port, "localhost").expect("temporary root rejected");
+        let body = connect(&config, port, "127.0.0.1").expect("temporary root rejected");
         assert!(
             body.ends_with(b"ok"),
             "unexpected response body: {:?}",
@@ -466,11 +466,11 @@ mod tests {
     #[cfg(not(target_os = "macos"))]
     #[test]
     fn intermediate_chain_is_accepted() {
-        let cert = intermediate_chain("localhost", true);
+        let cert = intermediate_chain("127.0.0.1", true);
         let port = serve(&cert);
         let config = client_config_with_extra_roots(std::slice::from_ref(&cert.root))
             .expect("config with temporary root");
-        let body = connect(&config, port, "localhost").expect("intermediate chain rejected");
+        let body = connect(&config, port, "127.0.0.1").expect("intermediate chain rejected");
         assert!(
             body.ends_with(b"ok"),
             "unexpected response body: {:?}",
