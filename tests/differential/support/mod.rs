@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use ring::digest::{SHA256, digest};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// The pinned baseline manifest checked in at `tests/differential/baseline.lock`.
 #[derive(Debug, Clone, Deserialize)]
@@ -392,6 +392,51 @@ impl McpProcess {
     /// Send a notification (or any frame without a response) and flush it.
     pub fn notify(&mut self, notification: Value) -> io::Result<()> {
         self.send(&notification)
+    }
+
+    /// Synchronization barrier between `notifications/initialized` and the
+    /// first `tools/call`: send a `ping` and wait for its response.
+    ///
+    /// mcp-go has an initialized-session race that can drop notifications
+    /// racing the first request; the pong proves the session is fully live.
+    /// The pong is harness plumbing, so it is neither returned nor recorded —
+    /// goldens do not contain it.
+    pub fn initialized_session_barrier(&mut self) {
+        const PING_ID: i64 = 4; // 1 initialize, 2 tools/call, 3 budget follow-up
+        let pong = self.request(json!({
+            "jsonrpc": "2.0",
+            "id": PING_ID,
+            "method": "ping"
+        }));
+        assert_eq!(pong["id"], PING_ID, "barrier ping was not answered");
+    }
+
+    /// Drain non-response frames until `quiet` has passed with no new frame,
+    /// bounded by `overall`. Returns the drained frames in arrival order (they
+    /// are also retained for [`McpProcess::take_notifications`]).
+    ///
+    /// This captures notifications that legally trail the response they
+    /// belong to (e.g. Go writes `subagent/event` frames after the
+    /// `tools/call` result) without imposing any sleep on the compared
+    /// binaries: the quiet window only ever shortens once the server is
+    /// genuinely done.
+    pub fn drain(&mut self, quiet: Duration, overall: Duration) -> Vec<Value> {
+        let start = Instant::now();
+        let mut drained = Vec::new();
+        loop {
+            let left = overall.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            match self.frames.recv_timeout(quiet.min(left)) {
+                Ok(Ok(frame)) => drained.push(frame),
+                Ok(Err(error)) => panic!("invalid MCP frame while draining: {error}"),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        self.notifications.extend(drained.iter().cloned());
+        drained
     }
 
     fn send(&mut self, frame: &Value) -> io::Result<()> {

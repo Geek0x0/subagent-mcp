@@ -50,9 +50,14 @@ pub fn read_text(rel: &str) -> String {
 
 /// Rollout-only volatile keys the shared normalizer does not own: the local
 /// date the turn ran on, the epoch bookends of a turn, and the capturing
-/// binary's version. Everything else goes through `normalize::value`.
+/// binary's version. `started_at` is written with whole-second precision, so
+/// two turns in the same wall-clock second carry the same value and the
+/// boundary itself is timing-dependent — it must not be compared for value.
 fn rollout_volatile_key(key: &str) -> bool {
-    matches!(key, "current_date" | "completed_at" | "cli_version")
+    matches!(
+        key,
+        "current_date" | "completed_at" | "started_at" | "cli_version"
+    )
 }
 
 /// Timing fields whose *value* is timing-dependent even though their presence

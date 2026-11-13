@@ -1,2 +1,6 @@
-{"id": 1, "jsonrpc": "2.0", "result": {"capabilities": {"tools": {}}, "protocolVersion": "2025-03-26", "serverInfo": {"name": "subagent-mcp", "version": "0.13.1"}}}
-{"id": 2, "jsonrpc": "2.0", "result": {"content": [{"text": "hello from codex", "type": "text"}], "structuredContent": {"content": "hello from codex", "model": "gpt-6-astra", "provider": "codex", "threadId": "c9e8201d-28c3-4815-856f-5f34531ba7e5"}}}
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2025-03-26","serverInfo":{"name":"subagent-mcp","version":"0.13.1"}}}
+{"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"hello from codex","type":"text"}],"structuredContent":{"content":"hello from codex","model":"gpt-6-astra","provider":"codex","threadId":"5172c787-d377-4381-9a77-18ce65e28cad"}}}
+{"jsonrpc":"2.0","method":"subagent/event","params":{"msg":{"delta":"hello ","type":"agent_message_delta"},"threadId":"5172c787-d377-4381-9a77-18ce65e28cad"}}
+{"jsonrpc":"2.0","method":"subagent/event","params":{"msg":{"delta":"from codex","type":"agent_message_delta"},"threadId":"5172c787-d377-4381-9a77-18ce65e28cad"}}
+{"jsonrpc":"2.0","method":"subagent/event","params":{"msg":{"message":"hello from codex","type":"agent_message"},"threadId":"5172c787-d377-4381-9a77-18ce65e28cad"}}
+{"jsonrpc":"2.0","method":"subagent/event","params":{"msg":{"type":"task_complete"},"threadId":"5172c787-d377-4381-9a77-18ce65e28cad"}}

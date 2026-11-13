@@ -5,18 +5,25 @@
 //! The goldens under `tests/fixtures/mcp/` are complete Go 0.13.1 output
 //! streams (responses and `subagent/event` notifications in arrival order)
 //! captured from the pinned binary; they stand alone after the Go tree is
-//! deleted. The progress replay additionally checks in
-//! `mcp/chat-progress.jsonl`, a stream captured with `_meta.progressToken`,
-//! so `notifications/progress` frames (token, per-call sequence, mapped
-//! message) are compared causally per call (review finding 1). Every replay
-//! also compares the rollout JSONL the server wrote under `CODEX_HOME` —
-//! server-written `session_meta` line included — to the golden rollout for
-//! the same scenario (review findings 2 and 3). Every comparison is per
-//! request/thread/turn, collapses consecutive `agent_message_delta` events,
-//! and normalizes volatile fields.
+//! deleted. Every replay synchronizes with a ping barrier after
+//! `notifications/initialized` (so mcp-go's initialized-session race cannot
+//! drop early events) and drains notifications after each response until a
+//! short quiet window passes, capturing frames that trail the response. The
+//! comparison is causal: response frames and notification frames are each
+//! compared in exact order, but the interleaving between the two families is
+//! not compared — notifications may legally trail the response they belong
+//! to. The progress replay additionally checks in `mcp/chat-progress.jsonl`,
+//! a stream captured with `_meta.progressToken`, so `notifications/progress`
+//! frames (token, per-call sequence, mapped message) are compared causally
+//! per call (review finding 1). Every replay also compares the rollout JSONL
+//! the server wrote under `CODEX_HOME` — server-written `session_meta` line
+//! included — to the golden rollout for the same scenario (review findings 2
+//! and 3). Every comparison is per request/thread/turn, collapses
+//! consecutive `agent_message_delta` events, and normalizes volatile fields.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tokio_util::sync::CancellationToken;
@@ -45,6 +52,18 @@ const MESSAGES_TEXT: &str =
 
 const ENV_KEY: &str = "SUBAGENT_DIFFERENTIAL_MOCK_KEY";
 const KEY_VALUE: &str = "mock-key";
+
+/// Quiet window for the post-response drain: once no new frame arrives for
+/// this long, the server is considered done. Long enough to absorb trailing
+/// notifications, short enough not to dominate the suite.
+const DRAIN_QUIET: Duration = Duration::from_millis(200);
+/// Upper bound on one drain, whatever keeps arriving.
+const DRAIN_OVERALL: Duration = Duration::from_secs(5);
+/// Directory override for golden regeneration: when
+/// `SUBAGENT_MCP_CAPTURE_GOLDENS` points at a directory, replays of the
+/// pinned reference write their raw stream to `<dir>/mcp/<name>.jsonl`
+/// instead of comparing (see `tests/coverage.md`).
+const CAPTURE_ENV: &str = "SUBAGENT_MCP_CAPTURE_GOLDENS";
 
 /// Serializes every scenario that touches process state (env vars, adapters,
 /// the shared codex record file).
@@ -552,6 +571,24 @@ fn subagent_call(id: i64, arguments: Value) -> Value {
     })
 }
 
+/// Send one `tools/call` and record the frames it produced in arrival order:
+/// notifications observed while waiting, then the response, then any
+/// notifications that trail the response (captured by the drain). The
+/// response's position relative to the notifications is the real arrival
+/// order; the comparison ignores it either way.
+fn replay_call(
+    process: &mut McpProcess,
+    call: Value,
+    stream: &mut Vec<Value>,
+    hook: impl FnMut(&Value) -> Option<Value>,
+) -> Value {
+    let response = process.request_with_hook(call, hook);
+    stream.extend(process.take_notifications());
+    stream.push(response.clone());
+    stream.extend(process.drain(DRAIN_QUIET, DRAIN_OVERALL));
+    response
+}
+
 /// Replay one scenario end-to-end on `binary` and return its ordered output
 /// stream plus the temp home/cwd the run used (the rollout file under the
 /// home is compared by the caller before they are dropped).
@@ -605,6 +642,10 @@ fn replay_stream(
     process
         .notify(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}))
         .unwrap();
+    // Barrier: prove the initialized session is live before the first call so
+    // mcp-go's initialized-session race cannot drop early events. The pong is
+    // harness plumbing and is not recorded in the compared stream.
+    process.initialized_session_barrier();
 
     let mut call = subagent_call(
         2,
@@ -619,22 +660,15 @@ fn replay_stream(
             "method": "notifications/cancelled",
             "params": {"requestId": 2}
         });
-        let response = process.request_with_hook(call, |frame| {
+        replay_call(&mut process, call, &mut stream, |frame| {
             (frame.get("method")? == "subagent/event"
                 && frame["params"]["msg"]["type"] == "task_started")
                 .then(|| cancelled.clone())
         });
-        stream.extend(process.take_notifications());
-        stream.push(response);
     } else {
-        let response = process.request(call);
-        stream.extend(process.take_notifications());
-        let follow_up_request = replay.follow_up.map(|follow_up| follow_up(&response));
-        stream.push(response);
-        if let Some(second) = follow_up_request {
-            let response = process.request(second);
-            stream.extend(process.take_notifications());
-            stream.push(response);
+        let response = replay_call(&mut process, call, &mut stream, |_| None);
+        if let Some(second) = replay.follow_up.map(|follow_up| follow_up(&response)) {
+            replay_call(&mut process, second, &mut stream, |_| None);
         }
     }
     process.close();
@@ -649,20 +683,67 @@ fn stream_thread_id(stream: &[Value]) -> String {
         .expect("a subagent/event notification carries the threadId")
 }
 
-/// Compare the ordered output stream to the checked-in golden transcript,
-/// normalized (notifications drained before each response, so the comparison
-/// stays causal per call).
+/// Compare the replayed transcript to the golden causally (review finding,
+/// task 27 fix): response frames (initialize, tools/call results) and
+/// non-response frames (`subagent/event`, `notifications/progress`, ...) are
+/// each compared as ordered projections, but the interleaving between the two
+/// families is not compared — notifications may legally trail the response
+/// they belong to, and the harness drains them after each response. Within
+/// each family the order is exact after normalization (delta collapsing is
+/// applied by the runner-level comparisons; the raw frame order here is the
+/// emitted order).
 fn assert_transcript_matches_golden(stream: &[Value], name: &str, home: &Path, cwd: &Path) {
     let golden = read_jsonl(&format!("mcp/{name}.jsonl"));
     let golden_context = golden_context_for(&golden);
     let live_context = NormalizeContext::new()
         .with_temp_root(home)
         .with_temp_root(cwd);
+    let live_frames = normalize_frames(stream.to_vec(), &live_context);
+    let golden_frames = normalize_frames(golden, &golden_context);
+    let responses = |frames: &[Value]| -> Vec<Value> {
+        frames
+            .iter()
+            .filter(|frame| frame.get("method").is_none())
+            .cloned()
+            .collect()
+    };
+    let notifications = |frames: &[Value]| -> Vec<Value> {
+        frames
+            .iter()
+            .filter(|frame| frame.get("method").is_some())
+            .cloned()
+            .collect()
+    };
     assert_eq!(
-        normalize_frames(stream.to_vec(), &live_context),
-        normalize_frames(golden, &golden_context),
-        "replayed MCP transcript differs from golden for {name}"
+        responses(&live_frames),
+        responses(&golden_frames),
+        "response frames differ from golden for {name}"
     );
+    assert_eq!(
+        notifications(&live_frames),
+        notifications(&golden_frames),
+        "notification stream differs from golden for {name}"
+    );
+}
+
+/// The golden-capture directory when regeneration mode is on.
+fn capture_dir() -> Option<PathBuf> {
+    std::env::var_os(CAPTURE_ENV).map(PathBuf::from)
+}
+
+/// Write the pinned reference's raw stream as the `mcp/<name>.jsonl` golden
+/// under `dir` (regeneration mode; every golden is captured from the pinned
+/// binary through this exact harness).
+fn capture_golden(dir: &Path, name: &str, stream: &[Value]) {
+    let mcp_dir = dir.join("mcp");
+    std::fs::create_dir_all(&mcp_dir).unwrap();
+    let mut text = String::new();
+    for frame in stream {
+        text.push_str(&serde_json::to_string(frame).unwrap());
+        text.push('\n');
+    }
+    std::fs::write(mcp_dir.join(format!("{name}.jsonl")), text).unwrap();
+    eprintln!("captured golden mcp/{name}.jsonl ({} frames)", stream.len());
 }
 
 /// Replay one scenario end-to-end on the Rust binary and compare its ordered
@@ -673,6 +754,18 @@ fn assert_transcript_matches_golden(stream: &[Value], name: &str, home: &Path, c
 fn assert_replay_matches_golden(replay: &Replay) -> Vec<Value> {
     let _guard = SCENARIO_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     set_mock_key();
+
+    // Regeneration mode: capture the pinned reference's stream instead of
+    // comparing, then replay the Rust binary once so capture-mode callers can
+    // still assert on its stream families.
+    if let Some(dir) = capture_dir() {
+        let reference = reference_or_skip()
+            .unwrap_or_else(|| panic!("{CAPTURE_ENV} set but the pinned baseline is missing"));
+        let (go_stream, _, _) = replay_stream(&reference.path(), replay);
+        capture_golden(&dir, replay.name, &go_stream);
+        let (stream, _, _) = replay_stream(Path::new(rust_binary()), replay);
+        return stream;
+    }
 
     let (stream, home, cwd) = replay_stream(Path::new(rust_binary()), replay);
     assert_transcript_matches_golden(&stream, replay.name, home.path(), cwd.path());
@@ -687,20 +780,10 @@ fn assert_replay_matches_golden(replay: &Replay) -> Vec<Value> {
     }
 
     // Guard fixture drift: when the pinned reference is available, replay it
-    // against the same golden too.
+    // against the same golden too (same causal comparison).
     if let Some(reference) = reference_or_skip() {
         let (go_stream, go_home, go_cwd) = replay_stream(&reference.path(), replay);
-        let golden = read_jsonl(&format!("mcp/{}.jsonl", replay.name));
-        let golden_context = golden_context_for(&golden);
-        let go_context = NormalizeContext::new()
-            .with_temp_root(go_home.path())
-            .with_temp_root(go_cwd.path());
-        assert_eq!(
-            normalize_frames(go_stream.clone(), &go_context),
-            normalize_frames(golden, &golden_context),
-            "reference transcript drifted from golden for {}",
-            replay.name
-        );
+        assert_transcript_matches_golden(&go_stream, replay.name, go_home.path(), go_cwd.path());
         if let Some(golden_rel) = replay.rollout_golden {
             golden::assert_rollout_for_thread_matches(
                 go_home.path(),
@@ -1001,9 +1084,10 @@ fn differential_mcp_replay_progress_turn_matches_golden() {
         messages,
         vec!["started", "agent: Let me check.", "completed"]
     );
-    // Causal per call: each progress frame directly follows the
-    // `subagent/event` it summarizes (verified against the Go golden's
-    // interleaving by the transcript comparison above).
+    // Causal per call (Rust side): each progress frame directly follows the
+    // `subagent/event` it summarizes. The transcript comparison above checks
+    // each family's order against the Go golden without comparing
+    // response/notification interleaving.
     for frame in &progress {
         let position = stream
             .iter()
@@ -1055,16 +1139,13 @@ fn codex_replay() -> (Replay, tempfile::TempDir) {
 }
 
 /// The full `mcp/codex-turn.jsonl` golden, at the MCP level: the serve process
-/// runs the checked-in scripted fake app-server and the output frames the
-/// golden captured — the initialize response and the tools/call result —
-/// match the pinned Go capture exactly, and the client-to-peer record matches
-/// the Go record golden too.
-///
-/// Known divergence (verified live against the pinned binary while wiring
-/// this golden): Go 0.13.1 emits no `subagent/event` notifications for Codex
-/// sessions, while the Rust port forwards the runner events. The comparison
-/// below pins the frames the golden contains; the extra Rust notifications
-/// are a documented parity divergence, not an asserted behavior.
+/// runs the checked-in scripted fake app-server and the whole output stream —
+/// initialize response, tools/call result, and the complete `subagent/event`
+/// sequence of the call — is compared causally to the golden captured from the
+/// pinned Go binary under this same harness (ping barrier after
+/// `notifications/initialized`, drain after the response, so Go's trailing
+/// notifications are captured; response/notification interleaving itself is
+/// not compared). The client-to-peer record matches the Go record golden too.
 #[test]
 fn differential_mcp_replay_codex_turn_matches_golden() {
     let _guard = SCENARIO_LOCK.lock().unwrap_or_else(|p| p.into_inner());
@@ -1075,13 +1156,44 @@ fn differential_mcp_replay_codex_turn_matches_golden() {
     let _ = std::fs::remove_file(fallback);
 
     let (replay, record_dir) = codex_replay();
+    let record_path = record_dir.path().join("record.jsonl");
+
+    // Regeneration mode captures the reference instead of comparing.
+    if let Some(dir) = capture_dir() {
+        let reference = reference_or_skip()
+            .unwrap_or_else(|| panic!("{CAPTURE_ENV} set but the pinned baseline is missing"));
+        let (go_stream, _, _) = replay_stream(&reference.path(), &replay);
+        capture_golden(&dir, replay.name, &go_stream);
+        let _ = std::fs::remove_file(fallback);
+        return;
+    }
+
     let (stream, home, cwd) = replay_stream(Path::new(rust_binary()), &replay);
-    assert_codex_transcript_frames(&stream, home.path(), cwd.path());
+    assert_transcript_matches_golden(&stream, replay.name, home.path(), cwd.path());
+
+    // The full event sequence of the call, collapsed: exactly the events the
+    // pinned Go binary emits for the Codex turn (two `agent_message_delta`
+    // halves, the final `agent_message`, then `task_complete`).
+    let events: Vec<Value> = stream
+        .iter()
+        .filter(|frame| frame["method"] == "subagent/event")
+        .map(|frame| frame["params"]["msg"].clone())
+        .collect();
+    let events = golden::collapse_deltas(events);
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap().to_string())
+            .collect::<Vec<_>>(),
+        ["agent_message_delta", "agent_message", "task_complete"],
+        "codex event sequence: {events:?}"
+    );
+    assert_eq!(events[0]["delta"], "hello from codex");
+    assert_eq!(events[1]["message"], "hello from codex");
 
     // The client-to-peer record: same lines the Go client sent at capture
     // time, compared with the same temp-root normalization as the
     // adapter-level codex scenario.
-    let record_path = record_dir.path().join("record.jsonl");
     let got = golden::read_rollout(&record_path);
     let want = read_jsonl("codex/turn-record.jsonl");
     assert_eq!(got.len(), want.len(), "record line count");
@@ -1107,49 +1219,9 @@ fn differential_mcp_replay_codex_turn_matches_golden() {
     // Drift guard: the pinned binary must still produce the same frames.
     if let Some(reference) = reference_or_skip() {
         let (go_stream, go_home, go_cwd) = replay_stream(&reference.path(), &replay);
-        assert_codex_transcript_frames(&go_stream, go_home.path(), go_cwd.path());
+        assert_transcript_matches_golden(&go_stream, replay.name, go_home.path(), go_cwd.path());
     }
     let _ = std::fs::remove_file(fallback);
-}
-
-/// Compare the two frames the codex golden captured (initialize response and
-/// tools/call result) positionally.
-fn assert_codex_transcript_frames(stream: &[Value], home: &Path, cwd: &Path) {
-    let golden = read_jsonl("mcp/codex-turn.jsonl");
-    assert_eq!(golden.len(), 2, "golden frame count");
-    let live_context = NormalizeContext::new()
-        .with_temp_root(home)
-        .with_temp_root(cwd);
-    let golden_context = golden_context_for(&golden);
-    let initialize = stream
-        .iter()
-        .find(|frame| frame["id"] == json!(1))
-        .expect("initialize response");
-    let result = stream
-        .iter()
-        .find(|frame| frame["id"] == json!(2) && frame.get("result").is_some())
-        .expect("tools/call result");
-    let golden_initialize = golden
-        .iter()
-        .find(|frame| frame["id"] == json!(1))
-        .expect("golden initialize response");
-    let golden_result = golden
-        .iter()
-        .find(|frame| frame["id"] == json!(2) && frame.get("result").is_some())
-        .expect("golden tools/call result");
-    assert_eq!(
-        golden::normalize_value(golden::blank_timing(initialize.clone()), &live_context),
-        golden::normalize_value(
-            golden::blank_timing(golden_initialize.clone()),
-            &golden_context
-        ),
-        "codex initialize response differs from golden"
-    );
-    assert_eq!(
-        golden::normalize_value(golden::blank_timing(result.clone()), &live_context),
-        golden::normalize_value(golden::blank_timing(golden_result.clone()), &golden_context),
-        "codex tools/call result differs from golden"
-    );
 }
 
 /// A JSON merge helper: `base` wins for overlapping keys only when `overlay`

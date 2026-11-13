@@ -85,9 +85,16 @@ Rust coverage columns:
   `subagent/event` notifications in arrival order) for eleven scenarios:
   chat/responses/messages text turns, tool turn, files turn, patch turn,
   nudge, budget refusal, mid-turn cancellation, auto (Jev) selection, a Codex
-  app-server turn, and a progress turn captured with `_meta.progressToken`
-  (`chat-progress.jsonl`, whose `notifications/progress` frames — token,
-  per-call sequence, mapped message — are compared causally per call).
+  app-server turn (including its full `subagent/event` sequence — two
+  `agent_message_delta` halves, `agent_message`, `task_complete` — which
+  trails the tools/call response), and a progress turn captured with
+  `_meta.progressToken` (`chat-progress.jsonl`, whose
+  `notifications/progress` frames — token, per-call sequence, mapped message
+  — are compared causally per call). Every golden is (re)generatable from the
+  pinned binary through the replay harness itself: set
+  `SUBAGENT_MCP_CAPTURE_GOLDENS=<dir>` and run the differential tests with
+  the baseline; the replays then write the reference's raw streams to
+  `<dir>/mcp/<name>.jsonl` instead of comparing.
 - `tests/fixtures/wire/<scenario>/NN-*.json` — provider HTTP requests
   (method, path, headers, body) recorded by the mock during the same runs,
   plus `expected-tree.txt` for the files turn.
@@ -121,9 +128,16 @@ collapsed within a turn before comparison, progress is compared per call via
 the `chat-progress` replay, and global cross-session interleaving is never
 compared.
 
-Known divergence documented by the Codex MCP replay: Go 0.13.1 emits no
-`subagent/event` notifications for Codex sessions (verified live against the
-pinned binary), while the Rust port forwards the runner events. The Codex
-golden comparison pins exactly the frames the golden captured (initialize
-response and tools/call result); the extra Rust notifications are a parity
-divergence, not asserted behavior.
+Response/notification interleaving is not compared. Each MCP replay
+synchronizes with a ping barrier after `notifications/initialized` (so
+mcp-go's initialized-session race cannot drop early events) and, after each
+`tools/call` response, drains non-response frames until a short quiet window
+(200 ms) passes with no new frame, bounded overall — Go writes the Codex
+`subagent/event` notifications after the tools/call result, so trailing
+notifications are legal and must be captured. The comparison is causal: the
+response frames (initialize, tools/call results) and the notification frames
+(`subagent/event`, `notifications/progress`) are each compared in exact order
+after normalization, but the interleaving between the two families is not
+compared. The Codex replay compares the full event sequence of the call
+(collapsed deltas, then `agent_message`, then `task_complete`) against the
+regenerated golden.
