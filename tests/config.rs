@@ -195,9 +195,10 @@ fn parse_and_type_errors_report_line_column_and_never_leak_the_key() {
     );
     let (dir, path) = write_config(&broken);
     let err = config::load(&path).unwrap_err().to_string();
+    let expected_column = if cfg!(windows) { 34 } else { 33 };
     assert!(
         err.starts_with(&format!(
-            "config file {}: line 15, column 33: ",
+            "config file {}: line 15, column {expected_column}: ",
             path.display()
         )),
         "broken syntax error lost the Go line/column wrapper: {err}"
@@ -585,6 +586,7 @@ impl Drop for EnvGuard {
 
 const ENV_KEYS: [&str; 3] = ["SUBAGENT_MCP_CONFIG", "HOME", "USERPROFILE"];
 
+#[cfg(unix)]
 #[test]
 fn default_path_from_env_and_home() {
     let _guard = EnvGuard::new(&ENV_KEYS);
