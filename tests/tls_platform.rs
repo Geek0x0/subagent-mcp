@@ -493,9 +493,17 @@ impl PlatformStoreTrust {
         {
             let pem_path = dir.join("root.pem");
             std::fs::write(&pem_path, cert.root_pem.as_bytes()).unwrap();
-            let keychain = login_keychain();
+            let keychain = system_keychain();
             let pem = pem_path.to_string_lossy().into_owned();
-            run_security(&["add-trusted-cert", "-r", "trustRoot", "-k", &keychain, &pem]);
+            run_security(&[
+                "add-trusted-cert",
+                "-d",
+                "-r",
+                "trustRoot",
+                "-k",
+                &keychain,
+                &pem,
+            ]);
             Self {
                 pem_path,
                 common_name: cert.common_name.clone(),
@@ -507,7 +515,7 @@ impl PlatformStoreTrust {
             let der_path = dir.join("root.cer");
             std::fs::write(&der_path, &cert.root[..]).unwrap();
             let der = der_path.to_string_lossy().into_owned();
-            run_certutil(&["-addstore", "-user", "Root", &der]);
+            run_certutil(&["-addstore", "-f", "-user", "Root", &der]);
             Self {
                 der_path,
                 common_name: cert.common_name.clone(),
@@ -520,15 +528,23 @@ impl PlatformStoreTrust {
     fn distrust(&self) {
         #[cfg(target_os = "macos")]
         {
-            let keychain = login_keychain();
+            let keychain = system_keychain();
             let pem = self.pem_path.to_string_lossy().into_owned();
-            run_security(&["add-trusted-cert", "-r", "deny", "-k", &keychain, &pem]);
+            run_security(&[
+                "add-trusted-cert",
+                "-d",
+                "-r",
+                "deny",
+                "-k",
+                &keychain,
+                &pem,
+            ]);
         }
 
         #[cfg(target_os = "windows")]
         {
             let der = self.der_path.to_string_lossy().into_owned();
-            run_certutil(&["-addstore", "-user", "Disallowed", &der]);
+            run_certutil(&["-addstore", "-f", "-user", "Disallowed", &der]);
         }
     }
 }
@@ -539,12 +555,19 @@ impl Drop for PlatformStoreTrust {
         #[cfg(target_os = "macos")]
         {
             let pem = self.pem_path.to_string_lossy().into_owned();
-            let _ = std::process::Command::new("security")
-                .args(["remove-trusted-cert", &pem])
+            let _ = std::process::Command::new("sudo")
+                .args(["-n", "security", "remove-trusted-cert", &pem])
                 .status();
-            let keychain = login_keychain();
-            let _ = std::process::Command::new("security")
-                .args(["delete-certificate", "-c", &self.common_name, &keychain])
+            let keychain = system_keychain();
+            let _ = std::process::Command::new("sudo")
+                .args([
+                    "-n",
+                    "security",
+                    "delete-certificate",
+                    "-c",
+                    &self.common_name,
+                    &keychain,
+                ])
                 .status();
         }
 
@@ -560,20 +583,24 @@ impl Drop for PlatformStoreTrust {
 }
 
 #[cfg(target_os = "macos")]
-fn login_keychain() -> String {
-    let home = std::env::var("HOME").expect("HOME");
-    format!("{home}/Library/Keychains/login.keychain-db")
+fn system_keychain() -> String {
+    "/Library/Keychains/System.keychain".to_string()
 }
 
 #[cfg(target_os = "macos")]
 fn run_security(args: &[&str]) {
-    let out = std::process::Command::new("security")
+    // `sudo -n` fails immediately when the runner has no passwordless sudo,
+    // instead of hanging on an authorization prompt. GitHub's macOS runners
+    // provide passwordless sudo; the test is ignored unless explicitly enabled.
+    let out = std::process::Command::new("sudo")
+        .arg("-n")
+        .arg("security")
         .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("security {}: {e}", args.join(" ")));
+        .unwrap_or_else(|e| panic!("sudo security {}: {e}", args.join(" ")));
     assert!(
         out.status.success(),
-        "security {} failed: {}",
+        "sudo security {} failed: {}",
         args.join(" "),
         String::from_utf8_lossy(&out.stderr)
     );

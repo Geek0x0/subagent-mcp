@@ -22,15 +22,20 @@ use serde_json::{Value, json};
 /// The production shutdown budget; assertions match the 10 s promise.
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
 /// Go's `TestMainStopsOnSignal` fails when shutdown waits out the grace period.
+#[cfg(unix)]
 const PROMPT_SHUTDOWN: Duration = Duration::from_secs(8);
 /// Generous bound for process startup and one MCP round trip.
 const MCP_TIMEOUT: Duration = Duration::from_secs(20);
 
 const API_KEY: &str = "SUBAGENT_RUNTIME_TEST_KEY";
 const API_SECRET: &str = "sk-runtime-child-secret";
+#[cfg(target_os = "linux")]
 const PREFIX_MARKER: &str = "SUBAGENT_MCP_RUNTIME_MARKER";
+#[cfg(target_os = "linux")]
 const PREFIX_MARKER_VALUE: &str = "prefix-marker-value";
+#[cfg(target_os = "linux")]
 const VISIBLE_MARKER: &str = "SUBAGENT_RUNTIME_VISIBLE_MARKER";
+#[cfg(target_os = "linux")]
 const VISIBLE_MARKER_VALUE: &str = "visible-marker-value";
 
 fn binary() -> &'static str {
@@ -371,6 +376,7 @@ impl Server {
         }
     }
 
+    #[cfg(unix)]
     fn wait_for_event(&self, kind: &str, timeout: Duration) -> Value {
         let deadline = Instant::now() + timeout;
         loop {
@@ -466,6 +472,7 @@ impl Drop for Server {
     }
 }
 
+#[cfg(unix)]
 fn wait_for_file(path: &Path, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     while !path.exists() {

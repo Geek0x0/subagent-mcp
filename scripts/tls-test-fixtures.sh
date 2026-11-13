@@ -87,8 +87,8 @@ cmd_install() {
 		;;
 	macos)
 		need security
-		security add-trusted-cert -r "$trust" \
-			-k "$HOME/Library/Keychains/login.keychain-db" "$pem"
+		sudo -n security add-trusted-cert -d -r "$trust" \
+			-k "/Library/Keychains/System.keychain" "$pem"
 		;;
 	windows)
 		need certutil
@@ -115,9 +115,9 @@ cmd_remove() {
 		;;
 	macos)
 		need security
-		security remove-trusted-cert "$pem" || true
-		security delete-certificate -c "$TEST_CA_NAME" \
-			"$HOME/Library/Keychains/login.keychain-db" || true
+		sudo -n security remove-trusted-cert "$pem" || true
+		sudo -n security delete-certificate -c "$TEST_CA_NAME" \
+			"/Library/Keychains/System.keychain" || true
 		;;
 	windows)
 		need certutil
@@ -139,9 +139,9 @@ cmd_cleanup() {
 		;;
 	macos)
 		need security
-		security delete-certificate -c "$name" \
-			"$HOME/Library/Keychains/login.keychain-db" >/dev/null 2>&1 || true
-		echo "cleaned $name from the login keychain (if present)"
+		sudo -n security delete-certificate -c "$name" \
+			"/Library/Keychains/System.keychain" >/dev/null 2>&1 || true
+		echo "cleaned $name from the system keychain (if present)"
 		;;
 	windows)
 		need certutil
