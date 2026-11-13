@@ -734,7 +734,7 @@ fn path_is_resolved_to_absolute() {
     let with_dot = dir.path().join(".").join("config.toml");
     let cfg = config::load(&with_dot).unwrap();
     assert!(cfg.path.is_absolute());
-    assert_eq!(cfg.path, std::fs::canonicalize(&path).unwrap());
+    assert_eq!(cfg.path, path);
     drop(dir);
 }
 

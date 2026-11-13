@@ -515,10 +515,7 @@ impl PlatformStoreTrust {
             let der_path = dir.join("root.cer");
             std::fs::write(&der_path, &cert.root[..]).unwrap();
             let der = der_path.to_string_lossy().into_owned();
-            run_powershell(&format!(
-                "Import-Certificate -FilePath '{}' -CertStoreLocation Cert:\\CurrentUser\\Root",
-                der.replace('\'', "''")
-            ));
+            install_store("Root", &der);
             Self {
                 der_path,
                 common_name: cert.common_name.clone(),
@@ -547,10 +544,7 @@ impl PlatformStoreTrust {
         #[cfg(target_os = "windows")]
         {
             let der = self.der_path.to_string_lossy().into_owned();
-            run_powershell(&format!(
-                "Import-Certificate -FilePath '{}' -CertStoreLocation Cert:\\CurrentUser\\Disallowed",
-                der.replace('\'', "''")
-            ));
+            install_store("Disallowed", &der);
         }
     }
 }
@@ -613,29 +607,21 @@ fn run_security(args: &[&str]) {
 }
 
 #[cfg(target_os = "windows")]
-fn run_powershell(script: &str) {
+fn install_store(store_name: &str, der_path: &str) {
+    let script = format!(
+        "$cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 '{}'; \
+         $store = New-Object System.Security.Cryptography.X509Certificates.X509Store '{}','CurrentUser'; \
+         $store.Open('ReadWrite'); $store.Add($cert); $store.Close()",
+        der_path.replace('\'', "''"),
+        store_name
+    );
     let out = std::process::Command::new("powershell")
-        .args(["-NoProfile", "-NonInteractive", "-Command", script])
+        .args(["-NoProfile", "-NonInteractive", "-Command", &script])
         .output()
         .unwrap_or_else(|e| panic!("powershell: {e}"));
     assert!(
         out.status.success(),
         "powershell failed: {}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-}
-
-#[cfg(target_os = "windows")]
-fn run_certutil(args: &[&str]) {
-    let out = std::process::Command::new("certutil")
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("certutil {}: {e}", args.join(" ")));
-    assert!(
-        out.status.success(),
-        "certutil {} failed: {}{}",
-        args.join(" "),
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
