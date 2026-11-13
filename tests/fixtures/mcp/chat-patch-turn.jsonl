@@ -1,0 +1,12 @@
+{"id": 1, "jsonrpc": "2.0", "result": {"capabilities": {"tools": {}}, "protocolVersion": "2025-03-26", "serverInfo": {"name": "subagent-mcp", "version": "0.13.1"}}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"type": "task_started"}, "threadId": "9e58d6a0-2d88-4226-9ee5-20165ac1d100"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"duration_ms": 1, "model": "mock-model", "provider": "mock", "type": "provider_request"}, "threadId": "9e58d6a0-2d88-4226-9ee5-20165ac1d100"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"completion_tokens": 8, "prompt_tokens": 9, "total_tokens": 17, "type": "token_count"}, "threadId": "9e58d6a0-2d88-4226-9ee5-20165ac1d100"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"call_id": "call_p", "paths": ["hello.txt"], "tool": "apply_patch", "type": "exec_command_begin"}, "threadId": "9e58d6a0-2d88-4226-9ee5-20165ac1d100"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"call_id": "call_p", "paths": ["hello.txt"], "tool": "apply_patch", "type": "exec_command_end"}, "threadId": "9e58d6a0-2d88-4226-9ee5-20165ac1d100"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"delta": "Let me check.", "type": "agent_message_delta"}, "threadId": "9e58d6a0-2d88-4226-9ee5-20165ac1d100"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"duration_ms": 41, "model": "mock-model", "provider": "mock", "ttft_ms": 41, "type": "provider_request"}, "threadId": "9e58d6a0-2d88-4226-9ee5-20165ac1d100"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"completion_tokens": 5, "prompt_tokens": 7, "total_tokens": 12, "type": "token_count"}, "threadId": "9e58d6a0-2d88-4226-9ee5-20165ac1d100"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"message": "Let me check.", "type": "agent_message"}, "threadId": "9e58d6a0-2d88-4226-9ee5-20165ac1d100"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"type": "task_complete"}, "threadId": "9e58d6a0-2d88-4226-9ee5-20165ac1d100"}}
+{"id": 2, "jsonrpc": "2.0", "result": {"content": [{"text": "Let me check.", "type": "text"}], "structuredContent": {"content": "Let me check.", "model": "mock-model", "provider": "mock", "threadId": "9e58d6a0-2d88-4226-9ee5-20165ac1d100"}}}

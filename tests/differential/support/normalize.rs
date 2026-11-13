@@ -82,7 +82,15 @@ fn normalize_value(value: Value, context: &NormalizeContext) -> Value {
         Value::Object(object) => {
             let mut normalized = Map::with_capacity(object.len());
             for (key, value) in object {
-                normalized.insert(key.clone(), normalize_field(&key, value, context));
+                // Object keys can carry volatile data too (the rollout
+                // `patch_apply_end` payload keys its `changes` map by file
+                // path, e.g. `/tmp/<cwd>/hello.txt`), so keys go through the
+                // same string normalization as values. Field names like
+                // `threadId` match no volatile pattern and survive intact.
+                normalized.insert(
+                    normalize_string(&key, context, false),
+                    normalize_field(&key, value, context),
+                );
             }
             Value::Object(normalized)
         }

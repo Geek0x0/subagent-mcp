@@ -1,0 +1,5 @@
+{"id":1,"method":"initialize","params":{"clientInfo":{"name":"subagent-mcp","version":"v0.13.1"}}}
+{"method":"initialized"}
+{"id":2,"method":"thread/start","params":{"approvalPolicy":"never","cwd":"/tmp/codex-turn-cwd-vzpgnhle","ephemeral":false,"model":"gpt-6-astra","sandbox":"read-only"}}
+{"id":3,"method":"turn/start","params":{"effort":"high","input":[{"text":"hi","type":"text"}],"threadId":"th_diff1"}}
+{"id":4,"method":"thread/unsubscribe","params":{"threadId":"th_diff1"}}

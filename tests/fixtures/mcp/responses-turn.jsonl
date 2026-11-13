@@ -1,0 +1,8 @@
+{"id": 1, "jsonrpc": "2.0", "result": {"capabilities": {"tools": {}}, "protocolVersion": "2025-03-26", "serverInfo": {"name": "subagent-mcp", "version": "0.13.1"}}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"type": "task_started"}, "threadId": "99663ad4-4182-485f-aa9f-86f39d817aa5"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"delta": "hello", "type": "agent_message_delta"}, "threadId": "99663ad4-4182-485f-aa9f-86f39d817aa5"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"duration_ms": 2, "model": "mock-model", "provider": "mock", "ttft_ms": 2, "type": "provider_request"}, "threadId": "99663ad4-4182-485f-aa9f-86f39d817aa5"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"completion_tokens": 3, "prompt_tokens": 10, "total_tokens": 13, "type": "token_count"}, "threadId": "99663ad4-4182-485f-aa9f-86f39d817aa5"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"message": "hello", "type": "agent_message"}, "threadId": "99663ad4-4182-485f-aa9f-86f39d817aa5"}}
+{"jsonrpc": "2.0", "method": "subagent/event", "params": {"msg": {"type": "task_complete"}, "threadId": "99663ad4-4182-485f-aa9f-86f39d817aa5"}}
+{"id": 2, "jsonrpc": "2.0", "result": {"content": [{"text": "hello", "type": "text"}], "structuredContent": {"content": "hello", "model": "mock-model", "provider": "mock", "threadId": "99663ad4-4182-485f-aa9f-86f39d817aa5"}}}

@@ -176,13 +176,11 @@ fn assert_mcp_matches(requests: &[Value]) {
 }
 
 #[test]
-#[ignore = "Task 25B serve lifecycle is not in the base commit; remove once cli::serve is implemented"]
 fn differential_mcp_initialize_matches_reference() {
     assert_mcp_matches(&[initialize_request()]);
 }
 
 #[test]
-#[ignore = "Task 25B serve lifecycle is not in the base commit; remove once cli::serve is implemented"]
 fn differential_mcp_tools_list_matches_reference() {
     assert_mcp_matches(&[
         initialize_request(),
@@ -191,7 +189,6 @@ fn differential_mcp_tools_list_matches_reference() {
 }
 
 #[test]
-#[ignore = "Task 25B serve lifecycle is not in the base commit; remove once cli::serve is implemented"]
 fn differential_mcp_unknown_tool_matches_reference() {
     assert_mcp_matches(&[
         initialize_request(),

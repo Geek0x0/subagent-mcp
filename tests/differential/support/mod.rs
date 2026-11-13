@@ -5,9 +5,12 @@
 //! the documented volatile fields. Task 27 builds its scenarios on these
 //! interfaces.
 
+pub mod golden;
+pub mod mock_http;
 pub mod normalize;
 
 use std::env;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
@@ -18,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use ring::digest::{SHA256, digest};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// The pinned baseline manifest checked in at `tests/differential/baseline.lock`.
 #[derive(Debug, Clone, Deserialize)]
@@ -187,6 +190,40 @@ pub fn run_cli(binary: &Path, args: &[&str], envs: &[(&str, &str)], home: &Path)
         .unwrap_or_else(|error| panic!("failed to run {}: {error}", binary.display()))
 }
 
+/// Set `name` to `value` for the scope of this guard, restoring the previous
+/// value (or its absence) on drop.
+///
+/// Task 27 review finding: `rollout.rs` mutated `CODEX_HOME` process-wide and
+/// never restored it. Every env mutation in the differential suite now goes
+/// through this guard, so a later `CODEX_HOME`-respecting scenario cannot
+/// become a heisenbug. SAFETY: callers serialize environment mutation behind
+/// their module's `SCENARIO_LOCK`.
+pub struct EnvGuard {
+    name: &'static str,
+    previous: Option<OsString>,
+}
+
+impl EnvGuard {
+    pub fn set(name: &'static str, value: impl AsRef<OsStr>) -> Self {
+        let previous = env::var_os(name);
+        // SAFETY: callers serialize environment mutation behind a scenario lock.
+        unsafe { env::set_var(name, value) };
+        Self { name, previous }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        // SAFETY: same lock discipline as `EnvGuard::set`.
+        unsafe {
+            match &self.previous {
+                Some(value) => env::set_var(self.name, value),
+                None => env::remove_var(self.name),
+            }
+        }
+    }
+}
+
 /// A newline-delimited JSON-RPC MCP process.
 ///
 /// One reader thread parses stdout frames; [`McpProcess::request`] waits for
@@ -301,6 +338,19 @@ impl McpProcess {
     /// Frames without a matching id are retained for
     /// [`McpProcess::notifications`].
     pub fn request(&mut self, request: Value) -> Value {
+        self.request_with_hook(request, |_| None)
+    }
+
+    /// Send a request and return the response with the same id, running
+    /// `hook` for every non-response frame observed while waiting (in arrival
+    /// order). A hook may answer with a frame to send back (e.g. a
+    /// `notifications/cancelled` the instant the first `subagent/event`
+    /// arrives) or `None` to do nothing.
+    pub fn request_with_hook(
+        &mut self,
+        request: Value,
+        mut hook: impl FnMut(&Value) -> Option<Value>,
+    ) -> Value {
         let id = request
             .get("id")
             .cloned()
@@ -317,6 +367,11 @@ impl McpProcess {
                 Ok(Ok(frame)) => {
                     if frame.get("method").is_none() && frame.get("id") == Some(&id) {
                         return frame;
+                    }
+                    if let Some(reply) = hook(&frame) {
+                        self.send(&reply).unwrap_or_else(|error| {
+                            panic!("write MCP hook frame: {error}; stderr:\n{}", self.stderr())
+                        });
                     }
                     self.notifications.push(frame);
                 }
@@ -337,6 +392,51 @@ impl McpProcess {
     /// Send a notification (or any frame without a response) and flush it.
     pub fn notify(&mut self, notification: Value) -> io::Result<()> {
         self.send(&notification)
+    }
+
+    /// Synchronization barrier between `notifications/initialized` and the
+    /// first `tools/call`: send a `ping` and wait for its response.
+    ///
+    /// mcp-go has an initialized-session race that can drop notifications
+    /// racing the first request; the pong proves the session is fully live.
+    /// The pong is harness plumbing, so it is neither returned nor recorded —
+    /// goldens do not contain it.
+    pub fn initialized_session_barrier(&mut self) {
+        const PING_ID: i64 = 4; // 1 initialize, 2 tools/call, 3 budget follow-up
+        let pong = self.request(json!({
+            "jsonrpc": "2.0",
+            "id": PING_ID,
+            "method": "ping"
+        }));
+        assert_eq!(pong["id"], PING_ID, "barrier ping was not answered");
+    }
+
+    /// Drain non-response frames until `quiet` has passed with no new frame,
+    /// bounded by `overall`. Returns the drained frames in arrival order (they
+    /// are also retained for [`McpProcess::take_notifications`]).
+    ///
+    /// This captures notifications that legally trail the response they
+    /// belong to (e.g. Go writes `subagent/event` frames after the
+    /// `tools/call` result) without imposing any sleep on the compared
+    /// binaries: the quiet window only ever shortens once the server is
+    /// genuinely done.
+    pub fn drain(&mut self, quiet: Duration, overall: Duration) -> Vec<Value> {
+        let start = Instant::now();
+        let mut drained = Vec::new();
+        loop {
+            let left = overall.saturating_sub(start.elapsed());
+            if left.is_zero() {
+                break;
+            }
+            match self.frames.recv_timeout(quiet.min(left)) {
+                Ok(Ok(frame)) => drained.push(frame),
+                Ok(Err(error)) => panic!("invalid MCP frame while draining: {error}"),
+                Err(RecvTimeoutError::Timeout) => break,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        self.notifications.extend(drained.iter().cloned());
+        drained
     }
 
     fn send(&mut self, frame: &Value) -> io::Result<()> {

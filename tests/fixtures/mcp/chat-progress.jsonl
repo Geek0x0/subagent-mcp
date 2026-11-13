@@ -1,0 +1,11 @@
+{"id":1,"jsonrpc":"2.0","result":{"capabilities":{"tools":{}},"protocolVersion":"2025-03-26","serverInfo":{"name":"subagent-mcp","version":"0.13.1"}}}
+{"jsonrpc":"2.0","method":"subagent/event","params":{"msg":{"type":"task_started"},"threadId":"1542856a-93af-4b22-9e84-4676aa38a0e9"}}
+{"jsonrpc":"2.0","method":"notifications/progress","params":{"message":"started","progress":1,"progressToken":"prog-1"}}
+{"jsonrpc":"2.0","method":"subagent/event","params":{"msg":{"delta":"Let me check.","type":"agent_message_delta"},"threadId":"1542856a-93af-4b22-9e84-4676aa38a0e9"}}
+{"jsonrpc":"2.0","method":"subagent/event","params":{"msg":{"duration_ms":1,"model":"mock-model","provider":"mock","ttft_ms":1,"type":"provider_request"},"threadId":"1542856a-93af-4b22-9e84-4676aa38a0e9"}}
+{"jsonrpc":"2.0","method":"subagent/event","params":{"msg":{"completion_tokens":5,"prompt_tokens":7,"total_tokens":12,"type":"token_count"},"threadId":"1542856a-93af-4b22-9e84-4676aa38a0e9"}}
+{"jsonrpc":"2.0","method":"subagent/event","params":{"msg":{"message":"Let me check.","type":"agent_message"},"threadId":"1542856a-93af-4b22-9e84-4676aa38a0e9"}}
+{"jsonrpc":"2.0","method":"notifications/progress","params":{"message":"agent: Let me check.","progress":2,"progressToken":"prog-1"}}
+{"jsonrpc":"2.0","method":"subagent/event","params":{"msg":{"type":"task_complete"},"threadId":"1542856a-93af-4b22-9e84-4676aa38a0e9"}}
+{"jsonrpc":"2.0","method":"notifications/progress","params":{"message":"completed","progress":3,"progressToken":"prog-1"}}
+{"id":2,"jsonrpc":"2.0","result":{"content":[{"text":"Let me check.","type":"text"}],"structuredContent":{"content":"Let me check.","model":"mock-model","provider":"mock","threadId":"1542856a-93af-4b22-9e84-4676aa38a0e9"}}}
