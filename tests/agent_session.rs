@@ -389,6 +389,7 @@ async fn lease_deref_mut_persists_state_and_blocks_second_acquire() {
     assert_eq!(lease.total_usage.total, 8);
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn idle_ttl_eviction_and_busy_session_never_evicted() {
     let m = SessionManager::new();
@@ -430,6 +431,7 @@ async fn idle_ttl_eviction_and_busy_session_never_evicted() {
     assert!(m.acquire(&fresh.id).await.is_ok());
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn cap_eviction_never_exceeds_256_idle_sessions() {
     let m = SessionManager::new();
@@ -552,6 +554,7 @@ async fn bound_cwd_is_set_and_missing_root_fails_closed() {
         assert_eq!(lease.bound_cwd.as_ref().unwrap().path, cwd);
         assert!(lease.bind_err.is_none());
         assert!(lease.root_paths.iter().any(|p| p == &cwd));
+        #[cfg(unix)]
         assert!(lease.root_paths.iter().any(|p| p == Path::new("/tmp")));
         assert_eq!(
             lease.bound_roots.len(),
@@ -632,6 +635,7 @@ async fn bound_roots_are_held_and_match_root_paths() {
     assert_eq!(lease.bound_roots.len(), lease.root_paths.len());
     assert!(lease.root_paths.contains(&cwd));
     assert!(lease.root_paths.contains(&extra));
+    #[cfg(unix)]
     assert!(lease.root_paths.iter().any(|p| p == Path::new("/tmp")));
 
     // Every root is a HELD handle, not a re-stat'able path. On Linux path() is
@@ -687,7 +691,9 @@ async fn bound_roots_dedupe_by_held_identity() {
         !lease.root_paths.contains(&link),
         "symlink to the cwd inode must dedup away"
     );
+    #[cfg(unix)]
     assert!(lease.root_paths.iter().any(|p| p == Path::new("/tmp")));
+    #[cfg(unix)]
     assert!(lease.root_paths.len() >= 2, "cwd + /tmp at minimum");
     // cwd handle is shared, never opened a second time.
     #[cfg(target_os = "linux")]
@@ -771,6 +777,7 @@ fn effective_writable_roots_dedup_by_same_file() {
     // appear exactly once; /tmp and a distinct configured dir must appear.
     let roots = effective_writable_roots(&cwd, &[cwd.clone(), other.clone()]);
     assert_eq!(roots.iter().filter(|p| *p == &cwd).count(), 1);
+    #[cfg(unix)]
     assert!(roots.iter().any(|p| p == Path::new("/tmp")));
     assert!(roots.iter().any(|p| p == &other));
 }

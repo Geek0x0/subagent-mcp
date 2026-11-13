@@ -454,7 +454,9 @@ fn bind_directories(opts: &SessionOptions) -> BoundState {
 fn candidate_paths(cwd: &Path, configured: &[PathBuf]) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     paths.push(cwd.to_path_buf());
-    paths.push(PathBuf::from("/tmp"));
+    if Path::new("/tmp").is_dir() {
+        paths.push(PathBuf::from("/tmp"));
+    }
     if let Ok(tmp) = std::env::var("TMPDIR")
         && !tmp.is_empty()
         && Path::new(&tmp).is_dir()
