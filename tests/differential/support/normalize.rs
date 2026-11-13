@@ -1,9 +1,8 @@
 //! Volatile-field normalization for differential comparisons.
 //!
 //! Normalization is deliberately field-name driven for JSON values and
-//! pattern driven only for values that are volatile by construction (UUIDs,
-//! RFC 3339 timestamps, Go durations, PIDs, provider request ids, and
-//! semantic versions). Semantic fields such as `protocolVersion`, model ids,
+//! pattern driven only for UUIDs in identifier fields and the CLI version
+//! banner. Semantic fields such as `protocolVersion`, model ids,
 //! method names, and error messages are left alone.
 
 use std::cell::RefCell;
@@ -120,7 +119,7 @@ fn normalize_field(key: &str, value: Value, context: &NormalizeContext) -> Value
     }
 
     if let Value::String(string) = &value {
-        if uuid_regex().is_match(string) {
+        if id_key(key) && uuid_regex().is_match(string) {
             return Value::String(context.placeholder("uuid", string));
         }
         // JSON-RPC `id` echoes are semantic, even when they are strings. Only
@@ -166,6 +165,8 @@ fn id_key(key: &str) -> bool {
             | "callId"
             | "tool_call_id"
             | "toolCallId"
+            | "turn_id"
+            | "turnId"
     )
 }
 
@@ -180,33 +181,10 @@ fn scalar_text(value: &Value) -> Option<String> {
 
 fn normalize_string(input: &str, context: &NormalizeContext, versions: bool) -> String {
     let mut out = context.replace_temp_roots(input);
-    out = uuid_regex()
-        .replace_all(&out, |captures: &regex::Captures<'_>| {
-            context.placeholder("uuid", &captures[0])
-        })
-        .into_owned();
-    out = timestamp_regex()
-        .replace_all(&out, |captures: &regex::Captures<'_>| {
-            context.placeholder("timestamp", &captures[0])
-        })
-        .into_owned();
-    out = duration_regex()
-        .replace_all(&out, |captures: &regex::Captures<'_>| {
-            context.placeholder("duration", &captures[0])
-        })
-        .into_owned();
-    out = pid_regex()
-        .replace_all(&out, |captures: &regex::Captures<'_>| {
-            context.placeholder("pid", &captures[0])
-        })
-        .into_owned();
-    out = request_id_regex()
-        .replace_all(&out, |captures: &regex::Captures<'_>| {
-            context.placeholder("request-id", &captures[0])
-        })
-        .into_owned();
     if versions {
-        out = version_regex().replace_all(&out, "<version>").into_owned();
+        out = version_regex()
+            .replace_all(&out, "${1}<version>")
+            .into_owned();
     }
     out
 }
@@ -214,45 +192,16 @@ fn normalize_string(input: &str, context: &NormalizeContext, versions: bool) -> 
 fn uuid_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+        Regex::new(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
             .expect("valid UUID regex")
-    })
-}
-
-fn timestamp_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?")
-            .expect("valid timestamp regex")
-    })
-}
-
-fn duration_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(r"\b\d+(?:\.\d+)?(?:ns|µs|us|ms|s|m|h)\b").expect("valid duration regex")
-    })
-}
-
-fn pid_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"(?i)\bpid\s*[:=]?\s*\d+\b").expect("valid pid regex"))
-}
-
-fn request_id_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| {
-        Regex::new(
-            r"(?i)\b(?:x[-_])?(?:provider[-_])?request[-_ ]?id\b\s*[:=]?\s*[A-Za-z0-9._-]{4,}",
-        )
-        .expect("valid request id regex")
     })
 }
 
 fn version_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| {
-        Regex::new(r"\b\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b").expect("valid version regex")
+        Regex::new(r"(?m)^(subagent-mcp )\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?\b")
+            .expect("valid version regex")
     })
 }
 
@@ -329,6 +278,18 @@ mod tests {
         let a = value(json!({"model": "model-a", "count": 1}), &context);
         let b = value(json!({"model": "model-b", "count": 2}), &context);
         assert_ne!(a, b);
+        assert_ne!(
+            value(
+                json!({"error":"command timed out after 60s"}),
+                &NormalizeContext::new()
+            ),
+            value(
+                json!({"error":"command timed out after 600s"}),
+                &NormalizeContext::new()
+            )
+        );
+        let authored = json!({"text":"550e8400-e29b-41d4-a716-446655440000", "output":"2026-11-12T22:21:52Z request_id=req_abc123 pid=4242 60s"});
+        assert_eq!(value(authored.clone(), &context), authored);
     }
 
     #[test]
@@ -341,19 +302,23 @@ mod tests {
             output.contains("config   <tmp>/config.toml   OK"),
             "{output}"
         );
-        assert!(output.contains("<duration:1>"), "{output}");
-        assert!(output.contains("<request-id:1>"), "{output}");
-        assert!(output.contains("<pid:1>"), "{output}");
-        assert!(output.contains("<timestamp:1>"), "{output}");
+        assert!(output.contains("1.234ms"), "{output}");
+        assert!(
+            output.contains("request_id=req_abc123 pid=4242 at 2026-11-12T22:21:52Z"),
+            "{output}"
+        );
     }
 
     #[test]
-    fn normalizes_uuid_inside_text() {
+    fn preserves_uuid_inside_text() {
         let context = NormalizeContext::new();
         let output = text(
             "thread 550e8400-e29b-41d4-a716-446655440000 started",
             &context,
         );
-        assert_eq!(output, "thread <uuid:1> started");
+        assert_eq!(
+            output,
+            "thread 550e8400-e29b-41d4-a716-446655440000 started"
+        );
     }
 }

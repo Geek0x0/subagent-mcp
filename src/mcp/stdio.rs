@@ -3,14 +3,14 @@
 //! stdin is read by one detached OS thread performing blocking reads (a Tokio
 //! stdin task is not cancellable and does not reproduce Go's backpressure). The
 //! thread forwards complete lines over a capacity-1 channel, so at most one
-//! frame is buffered ahead of the serve loop. stdout is drained by a task that
+//! frame is buffered ahead of the serve loop. stdout is drained by an OS thread that
 //! serializes frames and flushes every line; [`StdoutWriter::flush`] lets the
 //! shutdown path wait until the queue is empty before the process exits.
 
 use std::io::{BufRead, Write};
 
+use std::thread::JoinHandle;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinHandle;
 
 /// Capacity of the stdin hand-off channel: one frame of lookahead.
 const STDIN_CHANNEL_CAPACITY: usize = 1;
@@ -72,35 +72,43 @@ impl StdoutWriter {
     pub fn spawn() -> Self {
         let (frames, mut frame_rx) = mpsc::channel::<String>(STDOUT_CHANNEL_CAPACITY);
         let (flush, mut flush_rx) = mpsc::channel::<oneshot::Sender<()>>(1);
-        let task = tokio::spawn(async move {
-            let stdout = std::io::stdout();
-            let mut flush_open = true;
-            loop {
-                tokio::select! {
-                    biased;
-                    request = flush_rx.recv(), if flush_open => match request {
-                        Some(ack) => {
-                            // Drain every frame queued before the flush request,
-                            // then flush the OS buffer and acknowledge.
-                            while let Ok(frame) = frame_rx.try_recv() {
-                                if !write_frame(&stdout, &frame) {
-                                    let _ = ack.send(());
-                                    return;
+        let task = std::thread::spawn(move || {
+            // Blocking stdout must never occupy a server runtime worker: an
+            // unread pipe must not prevent signals or the shutdown timer.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("stdout writer runtime");
+            runtime.block_on(async move {
+                let stdout = std::io::stdout();
+                let mut flush_open = true;
+                loop {
+                    tokio::select! {
+                        biased;
+                        request = flush_rx.recv(), if flush_open => match request {
+                            Some(ack) => {
+                                // Drain every frame queued before the flush request,
+                                // then flush the OS buffer and acknowledge.
+                                while let Ok(frame) = frame_rx.try_recv() {
+                                    if !write_frame(&stdout, &frame) {
+                                        let _ = ack.send(());
+                                        return;
+                                    }
                                 }
+                                let _ = stdout.lock().flush();
+                                let _ = ack.send(());
                             }
-                            let _ = stdout.lock().flush();
-                            let _ = ack.send(());
-                        }
-                        None => flush_open = false,
-                    },
-                    frame = frame_rx.recv() => {
-                        let Some(frame) = frame else { break };
-                        if !write_frame(&stdout, &frame) {
-                            break;
+                            None => flush_open = false,
+                        },
+                        frame = frame_rx.recv() => {
+                            let Some(frame) = frame else { break };
+                            if !write_frame(&stdout, &frame) {
+                                break;
+                            }
                         }
                     }
                 }
-            }
+            });
         });
         Self {
             frames,

@@ -37,6 +37,91 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_subagent-mcp")
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn check_config_reports_tls_construction_error_without_panicking() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_config(dir.path(), &config_text("http://127.0.0.1:1"));
+    let output = Command::new(binary())
+        .arg("--check-config")
+        .arg(config)
+        .env(API_KEY, "test-key")
+        .env("SSL_CERT_FILE", dir.path().join("missing.pem"))
+        .env("SSL_CERT_DIR", dir.path().join("missing-dir"))
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stdout.contains("FAIL:") && stdout.contains("tls:"),
+        "stdout: {stdout}; stderr: {stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn sigterm_with_full_stdout_and_one_worker_is_bounded() {
+    struct Reap(Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let home = tempfile::tempdir().unwrap();
+    let config = write_config(home.path(), &config_text("http://127.0.0.1:1"));
+    let mut child = Reap(
+        Command::new(binary())
+            .env("HOME", home.path())
+            .env("SUBAGENT_MCP_CONFIG", config)
+            .env("TOKIO_WORKER_THREADS", "1")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let mut stdin = child.0.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.0.stdout.take().unwrap());
+    writeln!(stdin, "{}", json!({"jsonrpc":"2.0", "id":1,"method":"initialize","params":{"capabilities":{},"protocolVersion":"2024-11-05","clientInfo":{"name":"blocked-test","version":"1"}}})).unwrap();
+    let mut response = String::new();
+    stdout.read_line(&mut response).unwrap();
+    assert_eq!(serde_json::from_str::<Value>(&response).unwrap()["id"], 1);
+    let flood = std::thread::spawn(move || {
+        for id in 2..2002 {
+            if writeln!(
+                stdin,
+                "{}",
+                json!({"jsonrpc":"2.0","id":id,"method":"ping"})
+            )
+            .is_err()
+            {
+                break;
+            }
+        }
+    });
+    // Leave stdout open and unread until process exit; replies fill its pipe.
+    std::thread::sleep(Duration::from_millis(750));
+    let start = Instant::now();
+    unsafe {
+        libc::kill(child.0.id() as i32, libc::SIGTERM);
+    }
+    loop {
+        if child.0.try_wait().unwrap().is_some() {
+            break;
+        }
+        assert!(
+            start.elapsed() < SHUTDOWN_BUDGET + Duration::from_secs(2),
+            "shutdown hung with unread stdout"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    drop(stdout);
+    flood.join().unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Fake chat-completions server
 // ---------------------------------------------------------------------------

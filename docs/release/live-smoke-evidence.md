@@ -33,11 +33,11 @@ its OS-specific setup with `#[cfg(target_os = "...")]`.
 | Windows x86_64 | `windows-2022` | `cargo test --test platform_windows --test tls_platform -v` + `cargo test --test tls_platform -- --ignored -v` | Job Object suspended start/assign/resume, path checks, whole-job cleanup | CryptoAPI, CurrentUser stores | **PENDING NATIVE EVIDENCE** |
 | Windows arm64 | `windows-11-arm` | same | same | same | **PENDING NATIVE EVIDENCE** |
 
-SIGTERM with stdin open is an **ignored skeleton** on every platform
-(`#[ignore = "requires Task 25 serve lifecycle"]`). Task 25 owns `cli::serve`
-and the signal handler; until it lands there is no crate code on that path, so
-the skeleton is not a gate. Task 25 must replace the shell/`pause` child with
-the real `subagent-mcp` server and remove the ignore attribute.
+The stdin-open shutdown tests now drive the real `subagent-mcp` lifecycle and
+run without an ignore attribute. Linux/macOS exercise SIGTERM; Windows exercises
+bounded EOF cleanup (Windows has no SIGTERM). Linux runtime coverage includes
+these tests; native macOS/Windows/arm64 evidence remains pending. Historical
+Task 28 output below predates the completed lifecycle and is retained as history.
 
 The OS trust-store case (`platform_store_trust_and_distrust_apply`) is also
 `#[ignore]`d so the general `verify` matrix reports it as **ignored**, never as
@@ -53,19 +53,19 @@ What each platform file pins:
   zero-exit (`ErrWaitDelay` → success) and non-zero precedence (exit 7 wins)
   with an escaped descendant holding the pipes. The `openat2` case starts with
   a positive control (safe write/read and an in-root symlink) so a wholly
-  broken `fs()` cannot pass the escape assertions. SIGTERM with stdin open is
-  the ignored Task 25 skeleton.
+  broken `fs()` cannot pass the escape assertions. SIGTERM with stdin open
+  exercises the real server and runs unignored.
 - **macOS** (`platform_macos.rs`): the path sandbox (no kernel enforcement,
   helper fails closed with `landlock unavailable: kernel sandbox requires
   Linux`), policy-level confinement (symlink resolution, `..` rejection,
   outside-root denial), held-directory inode identity, and process-group
-  cleanup. SIGTERM with stdin open is the ignored Task 25 skeleton.
+  cleanup. SIGTERM with stdin open exercises the real server; native evidence is pending.
 - **Windows** (`platform_windows.rs`): Job Object containment of descendants of
   a suspended-start/assign/resume child, path checks (policy confinement plus
   held-handle identity and replacement detection), whole-job termination on
   cancellation with captured output preserved, and the merged stdout/stderr
-  contract. Bounded termination while stdin is held open is the ignored Task 25
-  skeleton (Windows has no SIGTERM).
+  contract. Bounded EOF cleanup exercises the real server (Windows has no SIGTERM);
+  native evidence is pending.
 - **TLS** (`tls_platform.rs`, every platform): enterprise CA as an added root,
   untrusted root rejected, root → intermediate → leaf accepted and the same
   chain without the intermediate rejected, hostname mismatch rejected, expired
@@ -165,7 +165,7 @@ Not run. This environment is Linux-only. Run on a native macOS host (macOS 12+):
 ```console
 $ rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
 $ cargo test --test platform_macos --test tls_platform -v
-# 4 runtime tests pass, 1 ignored (SIGTERM skeleton); 7 TLS tests pass, 1 ignored
+# Runtime lifecycle tests run unignored; native results pending. Trust-store TLS case requires opt-in.
 $ SUBAGENT_MCP_PLATFORM_TRUST_TESTS=1 \
     cargo test --test tls_platform -- --ignored -v
 # platform_store_trust_and_distrust_apply passes (trust, then explicit distrust)
@@ -188,7 +188,7 @@ Not run. Run on a native Windows host (Windows 10 / Server 2016+):
 ```powershell
 rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
 cargo test --test platform_windows --test tls_platform -v
-# 4 runtime tests pass, 1 ignored (Task 25 skeleton); 7 TLS tests pass, 1 ignored
+# Runtime lifecycle tests run unignored; native results pending. Trust-store TLS case requires opt-in.
 $env:SUBAGENT_MCP_PLATFORM_TRUST_TESTS = "1"
 cargo test --test tls_platform -- --ignored -v
 certutil -delstore -user Root "subagent-mcp platform trust test CA" 2>$null
@@ -276,13 +276,14 @@ Status: **PENDING MANUAL SMOKE** (requires Jev access).
 
 ## 8. Gate decision
 
-- Linux x86_64: **verified** above (6 runtime tests + 8 TLS tests pass; the
-  SIGTERM skeleton is ignored).
+- Linux x86_64: **verified**; historical Task 28 output above records the earlier
+  6 runtime + 8 TLS run. Current lifecycle tests run unignored, including SIGTERM
+  with stdin open; final fix verification also covers unread stdout with one worker.
 - Linux arm64, macOS x86_64/arm64, Windows x86_64, Windows arm64: **PENDING
   NATIVE EVIDENCE**. Fill the corresponding section with a native run before
   treating the platform gate as passed.
 - Windows arm64 must be native (`windows-11-arm` or a Windows arm64 VM with the
   four recorded items in §5). A cross-build is not acceptance.
-- The SIGTERM-with-stdin-open rows are **not** part of the gate until Task 25
-  lands the serve lifecycle and removes `#[ignore]`. The OS trust-store row is
+- The stdin-open lifecycle rows are implemented and part of the runtime gate.
+  The OS trust-store row is
   gated by the dedicated `--ignored` CI step, not by the general matrix.

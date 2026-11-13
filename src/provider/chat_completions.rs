@@ -696,7 +696,7 @@ impl ChatCompletions {
         };
         Ok(Self {
             name: name.to_string(),
-            client: PooledClient::from_config(TransportKind::ChatCompletions, cfg),
+            client: PooledClient::from_config(TransportKind::ChatCompletions, cfg)?,
             cfg: cfg.clone(),
             api_key,
             backoff: Arc::new(default_backoff),

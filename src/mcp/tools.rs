@@ -437,8 +437,10 @@ impl SubagentTools {
 
         let max_turns = loose_config
             .get("max_turns")
-            .and_then(integer_value)
-            .filter(|value| *value > 0 && *value <= MAX_CONFIGURED_TURNS)
+            .and_then(Value::as_f64)
+            .filter(|value| {
+                value.is_finite() && *value > 0.0 && *value <= MAX_CONFIGURED_TURNS as f64
+            })
             .map(|value| value as usize)
             .unwrap_or(0);
 
@@ -999,7 +1001,7 @@ fn display_value(value: &Value) -> String {
 }
 
 fn clean_path(path: &str) -> PathBuf {
-    Path::new(path).components().collect()
+    crate::util::fs::lexical_clean(Path::new(path))
 }
 
 // ---------------------------------------------------------------------------
@@ -1400,6 +1402,18 @@ fn git_root(dir: &Path) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn writable_root_paths_are_lexically_cleaned() {
+        for (input, expected) in [
+            ("", "."),
+            ("a/../b/", "b"),
+            ("../../a/../b", "../../b"),
+            ("/tmp/a/../b/./", "/tmp/b"),
+            ("/../../b", "/b"),
+        ] {
+            assert_eq!(super::clean_path(input), std::path::PathBuf::from(expected));
+        }
+    }
     use super::*;
 
     #[test]

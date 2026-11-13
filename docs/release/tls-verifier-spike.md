@@ -1,15 +1,15 @@
 # TLS verifier spike (Task 8)
 
 Status: **Linux verified. macOS and Windows are PENDING NATIVE EVIDENCE.**
-The native results are a **hard gate before Task 9** (provider transport and
-adapters). This document must not be read as a passed native gate until the
+The user waived the implementation gate before Task 9; provider transport and
+adapters are implemented. Native results remain a **release gate**. This document must not be read as a passed native gate until the
 macOS and Windows sections carry real command output.
 
 - Design reference: `docs/superpowers/specs/2026-11-09-rust-rewrite-design.md`
   §5.4 (shared transport) and §7 (security design).
 - Implementation: `src/provider/tls.rs`, `examples/tls_probe.rs`.
 - Consumer: `DecisionClient::new` (auto selection) already builds its HTTP
-  client with `tls::client_config()`. Task 9 wires
+  client with `tls::client_config()`. Provider transport also wires
   `provider::transport::shared_client` to the same function.
 
 ## 1. Backend selection
@@ -216,8 +216,7 @@ config:
 
 ## 3. macOS evidence — PENDING NATIVE EVIDENCE
 
-Not run. This environment is Linux-only. **Do not claim the native gate passed
-and do not start Task 9 on expected evidence.**
+Not run. This environment is Linux-only. **Do not claim the native release gate passed.**
 
 Exact commands to run on a native macOS host (macOS 12+, Xcode CLT installed):
 
@@ -318,14 +317,14 @@ than a static root list.
 
 - Linux: verified above. Linux uses system roots + webpki, matching Go's
   `crypto/x509` system-root behavior.
-- macOS: **PENDING NATIVE EVIDENCE**. Task 9 must not start until the commands
+- macOS: **PENDING NATIVE EVIDENCE**. Release remains gated until the commands
   in §3 are run and their output is appended here.
-- Windows: **PENDING NATIVE EVIDENCE**. Task 9 must not start until the commands
+- Windows: **PENDING NATIVE EVIDENCE**. Release remains gated until the commands
   in §4 are run and their output is appended here.
 - If either platform verifier cannot reproduce OS trust policy (for example the
   enterprise-CA, distrusted-root, expired-certificate, or intermediate-chain
   case disagrees with the OS), record the OS-native TLS stack fallback decision
-  here **before** Task 9. Do not silently fall back to webpki or native roots on
+  here **before release**. Do not silently fall back to webpki or native roots on
   macOS/Windows.
 
 The probes are automated in `.github/workflows/tls-probe.yml` (manual
@@ -344,7 +343,7 @@ artifacts into §3 and §4 and flip the status line.
 - The workflow currently runs one architecture per OS (`macos-latest` = arm64,
   `windows-latest` = amd64). Design §8.5 additionally requires macOS amd64 and
   Windows arm64 runtime TLS evidence for the release matrix; those runners must
-  be added before the release gate, not just before Task 9.
+  supply native evidence before release.
 - Error classification in the probe is heuristic (it looks for
   certificate/handshake text in the error chain). Every run prints the full
   error chain, so a misclassification is visible in the evidence.

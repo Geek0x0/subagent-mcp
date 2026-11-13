@@ -1,10 +1,8 @@
 //! MCP stdio differential scenarios.
 //!
 //! `differential_mcp_reference_*` exercises the harness against the pinned Go
-//! binary alone, so the foundation is proven before the Rust serve lifecycle
-//! exists. The comparison tests are ignored until Task 25B wires `cli::serve`:
-//! the base commit's `serve` is a stub, and pretending otherwise would hide a
-//! real failure.
+//! binary alone. Comparison tests exercise the implemented Rust serve lifecycle
+//! against the pinned reference and checked-in goldens.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;

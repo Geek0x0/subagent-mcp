@@ -306,7 +306,7 @@ async fn extra_body_is_applied_automatically_by_pooled_client() {
     let mut cfg = provider_config(Api::ChatCompletions);
     cfg.base_url = base_a.clone();
     cfg.extra_body = Some(extra.clone());
-    let client_a = PooledClient::from_config(TransportKind::ChatCompletions, &cfg);
+    let client_a = PooledClient::from_config(TransportKind::ChatCompletions, &cfg).unwrap();
     let url_a = Url::parse(&format!("{base_a}/chat/completions")).unwrap();
     let resp_a = client_a
         .execute_json(url_a, HeaderMap::new(), original)
@@ -319,7 +319,8 @@ async fn extra_body_is_applied_automatically_by_pooled_client() {
     // (b) No bypass: a raw POST Request handed straight to `execute` is merged.
     let (base_b, rx_b) = spawn_recording_mock().await;
     let client_b =
-        PooledClient::with_extra_body(TransportKind::ChatCompletions, &base_b, Some(extra));
+        PooledClient::with_extra_body(TransportKind::ChatCompletions, &base_b, Some(extra))
+            .unwrap();
     let url_b = Url::parse(&format!("{base_b}/chat/completions")).unwrap();
     let mut req = reqwest::Request::new(Method::POST, url_b);
     req.headers_mut().insert(
@@ -516,7 +517,7 @@ async fn shared_client_executes_a_request() {
     // which enforces the header timeout and merges extra_body.
     let raw = http_response("text/plain", b"ok", false);
     let base = spawn_mock(Reply::Respond { raw, tail: None }).await;
-    let client = transport::shared_client(TransportKind::Messages, &base);
+    let client = transport::shared_client(TransportKind::Messages, &base).unwrap();
     let resp = client
         .get(format!("{base}/v1/messages"))
         .send()
@@ -529,7 +530,7 @@ async fn shared_client_executes_a_request() {
 #[tokio::test]
 async fn header_timeout_slow_header_fails() {
     let base = spawn_mock(Reply::Hang).await;
-    let client = transport::shared_client(TransportKind::Responses, &base);
+    let client = transport::shared_client(TransportKind::Responses, &base).unwrap();
     let req = request_for(&base, "/responses");
     let err = transport::execute_with_header_timeout(&client, req, Duration::from_millis(80))
         .await
@@ -545,7 +546,7 @@ async fn header_timeout_slow_header_fails() {
 async fn header_timeout_long_stream_after_headers_succeeds() {
     let raw = http_response("text/event-stream", STREAM_BODY.as_bytes(), false);
     let base = spawn_mock(Reply::Respond { raw, tail: None }).await;
-    let client = transport::shared_client(TransportKind::ChatCompletions, &base);
+    let client = transport::shared_client(TransportKind::ChatCompletions, &base).unwrap();
     let req = request_for(&base, "/chat/completions");
     let resp = transport::execute_with_header_timeout(&client, req, Duration::from_secs(600))
         .await
@@ -567,7 +568,7 @@ async fn header_timeout_long_stream_after_headers_succeeds() {
 async fn pooled_client_executes_and_reads_the_body() {
     let raw = http_response("text/event-stream", b"data: hello\n\n", false);
     let base = spawn_mock(Reply::Respond { raw, tail: None }).await;
-    let client = PooledClient::new(TransportKind::ChatCompletions, &base);
+    let client = PooledClient::new(TransportKind::ChatCompletions, &base).unwrap();
     let req = request_for(&base, "/chat/completions");
     let mut resp = client.execute(req).await.unwrap();
     assert_eq!(resp.upstream(), None);
@@ -584,7 +585,7 @@ async fn pooled_client_slow_header_returns_timeout_error() {
     // The primary adapter API must enforce a response-header bound, not just
     // expose one. A server that never answers must fail with a timeout error.
     let base = spawn_mock(Reply::Hang).await;
-    let client = PooledClient::new(TransportKind::Responses, &base);
+    let client = PooledClient::new(TransportKind::Responses, &base).unwrap();
     let req = request_for(&base, "/responses");
     let err = client
         .execute_with_timeout(req, Duration::from_millis(80))
@@ -605,7 +606,7 @@ async fn pooled_client_long_body_after_headers_is_not_cut_off() {
     // not truncate a long SSE body.
     let raw = http_response("text/event-stream", STREAM_BODY.as_bytes(), false);
     let base = spawn_mock(Reply::Respond { raw, tail: None }).await;
-    let client = PooledClient::new(TransportKind::ChatCompletions, &base);
+    let client = PooledClient::new(TransportKind::ChatCompletions, &base).unwrap();
     let req = request_for(&base, "/chat/completions");
     let mut resp = client.execute(req).await.unwrap();
     assert_eq!(
@@ -641,7 +642,7 @@ async fn dropped_response_drain_is_bounded() {
         tail: Some(Duration::from_secs(30)),
     })
     .await;
-    let client = transport::shared_client(TransportKind::ChatCompletions, &base);
+    let client = transport::shared_client(TransportKind::ChatCompletions, &base).unwrap();
     let req = request_for(&base, "/stream");
     let resp = transport::execute_with_header_timeout(&client, req, Duration::from_secs(5))
         .await
@@ -672,7 +673,7 @@ async fn drain_caps_at_exactly_64kib_and_recorders_see_only_prefix() {
 
     let raw = http_response("text/event-stream", &body, false);
     let base = spawn_mock(Reply::Respond { raw, tail: None }).await;
-    let client = transport::shared_client(TransportKind::ChatCompletions, &base);
+    let client = transport::shared_client(TransportKind::ChatCompletions, &base).unwrap();
     let req = request_for(&base, "/stream");
     let resp = transport::execute_with_header_timeout(&client, req, Duration::from_secs(5))
         .await

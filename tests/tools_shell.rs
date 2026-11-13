@@ -215,10 +215,9 @@ fn process_alive(pid: i32) -> bool {
     if unsafe { libc::kill(pid, 0) } != 0 {
         return false;
     }
-    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
-        return true;
-    };
-    if let Some(end) = stat.rfind(')')
+    #[cfg(target_os = "linux")]
+    if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat"))
+        && let Some(end) = stat.rfind(')')
         && stat[end + 1..].trim_start().starts_with("Z ")
     {
         return false;
@@ -407,15 +406,48 @@ async fn merges_stdout_and_stderr() {
     let tmp = tempfile::tempdir().unwrap();
     let r = run(
         tmp.path(),
-        "echo out; echo err 1>&2",
+        "printf out1; printf err1 >&2; printf out2",
         Duration::from_secs(2),
     )
     .await;
     assert!(!r.is_error);
     assert_eq!(r.error, None);
     assert_eq!(r.exit_code, 0);
-    assert!(r.output.contains("out"), "{:?}", r.output);
-    assert!(r.output.contains("err"), "{:?}", r.output);
+    assert_eq!(r.output, "out1err1out2");
+}
+
+#[tokio::test]
+async fn descendant_finishes_within_wait_delay() {
+    let _g = SERIAL.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let r = run(
+        tmp.path(),
+        "(sleep 0.2; printf descendant-done) & exit 0",
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(r.output, "descendant-done");
+    assert_eq!(r.exit_code, 0);
+    assert!(!r.is_error);
+}
+
+#[tokio::test]
+async fn shared_stream_truncation_keeps_descriptor_order() {
+    let _g = SERIAL.lock().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let r = run(
+        tmp.path(),
+        "for ((i=0; i<9000; i++)); do printf e >&2; printf o; done",
+        Duration::from_secs(3),
+    )
+    .await;
+    assert_eq!(
+        r.output,
+        format!(
+            "{}\n[output truncated: 18000 bytes total]",
+            "eo".repeat(MAX_OUTPUT_BYTES / 2)
+        )
+    );
 }
 
 #[tokio::test]
@@ -475,6 +507,7 @@ async fn returns_success_when_background_process_holds_pipe() {
 }
 
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn grandchild_timeout_bounds_inherited_pipe_wait() {
     let _g = SERIAL.lock().await;
     let cwd = tempfile::tempdir().unwrap();
@@ -504,6 +537,7 @@ async fn grandchild_timeout_bounds_inherited_pipe_wait() {
 /// cgroup fully closes the gap. The direct child exits 0 with the pipes held,
 /// so the 1s WaitDelay turns into success (ErrWaitDelay -> zero exit).
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn setsid_escape_descendant_may_survive() {
     let _g = SERIAL.lock().await;
     let cwd = tempfile::tempdir().unwrap();
@@ -530,6 +564,7 @@ async fn setsid_escape_descendant_may_survive() {
 /// pipes, the non-zero exit code takes precedence over the ErrWaitDelay success
 /// path (Go: Wait returns the ExitError, not ErrWaitDelay).
 #[tokio::test]
+#[cfg(target_os = "linux")]
 async fn nonzero_exit_precedence_when_pipes_held() {
     let _g = SERIAL.lock().await;
     let cwd = tempfile::tempdir().unwrap();

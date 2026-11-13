@@ -121,7 +121,7 @@ impl Responses {
         };
         Ok(Self {
             name: name.to_string(),
-            client: PooledClient::from_config(TransportKind::Responses, cfg),
+            client: PooledClient::from_config(TransportKind::Responses, cfg)?,
             cfg: cfg.clone(),
             api_key,
             retry_delay: Arc::new(default_retry_delay),

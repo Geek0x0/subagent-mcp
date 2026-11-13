@@ -17,8 +17,8 @@
 //! this difference. Do not remove this note when the harness lands: the
 //! difference must never be reported as an unexplained Go-vs-Rust diff.
 //!
-//! Shared contract (unchanged from Task 17): stdout/stderr are drained on
-//! helper threads into a single capped [`LimitedBuffer`]; the inherited-pipe
+//! Shared contract: stdout/stderr share one pipe, drained on one
+//! helper thread into a capped [`LimitedBuffer`]; the inherited-pipe
 //! wait is bounded by ONE combined `wait_delay` deadline (never two sequential
 //! WaitDelay periods); captured bytes are always retained; cancellation kills
 //! the whole job and the bytes travel with [`cancelled_error`].
@@ -104,7 +104,6 @@ pub struct WindowsChild {
     thread: Option<OwnedHandle>,
     job: OwnedHandle,
     stdout_read: Option<OwnedHandle>,
-    stderr_read: Option<OwnedHandle>,
 }
 
 impl WindowsChild {
@@ -146,8 +145,8 @@ impl WindowsChild {
         }
     }
 
-    /// Wait for the process to exit (honouring cancellation) and drain BOTH
-    /// reader pipes within ONE combined `wait_delay` deadline. Returns the
+    /// Wait for the process to exit (honouring cancellation) and drain the shared
+    /// output pipe within one `wait_delay` deadline. Returns the
     /// exit status, the capped/merged/marked bytes, and whether cancellation
     /// killed a still-live child.
     pub fn wait(
@@ -160,20 +159,12 @@ impl WindowsChild {
         // The read ends live in shared slots so they can be dropped on
         // WaitDelay expiry (closing the pipe handles) while readers run.
         let out_slot = Arc::new(Mutex::new(self.stdout_read.take().map(into_file)));
-        let err_slot = Arc::new(Mutex::new(self.stderr_read.take().map(into_file)));
 
-        // A SINGLE recv_timeout bounds the inherited-pipe wait for both readers
-        // (never two sequential waits = 2x WaitDelay). When both readers exit,
-        // all done_tx clones are dropped and done_rx reports Disconnected.
+        // A single recv_timeout bounds inherited-pipe drain. The reader drops
+        // its done_tx on exit so done_rx reports Disconnected.
         let (done_tx, done_rx) = mpsc::channel::<()>();
         spawn_reader(
             Arc::clone(&out_slot),
-            Arc::clone(&limited),
-            Arc::clone(&stop),
-            done_tx.clone(),
-        );
-        spawn_reader(
-            Arc::clone(&err_slot),
             Arc::clone(&limited),
             Arc::clone(&stop),
             done_tx.clone(),
@@ -199,14 +190,11 @@ impl WindowsChild {
             std::thread::sleep(Duration::from_millis(10));
         };
 
-        // ONE combined deadline for process-exit pipe drain + both readers.
+        // One deadline for process-exit pipe drain.
         let _ = done_rx.recv_timeout(wait_delay);
         stop.store(true, Ordering::SeqCst);
         drop(done_rx);
         if let Ok(mut slot) = out_slot.try_lock() {
-            *slot = None;
-        }
-        if let Ok(mut slot) = err_slot.try_lock() {
             *slot = None;
         }
 
@@ -251,7 +239,7 @@ impl Drop for WindowsChild {
             TerminateProcess(self.process.as_raw_handle(), 1);
             TerminateJobObject(self.job.as_raw_handle(), 1);
         }
-        // self.thread / self.stdout_read / self.stderr_read drop here as well,
+        // self.thread / self.stdout_read drop here as well,
         // closing any handles the wait path did not already take.
     }
 }
@@ -263,9 +251,7 @@ struct Handles {
     thread: OwnedHandle,
     job: OwnedHandle,
     stdout_read: OwnedHandle,
-    stderr_read: OwnedHandle,
     stdout_write: OwnedHandle,
-    stderr_write: OwnedHandle,
     stdin: OwnedHandle,
     attr_list: ProcThreadAttributeList,
 }
@@ -275,23 +261,20 @@ struct Handles {
 /// job. The child is returned still suspended; assignment failure kills it.
 fn spawn_child(spec: &CommandSpec) -> io::Result<WindowsChild> {
     // `CreateProcessW` may modify the command line, so it must be writable.
-    let mut cmdline = build_command_line(spec.program.as_os_str(), &spec.args);
+    let program = resolve_program(spec)?;
+    let application = wide(program.as_os_str());
+    let mut cmdline = build_command_line(program.as_os_str(), &spec.args);
     // `env_clear` semantics: the child sees EXACTLY `spec.env`, never inherits.
     let env_block = build_env_block(&spec.env);
     let cwd_wide = spec.cwd.as_ref().map(|p| wide(p.as_os_str()));
 
     let (stdout_read, stdout_write) = make_pipe()?;
-    let (stderr_read, stderr_write) = make_pipe()?;
     let stdin = open_nul()?;
 
-    // Only these three handles are inherited by the child: stdin (NUL), stdout
-    // write end, stderr write end. The PROC_THREAD_ATTRIBUTE_HANDLE_LIST below
+    // Only these two handles are inherited: stdin (NUL) and the shared output
+    // write end. The PROC_THREAD_ATTRIBUTE_HANDLE_LIST below
     // restricts inheritance to exactly them even though bInheritHandles=TRUE.
-    let child_handles: [HANDLE; 3] = [
-        stdin.as_raw_handle(),
-        stdout_write.as_raw_handle(),
-        stderr_write.as_raw_handle(),
-    ];
+    let child_handles: [HANDLE; 2] = [stdin.as_raw_handle(), stdout_write.as_raw_handle()];
     for &h in &child_handles {
         // SAFETY: h is a valid handle we own; marking it inheritable is required
         // for the PROC_THREAD_ATTRIBUTE_HANDLE_LIST attribute.
@@ -308,16 +291,16 @@ fn spawn_child(spec: &CommandSpec) -> io::Result<WindowsChild> {
     siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
     siex.StartupInfo.hStdInput = child_handles[0];
     siex.StartupInfo.hStdOutput = child_handles[1];
-    siex.StartupInfo.hStdError = child_handles[2];
+    siex.StartupInfo.hStdError = child_handles[1];
     siex.lpAttributeList = attr_list.as_ptr();
 
     let mut pi = PROCESS_INFORMATION::default();
     // SAFETY: all pointers are valid for the duration of the call; cmdline is
     // writable and null-terminated; env_block/cwd_wide are kept alive here;
-    // lpApplicationName is NULL so Windows resolves the module via PATH search.
+    // The explicit application prevents CreateProcessW's implicit cwd search.
     let ok = unsafe {
         CreateProcessW(
-            std::ptr::null(),
+            application.as_ptr(),
             cmdline.as_mut_ptr(),
             std::ptr::null(),
             std::ptr::null(),
@@ -353,9 +336,7 @@ fn spawn_child(spec: &CommandSpec) -> io::Result<WindowsChild> {
         thread: unsafe { OwnedHandle::from_raw_handle(pi.hThread) },
         job,
         stdout_read,
-        stderr_read,
         stdout_write,
-        stderr_write,
         stdin,
         attr_list,
     };
@@ -405,14 +386,11 @@ fn spawn_child(spec: &CommandSpec) -> io::Result<WindowsChild> {
         thread,
         job,
         stdout_read,
-        stderr_read,
         stdout_write,
-        stderr_write,
         stdin,
         attr_list,
     } = h;
     drop(stdout_write);
-    drop(stderr_write);
     drop(stdin);
     drop(attr_list);
     Ok(WindowsChild {
@@ -420,7 +398,6 @@ fn spawn_child(spec: &CommandSpec) -> io::Result<WindowsChild> {
         thread: Some(thread),
         job,
         stdout_read: Some(stdout_read),
-        stderr_read: Some(stderr_read),
     })
 }
 
@@ -652,8 +629,67 @@ fn append_arg(cmd: &mut Vec<u16>, arg: &OsStr) {
     }
 }
 
-/// Build the null-terminated command line. `lpApplicationName` is left NULL so
-/// Windows resolves `program` via PATH search, matching `std::process::Command`.
+/// Resolve bare executable names via PATH/PATHEXT without implicit cwd search.
+fn resolve_program(spec: &CommandSpec) -> io::Result<std::path::PathBuf> {
+    use std::path::{Path, PathBuf};
+    let program = Path::new(&spec.program);
+    let cwd = match &spec.cwd {
+        Some(cwd) => std::path::absolute(cwd)?,
+        None => std::env::current_dir()?,
+    };
+    if program.components().count() > 1
+        || program.has_root()
+        || spec.program.to_string_lossy().contains(['/', '\\', ':'])
+    {
+        return Ok(cwd.join(program));
+    }
+    let env = |key: &str| {
+        spec.env
+            .iter()
+            .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case(key))
+            .map(|(_, value)| value.clone())
+    };
+    let path = env("PATH").unwrap_or_default();
+    let extensions = env("PATHEXT").unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".into());
+    let mut names = Vec::new();
+    if program.extension().is_some() {
+        names.push(PathBuf::from(program));
+    }
+    for extension in extensions
+        .to_string_lossy()
+        .split(';')
+        .filter(|e| !e.is_empty())
+    {
+        let mut name = spec.program.clone();
+        name.push(extension);
+        names.push(PathBuf::from(name));
+    }
+    for dir in std::env::split_paths(&path).filter(|p| !p.as_os_str().is_empty()) {
+        for name in &names {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                // Go's LookPath refuses an executable found via a relative
+                // PATH entry (ErrDot); never silently trust the current repo.
+                if !candidate.is_absolute() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "refusing executable resolved relative to current directory: {}",
+                            candidate.display()
+                        ),
+                    ));
+                }
+                return Ok(candidate);
+            }
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("executable {:?} not found in PATH", spec.program),
+    ))
+}
+
+/// Build the command line with the same resolved program as lpApplicationName.
 fn build_command_line(program: &OsStr, args: &[OsString]) -> Vec<u16> {
     let mut cmd = Vec::new();
     append_arg(&mut cmd, program);

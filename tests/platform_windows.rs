@@ -155,6 +155,58 @@ fn job_object_contains_descendants_of_the_resumed_child() {
 // Path checks
 // ---------------------------------------------------------------------------
 
+#[test]
+fn bound_directory_rejects_metadata_equivalent_replacement() {
+    use std::os::windows::{
+        fs::{MetadataExt, OpenOptionsExt},
+        io::AsRawHandle,
+    };
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_FLAG_BACKUP_SEMANTICS, FILE_WRITE_ATTRIBUTES,
+        GetFileInformationByHandle, SetFileTime,
+    };
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let bound = BoundDirectory::open(&root).unwrap();
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    assert_ne!(
+        unsafe { GetFileInformationByHandle(bound.file.as_raw_handle(), &mut info) },
+        0
+    );
+    fs::rename(&root, base.path().join("original")).unwrap();
+    fs::create_dir(&root).unwrap();
+    let replacement = fs::OpenOptions::new()
+        .access_mode(FILE_WRITE_ATTRIBUTES)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(&root)
+        .unwrap();
+    assert_ne!(
+        unsafe {
+            SetFileTime(
+                replacement.as_raw_handle(),
+                &info.ftCreationTime,
+                &info.ftLastAccessTime,
+                &info.ftLastWriteTime,
+            )
+        },
+        0
+    );
+    let original = bound.file.metadata().unwrap();
+    let current = fs::metadata(&root).unwrap();
+    assert_eq!(original.creation_time(), current.creation_time());
+    assert_eq!(original.last_write_time(), current.last_write_time());
+    assert_eq!(original.file_size(), current.file_size());
+    assert_eq!(original.file_attributes(), current.file_attributes());
+    assert!(
+        bound
+            .check()
+            .unwrap_err()
+            .to_string()
+            .contains("no longer names")
+    );
+}
+
 /// Windows confinement is policy-level (there is no kernel FS off Linux) plus
 /// the held directory handle: `check()` proves the path still names the
 /// session's original directory, and `inside_relative` refuses escapes.

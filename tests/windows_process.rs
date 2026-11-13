@@ -33,6 +33,92 @@ use windows_sys::Win32::System::Threading::{
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
+// Both copies of this test executable act as benign marker-writing bash.exe
+// peers. The directory containing the selected executable identifies its source.
+#[test]
+fn executable_search_marker_peer() {
+    if let Some(marker) = std::env::var_os("WINDOWS_EXECUTABLE_SEARCH_MARKER") {
+        let executable = std::env::current_exe().unwrap();
+        fs::write(
+            marker,
+            executable
+                .parent()
+                .unwrap()
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .as_bytes(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn path_executable_wins_over_cwd_bash() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let intended = tmp.path().join("bin");
+    let cwd = tmp.path().join("repo");
+    fs::create_dir(&intended).unwrap();
+    fs::create_dir(&cwd).unwrap();
+    let executable = std::env::current_exe().unwrap();
+    fs::copy(&executable, intended.join("bash.exe")).unwrap();
+    fs::copy(&executable, cwd.join("bash.exe")).unwrap();
+    struct RestoreCwd(std::path::PathBuf);
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            std::env::set_current_dir(&self.0).unwrap();
+        }
+    }
+    let _restore = RestoreCwd(std::env::current_dir().unwrap());
+    std::env::set_current_dir(&cwd).unwrap();
+    let marker = cwd.join("marker.txt");
+    let mut spec = cmd_spec("");
+    spec.program = "bash".into();
+    spec.args = vec![
+        "--exact".into(),
+        "executable_search_marker_peer".into(),
+        "--nocapture".into(),
+    ];
+    spec.cwd = Some(cwd.clone());
+    spec.env
+        .retain(|(key, _)| !key.to_string_lossy().eq_ignore_ascii_case("PATH"));
+    spec.env.push(("PATH".into(), intended.into_os_string()));
+    spec.env.push((
+        "WINDOWS_EXECUTABLE_SEARCH_MARKER".into(),
+        marker.clone().into_os_string(),
+    ));
+    let output = run_managed_command(spec, &CancellationToken::new(), WAIT_DELAY).unwrap();
+    assert!(output.status.success());
+    assert_eq!(fs::read_to_string(marker).unwrap(), "bin");
+}
+
+#[test]
+fn shared_output_pipe_preserves_order_and_truncation() {
+    let _g = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let out = run_managed_command(
+        powershell_spec("[Console]::Out.Write('out1'); [Console]::Error.Write('err1'); [Console]::Out.Write('out2')"),
+        &CancellationToken::new(),
+        WAIT_DELAY,
+    )
+    .unwrap();
+    assert_eq!(out.stdout, b"out1err1out2");
+    let script = "[Console]::Error.Write('err'); [Console]::Out.Write(('a' * 20000))";
+    let out = run_managed_command(
+        powershell_spec(script),
+        &CancellationToken::new(),
+        WAIT_DELAY,
+    )
+    .unwrap();
+    assert_eq!(
+        String::from_utf8(out.stdout).unwrap(),
+        format!(
+            "err{}\n[output truncated: 20003 bytes total]",
+            "a".repeat(16381)
+        )
+    );
+}
+
 /// `GetExitCodeProcess` reports this code while the process is still running.
 const STILL_ACTIVE: u32 = 259;
 /// Bounds the inherited-pipe drain. Kept small so the suite is fast.

@@ -72,27 +72,33 @@ static CLIENTS: LazyLock<Mutex<HashMap<String, reqwest::Client>>> =
 /// Adapter requests must go through [`PooledClient::execute`] /
 /// [`PooledClient::execute_json`], which enforce
 /// [`DEFAULT_RESPONSE_HEADER_TIMEOUT`] and merge `extra_body`.
-pub fn shared_client(kind: TransportKind, base_url: &str) -> reqwest::Client {
+pub fn shared_client(
+    kind: TransportKind,
+    base_url: &str,
+) -> Result<reqwest::Client, ProviderError> {
     let key = format!("{}\x00{}", kind_label(kind), base_url);
     let mut clients = CLIENTS.lock().unwrap();
     if let Some(client) = clients.get(&key) {
-        return client.clone();
+        return Ok(client.clone());
     }
-    let client = build_client();
+    let client = build_client()?;
     clients.insert(key, client.clone());
-    client
+    Ok(client)
 }
 
-fn build_client() -> reqwest::Client {
-    let tls = crate::provider::tls::client_config()
-        .expect("provider transport: platform TLS client configuration unavailable");
+fn build_client() -> Result<reqwest::Client, ProviderError> {
+    let tls = crate::provider::tls::client_config().map_err(|e| ProviderError {
+        message: format!("provider transport: {e}"),
+    })?;
     reqwest::Client::builder()
         .use_preconfigured_tls(tls)
         // Match Go's http.DefaultTransport dial (30 s) and idle (90 s) bounds.
         .connect_timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(90))
         .build()
-        .expect("provider transport: build reqwest client")
+        .map_err(|e| ProviderError {
+            message: format!("provider transport: build reqwest client: {e}"),
+        })
 }
 
 /// Execute `req` with a timer around **only** `client.execute()`. reqwest
@@ -485,7 +491,7 @@ pub struct PooledClient {
 
 impl PooledClient {
     /// Build a client with no `extra_body` (Go `PooledClient`).
-    pub fn new(kind: TransportKind, base_url: &str) -> Self {
+    pub fn new(kind: TransportKind, base_url: &str) -> Result<Self, ProviderError> {
         Self::with_extra_body(kind, base_url, None)
     }
 
@@ -495,17 +501,17 @@ impl PooledClient {
         kind: TransportKind,
         base_url: &str,
         extra_body: Option<serde_json::Map<String, serde_json::Value>>,
-    ) -> Self {
-        Self {
-            http: shared_client(kind, base_url),
+    ) -> Result<Self, ProviderError> {
+        Ok(Self {
+            http: shared_client(kind, base_url)?,
             kind,
             extra_body,
-        }
+        })
     }
 
     /// Build straight from a resolved [`ProviderConfig`]: base URL and
     /// `extra_body` come from config, so adapters cannot forget the merge.
-    pub fn from_config(kind: TransportKind, cfg: &ProviderConfig) -> Self {
+    pub fn from_config(kind: TransportKind, cfg: &ProviderConfig) -> Result<Self, ProviderError> {
         Self::with_extra_body(kind, &cfg.base_url, cfg.extra_body.clone())
     }
 

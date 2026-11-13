@@ -638,6 +638,11 @@ impl Client {
     /// immediate, so a busy writer is left for the caller's kill path instead of
     /// blocking close/shutdown.
     pub async fn close_writer(&self) {
+        self.close_writer_blocking();
+    }
+
+    /// Close stdin without waiting on an in-flight write during process shutdown.
+    pub fn close_writer_blocking(&self) {
         if let Ok(mut writer) = self.inner.writer.try_lock() {
             writer.take();
         }

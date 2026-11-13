@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{Document, Item, TableLike, Value as TomlValue};
 
-use crate::util::fs::eval_symlinks;
+use crate::util::fs::lexical_clean;
 use crate::util::json::go_quote;
 
 // --- Constants (Go config.go) ---------------------------------------------
@@ -354,15 +354,16 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     #[cfg(not(unix))]
     let _ = (holds_key, &metadata);
 
-    // Go stores filepath.Abs(path); util::fs::eval_symlinks (canonicalize) also
-    // yields an absolute path for an existing file.
-    let absolute = eval_symlinks(path).map_err(|e| {
-        err(format!(
-            "resolve config file path {}: {}",
-            path.display(),
-            e
-        ))
-    })?;
+    // filepath.Abs preserves the user's symlink spelling.
+    let absolute = std::path::absolute(path)
+        .map(|p| lexical_clean(&p))
+        .map_err(|e| {
+            err(format!(
+                "resolve config file path {}: {}",
+                path.display(),
+                e
+            ))
+        })?;
 
     // Defaults are applied before validation, exactly like Go Load.
     for p in raw.providers.values_mut() {

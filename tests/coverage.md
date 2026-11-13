@@ -82,7 +82,7 @@ Rust coverage columns:
 ## Golden fixtures captured from the pinned binary (stand alone after Go deletion)
 
 - `tests/fixtures/mcp/*.jsonl` — complete Go output streams (responses and
-  `subagent/event` notifications in arrival order) for eleven scenarios:
+  `subagent/event` notifications in arrival order) for twelve scenarios:
   chat/responses/messages text turns, tool turn, files turn, patch turn,
   nudge, budget refusal, mid-turn cancellation, auto (Jev) selection, a Codex
   app-server turn (including its full `subagent/event` sequence — two

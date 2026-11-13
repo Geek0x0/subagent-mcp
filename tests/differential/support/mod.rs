@@ -413,7 +413,7 @@ impl McpProcess {
 
     /// Drain non-response frames until `quiet` has passed with no new frame,
     /// bounded by `overall`. Returns the drained frames in arrival order (they
-    /// are also retained for [`McpProcess::take_notifications`]).
+    /// are not retained for [`McpProcess::take_notifications`]).
     ///
     /// This captures notifications that legally trail the response they
     /// belong to (e.g. Go writes `subagent/event` frames after the
@@ -435,7 +435,6 @@ impl McpProcess {
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
-        self.notifications.extend(drained.iter().cloned());
         drained
     }
 
@@ -493,5 +492,38 @@ impl Drop for McpProcess {
             let _ = child.kill();
             let _ = child.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod drain_tests {
+    use super::*;
+
+    #[test]
+    fn trailing_frames_are_not_repeated_on_followup() {
+        let (tx, frames) = mpsc::channel();
+        let mut process = McpProcess {
+            child: None,
+            stdin: None,
+            frames,
+            notifications: vec![],
+            stderr: Arc::new(Mutex::new(String::new())),
+            timeout: Duration::from_secs(1),
+        };
+        let trailing = json!({"method":"subagent/event","params":{"call":1}});
+        tx.send(Ok(trailing.clone())).unwrap();
+        let first = process.drain(Duration::from_millis(1), Duration::from_millis(10));
+        assert_eq!(first, vec![trailing]);
+        assert!(
+            process.take_notifications().is_empty(),
+            "followup must not repeat first call's trailing frames"
+        );
+        let second = json!({"method":"subagent/event","params":{"call":2}});
+        tx.send(Ok(second.clone())).unwrap();
+        assert_eq!(
+            process.drain(Duration::from_millis(1), Duration::from_millis(10)),
+            vec![second]
+        );
+        assert!(process.take_notifications().is_empty());
     }
 }

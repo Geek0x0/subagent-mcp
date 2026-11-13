@@ -2,8 +2,8 @@
 //!
 //! Ports Go `internal/server/auto.go` (v0.13.1): candidate filtering, the
 //! one-candidate skip, the TypeSafe Jev decision request, and the metadata
-//! object returned to the caller and written into the rollout. Usage fields
-//! stay absent when the decision response omitted them; they are never zeroed.
+//! object returned to the caller and written into the rollout. Missing decision
+//! fields emit Go's zero values.
 //!
 //! Task 24B integrates Codex candidates: the adapter is registered by
 //! [`super::tools::SubagentTools::new`], so [`codex_available`] is true and a
@@ -38,28 +38,25 @@ pub struct AutoSelection {
 }
 
 impl AutoSelection {
-    /// The `auto` result object. Absent optional fields are omitted, never
-    /// serialized as zero; `omitted` is an array when non-empty.
+    /// The `auto` result object, including Go's zero-value decision fields.
     pub fn meta(&self) -> Value {
         let mut meta = Map::new();
         if self.skipped {
-            meta.insert("skipped".into(), json!(true));
+            return json!({"skipped": true});
         } else {
-            if let Some(judge) = &self.judge_model {
-                meta.insert("judge_model".into(), json!(judge));
-            }
-            if let Some(confidence) = self.confidence {
-                meta.insert("confidence".into(), json!(confidence));
-            }
+            meta.insert(
+                "judge_model".into(),
+                json!(self.judge_model.as_deref().unwrap_or_default()),
+            );
+            meta.insert("confidence".into(), json!(self.confidence.unwrap_or(0.0)));
             if !self.probabilities.is_empty() {
                 meta.insert("probabilities".into(), json!(self.probabilities));
             }
-            if let Some(input) = self.input_tokens {
-                meta.insert("input_tokens".into(), json!(input));
-            }
-            if let Some(output) = self.output_tokens {
-                meta.insert("output_tokens".into(), json!(output));
-            }
+            meta.insert("input_tokens".into(), json!(self.input_tokens.unwrap_or(0)));
+            meta.insert(
+                "output_tokens".into(),
+                json!(self.output_tokens.unwrap_or(0)),
+            );
         }
         if !self.omitted.is_empty() {
             meta.insert("omitted".into(), json!(self.omitted));
@@ -286,4 +283,31 @@ fn default_description(model: &str) -> Option<&'static str> {
         }
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod metadata_tests {
+    use super::*;
+
+    #[test]
+    fn absent_decision_fields_emit_go_zero_values() {
+        let mut selection = AutoSelection {
+            provider: "p".into(),
+            model: "m".into(),
+            skipped: false,
+            judge_model: None,
+            confidence: None,
+            probabilities: BTreeMap::new(),
+            input_tokens: None,
+            output_tokens: None,
+            omitted: vec![],
+        };
+        assert_eq!(
+            selection.meta(),
+            json!({"judge_model":"", "confidence":0.0, "input_tokens":0, "output_tokens":0})
+        );
+        selection.skipped = true;
+        selection.omitted.push("unusable".into());
+        assert_eq!(selection.meta(), json!({"skipped":true}));
+    }
 }

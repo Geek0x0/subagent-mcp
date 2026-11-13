@@ -11,7 +11,7 @@ use crate::tools::process::{CommandSpec, LimitedBuffer, build_command, cancelled
 use std::io::{self, Read};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
-use std::process::{ChildStderr, ChildStdout, ExitStatus, Output};
+use std::process::{ChildStdout, ExitStatus, Output, Stdio};
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -28,32 +28,36 @@ pub fn run_managed_command(
     // New process group; pgid == the direct child's pid.
     // Go: SysProcAttr{Setpgid: true}.
     command.process_group(0);
+    command.stderr(Stdio::null());
+    // SAFETY: dup2 is async-signal-safe. Command has installed stdout before
+    // pre_exec runs; both descriptors must write to that same pipe.
+    unsafe {
+        command.pre_exec(|| {
+            if libc::dup2(1, 2) < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
     let mut child = command.spawn()?;
     let pgid = child.id();
 
     let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
     if let Some(s) = &stdout {
         set_nonblocking(s.as_raw_fd())?;
     }
-    if let Some(s) = &stderr {
-        set_nonblocking(s.as_raw_fd())?;
-    }
 
-    // Single Go-style limited buffer: both pipes feed it, capping during
+    // Single Go-style limited buffer: one shared pipe feeds it, capping during
     // draining (never buffering unbounded output) and counting the true total.
     let mut limited = LimitedBuffer::new();
     let mut out_eof = stdout.is_none();
-    let mut err_eof = stderr.is_none();
     let mut status: Option<ExitStatus> = None;
     let mut exited_at: Option<Instant> = None;
-    let mut swept = false;
     let mut killed = false;
 
     loop {
-        poll_once(&stdout, &stderr, out_eof, err_eof, POLL_INTERVAL_MS);
+        poll_once(&stdout, out_eof, POLL_INTERVAL_MS);
         drain(&mut stdout, &mut limited, &mut out_eof)?;
-        drain(&mut stderr, &mut limited, &mut err_eof)?;
 
         if status.is_none()
             && let Some(s) = child.try_wait()?
@@ -71,16 +75,8 @@ pub fn run_managed_command(
             killed = true;
         }
 
-        // Sweep once, immediately after the direct child exits. Go sweeps after
-        // Run returns, but sweeping here reaps backgrounded descendants sooner
-        // while keeping the same observable result.
-        if status.is_some() && !swept {
-            sweep_group(pgid);
-            swept = true;
-        }
-
         if let Some(t) = exited_at {
-            if out_eof && err_eof {
+            if out_eof {
                 break;
             }
             if t.elapsed() >= wait_delay {
@@ -89,6 +85,9 @@ pub fn run_managed_command(
         }
     }
 
+    // Go sweeps after Run's inherited-pipe drain, allowing short-lived
+    // descendants to finish within WaitDelay.
+    sweep_group(pgid);
     let status = match status {
         Some(s) => s,
         None => child.wait()?,
@@ -96,7 +95,6 @@ pub fn run_managed_command(
     // Dropping the read ends unblocks any orphaned writers still holding the
     // pipes (Go: closeDescriptors(parentIOPipes)).
     drop(stdout);
-    drop(stderr);
 
     // The captured/truncated bytes travel with the cancellation error so the
     // shell tool can still return them as `output` (Go keeps `out` on error).
@@ -125,14 +123,8 @@ fn set_nonblocking(fd: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn poll_once(
-    stdout: &Option<ChildStdout>,
-    stderr: &Option<ChildStderr>,
-    out_eof: bool,
-    err_eof: bool,
-    timeout_ms: i32,
-) {
-    let mut fds: Vec<libc::pollfd> = Vec::with_capacity(2);
+fn poll_once(stdout: &Option<ChildStdout>, out_eof: bool, timeout_ms: i32) {
+    let mut fds: Vec<libc::pollfd> = Vec::with_capacity(1);
     if !out_eof && let Some(s) = stdout {
         fds.push(libc::pollfd {
             fd: s.as_raw_fd(),
@@ -140,15 +132,8 @@ fn poll_once(
             revents: 0,
         });
     }
-    if !err_eof && let Some(s) = stderr {
-        fds.push(libc::pollfd {
-            fd: s.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        });
-    }
     if fds.is_empty() {
-        // Both pipes are at EOF; still poll the child/cancel at a fixed cadence.
+        // Output is at EOF; still poll the child/cancel at a fixed cadence.
         std::thread::sleep(Duration::from_millis(timeout_ms as u64));
         return;
     }

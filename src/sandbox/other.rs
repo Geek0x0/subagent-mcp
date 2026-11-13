@@ -9,7 +9,9 @@
 //! `None`, so callers fall back to ordinary paths, and `path()` is path-only.
 
 use std::ffi::OsString;
-use std::fs::{File, Metadata};
+use std::fs::File;
+#[cfg(not(windows))]
+use std::fs::Metadata;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -40,12 +42,7 @@ fn open_dir(path: &Path) -> io::Result<File> {
 
 #[cfg(windows)]
 fn open_dir(path: &Path) -> io::Result<File> {
-    use std::os::windows::fs::OpenOptionsExt;
-    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-        .open(path)
+    crate::util::fs::open_identity(path)
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -54,23 +51,11 @@ fn open_dir(path: &Path) -> io::Result<File> {
 }
 
 /// Go `os.SameFile` for two already-fetched metadata values: device + inode on
-/// Unix (exactly the logic of `util::fs::same_file`). Stable Windows std cannot
-/// expose a file's identity from metadata (`windows_by_handle` is unstable), so
-/// mirror `util::fs::same_file`'s documented non-Unix best-effort behavior by
-/// comparing the stable identity fields; a replaced directory will differ.
+/// Unix (exactly the logic of `util::fs::same_file`). Windows uses held handles.
 #[cfg(unix)]
 fn same_metadata(a: &Metadata, b: &Metadata) -> bool {
     use std::os::unix::fs::MetadataExt;
     a.dev() == b.dev() && a.ino() == b.ino()
-}
-
-#[cfg(windows)]
-fn same_metadata(a: &Metadata, b: &Metadata) -> bool {
-    use std::os::windows::fs::MetadataExt;
-    a.creation_time() == b.creation_time()
-        && a.last_write_time() == b.last_write_time()
-        && a.file_size() == b.file_size()
-        && a.file_attributes() == b.file_attributes()
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -113,21 +98,34 @@ impl BoundDirectory {
 
     /// Go `Check`: require the held inode still to be the one named by the path.
     pub fn check(&self) -> io::Result<()> {
-        let bound = self.file.metadata().map_err(|e| {
+        #[cfg(windows)]
+        let bound = crate::util::fs::windows_file_identity(&self.file);
+        #[cfg(not(windows))]
+        let bound = self.file.metadata();
+        let bound = bound.map_err(|e| {
             io::Error::other(format!(
                 "bound directory {} is unavailable: {}",
                 quote(&self.path),
                 e
             ))
         })?;
-        let current = std::fs::metadata(&self.path).map_err(|e| {
+        #[cfg(windows)]
+        let current =
+            open_dir(&self.path).and_then(|file| crate::util::fs::windows_file_identity(&file));
+        #[cfg(not(windows))]
+        let current = std::fs::metadata(&self.path);
+        let current = current.map_err(|e| {
             io::Error::other(format!(
                 "bound directory {} is no longer reachable: {}",
                 quote(&self.path),
                 e
             ))
         })?;
-        if !same_metadata(&bound, &current) {
+        #[cfg(windows)]
+        let same = bound == current;
+        #[cfg(not(windows))]
+        let same = same_metadata(&bound, &current);
+        if !same {
             return Err(io::Error::other(format!(
                 "bound directory {} no longer names the session's original directory",
                 quote(&self.path)

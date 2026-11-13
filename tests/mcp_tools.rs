@@ -1256,7 +1256,7 @@ async fn turn_limit_preserves_thread_id() {
         json!({
             "prompt": "never finish",
             "cwd": cwd(),
-            "config": {"max_turns": 1}
+            "config": {"max_turns": 1.5}
         }),
     )
     .await
@@ -1268,31 +1268,39 @@ async fn turn_limit_preserves_thread_id() {
 }
 
 #[tokio::test]
-async fn excessive_max_turns_falls_back_to_the_default() {
+async fn max_turns_bounds_and_fractional_truncation() {
     let _env = env_guard();
-    let provider = Arc::new(StubProvider::with_repeat(
-        "deepseek",
-        tool_turn(vec![subagent_mcp::provider::ToolCall {
-            id: "call-forever".into(),
-            name: "unknown_tool".into(),
-            arguments: "{}".into(),
-        }]),
-    ));
-    let tools = tools(test_config(vec![("deepseek", provider.clone())]));
-    let result = call(
-        &tools,
-        "subagent",
-        json!({
-            "prompt": "use a bounded turn count",
-            "cwd": cwd(),
-            "config": {"max_turns": 100001}
-        }),
-    )
-    .await
-    .unwrap();
-    assert!(is_error(&result));
-    assert!(text(&result).contains("turn limit reached (50)"));
-    assert_eq!(provider.requests().len(), 50);
+    for (value, expected) in [
+        (json!(0), 50),
+        (json!(-1), 50),
+        (json!(100001), 50),
+        (json!(1), 1),
+        (json!(1.5), 1),
+    ] {
+        let provider = Arc::new(StubProvider::with_repeat(
+            "deepseek",
+            tool_turn(vec![subagent_mcp::provider::ToolCall {
+                id: "call-forever".into(),
+                name: "unknown_tool".into(),
+                arguments: "{}".into(),
+            }]),
+        ));
+        let tools = tools(test_config(vec![("deepseek", provider.clone())]));
+        let result = call(
+            &tools,
+            "subagent",
+            json!({
+                "prompt": "use a bounded turn count",
+                "cwd": cwd(),
+                "config": {"max_turns": value}
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(is_error(&result));
+        assert!(text(&result).contains(&format!("turn limit reached ({expected})")));
+        assert_eq!(provider.requests().len(), expected);
+    }
 }
 
 // ---------------------------------------------------------------------------

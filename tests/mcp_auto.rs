@@ -1019,7 +1019,7 @@ async fn handle_start_auto_single_candidate_needs_no_jev_key() {
 }
 
 #[tokio::test]
-async fn handle_start_auto_reports_omitted_provider_and_rollout_metadata() {
+async fn handle_start_auto_skipped_metadata_has_only_skipped_flag() {
     let _env = env_guard();
     let home = tempfile::tempdir().unwrap();
     unsafe {
@@ -1067,17 +1067,15 @@ async fn handle_start_auto_reports_omitted_provider_and_rollout_metadata() {
         .unwrap()
         .to_string();
     let auto = structured(&result)["auto"].as_object().unwrap();
-    let omitted = auto["omitted"].as_array().unwrap();
-    assert_eq!(omitted.len(), 1);
-    assert!(omitted[0].as_str().unwrap().contains("bravo"));
-    assert!(omitted[0].as_str().unwrap().contains(missing));
+    assert_eq!(auto.len(), 1);
+    assert_eq!(auto["skipped"], true);
 
     let path = find_rollout(home.path(), &id);
     let data = std::fs::read_to_string(path).unwrap();
     let first: Value = serde_json::from_str(data.lines().next().unwrap()).unwrap();
     let selection = first["payload"]["model_selection"].as_object().unwrap();
     assert_eq!(selection["skipped"], true);
-    assert_eq!(selection["omitted"].as_array().unwrap().len(), 1);
+    assert!(selection.get("omitted").is_none());
     for key in [
         "judge_model",
         "confidence",

@@ -399,6 +399,30 @@ struct ProcessInner {
 }
 
 impl ProcessInner {
+    fn close_blocking(mut self) {
+        self.client.close_writer_blocking();
+        let poll = |child: &mut Child, timeout: Duration| {
+            let deadline = std::time::Instant::now() + timeout;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => return true,
+                    Err(_) => return false,
+                    Ok(None) => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        if !poll(&mut self.child, CLOSE_TIMEOUT) {
+            let _ = self.child.start_kill();
+            poll(&mut self.child, STDERR_WAIT_DELAY);
+        }
+        self.client.abort_reader();
+        self.stderr_task.abort();
+    }
+
     async fn close(mut self) {
         // Closing stdin lets the app-server exit on its own. `close_writer` does
         // not wait for an in-flight write, so a wedged child cannot delay the
@@ -440,12 +464,10 @@ impl Closer for ProcessCloser {
         let Ok(mut inner) = self.inner.try_lock() else {
             return;
         };
-        let Some(mut inner) = inner.take() else {
+        let Some(inner) = inner.take() else {
             return;
         };
-        inner.client.abort_reader();
-        let _ = inner.child.start_kill();
-        inner.stderr_task.abort();
+        inner.close_blocking();
     }
 }
 

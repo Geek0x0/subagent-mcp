@@ -9,6 +9,15 @@ use subagent_mcp::config;
 
 const VALID_TOML: &str = include_str!("fixtures/config/valid.toml");
 
+#[cfg(unix)]
+#[test]
+fn config_path_keeps_symlink_spelling() {
+    let (dir, target) = write_config(VALID_TOML);
+    let link = dir.path().join("linked.toml");
+    std::os::unix::fs::symlink(target, &link).unwrap();
+    assert_eq!(config::load(&link).unwrap().path, link);
+}
+
 const CODEX_TOML: &str = r#"
 [providers.codex]
 api = "codex-app-server"

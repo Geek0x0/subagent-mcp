@@ -105,7 +105,7 @@ impl Messages {
         };
         Ok(Self {
             name: name.to_string(),
-            client: PooledClient::from_config(TransportKind::Messages, cfg),
+            client: PooledClient::from_config(TransportKind::Messages, cfg)?,
             max_tokens: cfg.max_output_tokens.unwrap_or(0),
             cfg: cfg.clone(),
             api_key,
