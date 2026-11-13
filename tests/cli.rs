@@ -41,6 +41,17 @@ fn run_cli(args: &[&str], envs: &[(&str, &str)], home: &Path) -> Output {
         .env_clear()
         .env("HOME", home)
         .env("PATH", std::env::var_os("PATH").unwrap_or_default());
+    #[cfg(windows)]
+    {
+        // Windows networking and the default config path use these; clearing
+        // them breaks child-process loopback connections and home lookup.
+        cmd.env("USERPROFILE", home);
+        for name in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(name) {
+                cmd.env(name, value);
+            }
+        }
+    }
     for (name, value) in envs {
         cmd.env(name, value);
     }
