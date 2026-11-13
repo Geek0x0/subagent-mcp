@@ -1,7 +1,9 @@
 # Platform runtime and TLS trust evidence (Task 28)
 
-Status: **Linux x86_64 verified. Linux arm64, macOS x86_64/arm64, Windows
-x86_64, and Windows arm64 are PENDING NATIVE EVIDENCE.**
+Status: **Linux x86_64/arm64, macOS x86_64/arm64, and Windows x86_64/arm64
+runtime/TLS CI gates passed on 2026-11-13 in release run `43380656677`.
+macOS trust-store passed on both architectures. Windows trust-store is still
+PENDING native-VM evidence because CryptUI needs an interactive desktop.**
 
 This file records the per-platform release gate added by Task 28. The Linux
 result below is a real local run. Every other row is a checklist to execute on
