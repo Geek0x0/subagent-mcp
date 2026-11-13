@@ -42,7 +42,7 @@ impl AutoSelection {
     pub fn meta(&self) -> Value {
         let mut meta = Map::new();
         if self.skipped {
-            return json!({"skipped": true});
+            meta.insert("skipped".into(), json!(true));
         } else {
             meta.insert(
                 "judge_model".into(),
@@ -307,7 +307,11 @@ mod metadata_tests {
             json!({"judge_model":"", "confidence":0.0, "input_tokens":0, "output_tokens":0})
         );
         selection.skipped = true;
-        selection.omitted.push("unusable".into());
         assert_eq!(selection.meta(), json!({"skipped":true}));
+        selection.omitted.push("unusable".into());
+        assert_eq!(
+            selection.meta(),
+            json!({"skipped":true,"omitted":["unusable"]})
+        );
     }
 }

@@ -1004,6 +1004,7 @@ async fn handle_start_auto_single_candidate_needs_no_jev_key() {
     let structured = structured(&result);
     assert_eq!(structured["provider"], "alpha");
     assert_eq!(structured["model"], "m-fast");
+    assert_eq!(structured["auto"], json!({"skipped": true}));
     let auto = structured["auto"].as_object().unwrap();
     assert_eq!(auto["skipped"], true);
     for key in [
@@ -1019,7 +1020,7 @@ async fn handle_start_auto_single_candidate_needs_no_jev_key() {
 }
 
 #[tokio::test]
-async fn handle_start_auto_skipped_metadata_has_only_skipped_flag() {
+async fn handle_start_auto_skipped_metadata_preserves_omitted_providers() {
     let _env = env_guard();
     let home = tempfile::tempdir().unwrap();
     unsafe {
@@ -1066,16 +1067,22 @@ async fn handle_start_auto_skipped_metadata_has_only_skipped_flag() {
         .as_str()
         .unwrap()
         .to_string();
-    let auto = structured(&result)["auto"].as_object().unwrap();
-    assert_eq!(auto.len(), 1);
-    assert_eq!(auto["skipped"], true);
+    let expected = json!({
+        "skipped": true,
+        "omitted": ["bravo: environment variable TEST_AUTO_MISSING_BRAVO3_TASK24A (providers.bravo.env_key) must be set to the API key"]
+    });
+    assert_eq!(structured(&result)["auto"], expected);
 
     let path = find_rollout(home.path(), &id);
     let data = std::fs::read_to_string(path).unwrap();
     let first: Value = serde_json::from_str(data.lines().next().unwrap()).unwrap();
     let selection = first["payload"]["model_selection"].as_object().unwrap();
+    let mut expected_rollout = expected.clone();
+    expected_rollout["provider"] = json!("alpha");
+    expected_rollout["model"] = json!("m-fast");
+    assert_eq!(first["payload"]["model_selection"], expected_rollout);
+    assert_eq!(selection["omitted"], expected["omitted"]);
     assert_eq!(selection["skipped"], true);
-    assert!(selection.get("omitted").is_none());
     for key in [
         "judge_model",
         "confidence",
