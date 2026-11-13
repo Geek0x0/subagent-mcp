@@ -1015,6 +1015,68 @@ async fn honors_retry_after_header() {
 }
 
 #[tokio::test]
+async fn base_url_path_prefix_is_kept_on_the_wire() {
+    // Go's `WithBaseURL` appends `/` to a non-empty path before resolving the
+    // request path, so `https://gw/anthropic` + `v1/messages` keeps the prefix.
+    for (suffix, expected) in [
+        ("/anthropic", "/anthropic/v1/messages"),
+        ("/anthropic/", "/anthropic/v1/messages"),
+    ] {
+        let mock = Mock::start(vec![ScriptMessage::text("prefixed").scripted()]).await;
+        let mut cfg = mock.config(1000);
+        cfg.base_url = format!("{}{suffix}", mock.base);
+        let provider = Messages::new("anthropic", &cfg).unwrap();
+
+        let (result, _) = run_turn(&provider, request("claude-x", user_only())).await;
+        assert_eq!(
+            result.expect("prefixed base URL turn").text,
+            "prefixed",
+            "{suffix}"
+        );
+        assert_eq!(mock.request(0).path, expected, "{suffix}");
+    }
+}
+
+#[tokio::test]
+async fn invalid_retry_after_headers_fall_back_to_the_exponential_default() {
+    for (name, value) in [
+        ("Retry-After-Ms", "-1"),
+        ("Retry-After-Ms", "NaN"),
+        ("Retry-After", "inf"),
+        ("Retry-After", "1e300"),
+    ] {
+        let mock = Mock::start(vec![
+            ScriptMessage::http_error(429)
+                .scripted()
+                .with_headers(&[(name, value)]),
+            ScriptMessage::text("after fallback").scripted(),
+        ])
+        .await;
+
+        let recorded: RecordedDelays = Arc::new(Mutex::new(Vec::new()));
+        let recorder = Arc::clone(&recorded);
+        let mut provider = Messages::new("anthropic", &mock.config(1000)).unwrap();
+        provider.set_retry_delay(Arc::new(move |attempt, retry_after| {
+            recorder.lock().unwrap().push((attempt, retry_after));
+            Duration::ZERO
+        }));
+
+        let (result, _) = run_turn(&provider, request("claude-x", user_only())).await;
+        assert_eq!(
+            result.expect("invalid Retry-After must not panic").text,
+            "after fallback",
+            "{name}: {value}"
+        );
+        assert_eq!(mock.request_count(), 2, "{name}: {value}");
+        assert_eq!(
+            *recorded.lock().unwrap(),
+            vec![(0, None)],
+            "{name}: {value} must fall back to the exponential default"
+        );
+    }
+}
+
+#[tokio::test]
 async fn retry_does_not_read_a_stalled_error_body() {
     // A retryable error whose body never finishes. Go closes the body unread
     // before retrying; reading it here would block the turn on the stalled

@@ -1,5 +1,6 @@
 //! Go ProxyFromEnvironment routing: loopback is always direct, NO_PROXY applies
-//! before HTTP_PROXY/HTTPS_PROXY, and ALL_PROXY is deliberately ignored.
+//! before HTTP_PROXY/HTTPS_PROXY, and ALL_PROXY is deliberately ignored. Proxy
+//! URLs may use `http`, `https`, `socks4`, `socks4a`, `socks5`, or `socks5h`.
 
 use std::net::IpAddr;
 
@@ -40,7 +41,11 @@ fn proxy_url(value: &str) -> Option<Url> {
     } else {
         Url::parse(&format!("http://{value}")).ok()?
     };
-    (matches!(parsed.scheme(), "http" | "https") && parsed.host_str().is_some()).then_some(parsed)
+    (matches!(
+        parsed.scheme(),
+        "http" | "https" | "socks4" | "socks4a" | "socks5" | "socks5h"
+    ) && parsed.host_str().is_some())
+    .then_some(parsed)
 }
 
 impl Selector {
@@ -270,6 +275,45 @@ mod tests {
                 "{entry} -> {target}"
             );
         }
+    }
+
+    #[test]
+    fn socks_proxy_urls_are_selected_and_loopback_still_bypasses() {
+        // Go's http.DefaultTransport accepts SOCKS proxies; reqwest needs the
+        // `socks` feature to parse these schemes. Selection is pure here; the
+        // handshake is reqwest's own SOCKS implementation.
+        assert_eq!(
+            routed("", "https://example.com/").as_deref(),
+            Some("http://https-proxy:8081/")
+        );
+        for scheme in ["socks4", "socks4a", "socks5", "socks5h"] {
+            let proxy = format!("{scheme}://127.0.0.1:1080");
+            let selector = Selector::new("", &proxy, "");
+            assert_eq!(
+                selector
+                    .select(&Url::parse("https://example.com/").unwrap())
+                    .map(|url| url.to_string()),
+                Some(format!("{scheme}://127.0.0.1:1080")),
+                "{scheme}"
+            );
+        }
+        let selector = Selector::new("", "socks5://127.0.0.1:1080", "");
+        for target in [
+            "https://localhost/",
+            "https://127.0.0.1/",
+            "https://127.42.3.4:8443/",
+            "https://[::1]/",
+            "https://[::ffff:127.0.0.2]/",
+        ] {
+            assert_eq!(
+                selector.select(&Url::parse(target).unwrap()),
+                None,
+                "{target}"
+            );
+        }
+
+        // With the `socks` feature compiled in, reqwest accepts the same URL.
+        assert!(reqwest::Proxy::all("socks5://127.0.0.1:1080").is_ok());
     }
 
     #[test]

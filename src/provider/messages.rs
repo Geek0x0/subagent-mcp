@@ -118,22 +118,11 @@ impl Messages {
         self.retry_delay = delay;
     }
 
-    /// Resolve an API path the way the Go SDK does: relative to the configured
-    /// base URL, so a base URL without a trailing slash replaces its last path
-    /// segment exactly as Go's `url.URL.Parse` would.
+    /// Resolve an API path the way the Go SDK does: `WithBaseURL` appends `/`
+    /// to a non-empty base path before `url.URL.Parse` resolves the relative
+    /// request path, so a path prefix on the base URL is preserved.
     fn endpoint(&self, path: &str) -> Result<Url, ProviderError> {
-        let base = Url::parse(&self.cfg.base_url).map_err(|error| ProviderError {
-            message: format!(
-                "messages: invalid base URL {:?}: {error}",
-                self.cfg.base_url
-            ),
-        })?;
-        base.join(path).map_err(|error| ProviderError {
-            message: format!(
-                "messages: invalid base URL {:?}: {error}",
-                self.cfg.base_url
-            ),
-        })
+        resolve_endpoint(&self.cfg.base_url, path)
     }
 
     /// Protocol headers the SDK sets on every request. No environment-derived
@@ -1305,6 +1294,39 @@ fn should_retry(status: u16, headers: &HeaderMap) -> bool {
     status == 408 || status == 409 || status == 429 || status >= 500
 }
 
+/// Resolve an API path relative to the configured base URL.
+///
+/// Go's `WithBaseURL` appends `/` to a non-empty path without a trailing slash
+/// before `url.URL.Parse` resolves the request path, so
+/// `https://gw.example/anthropic` + `v1/messages` stays under `/anthropic`.
+fn resolve_endpoint(base_url: &str, path: &str) -> Result<Url, ProviderError> {
+    let mut base = Url::parse(base_url).map_err(|error| ProviderError {
+        message: format!("messages: invalid base URL {base_url:?}: {error}"),
+    })?;
+    let base_path = base.path();
+    if !base_path.is_empty() && !base_path.ends_with('/') {
+        let mut with_slash = String::with_capacity(base_path.len() + 1);
+        with_slash.push_str(base_path);
+        with_slash.push('/');
+        // Leaves any query and fragment on the base untouched; the relative
+        // join below then drops them, exactly like Go's `URL.Parse`.
+        base.set_path(&with_slash);
+    }
+    base.join(path).map_err(|error| ProviderError {
+        message: format!("messages: invalid base URL {base_url:?}: {error}"),
+    })
+}
+
+/// Convert untrusted `Retry-After` seconds into a `Duration` without the
+/// panics `Duration::from_secs_f64` has for negatives, `NaN`, infinities and
+/// overflow. Invalid values fall back to the exponential default.
+fn retry_after_duration(seconds: f64) -> Option<Duration> {
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(seconds).ok()
+}
+
 /// Go SDK `parseRetryAfterHeader`: `Retry-After-Ms` first, then `Retry-After`
 /// (fractional seconds or an RFC 1123 HTTP date).
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
@@ -1317,11 +1339,11 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     if let Some(value) = value("retry-after-ms")
         && let Ok(milliseconds) = value.parse::<f64>()
     {
-        return Some(Duration::from_secs_f64(milliseconds / 1000.0).max(Duration::ZERO));
+        return retry_after_duration(milliseconds / 1000.0);
     }
     let value = value("retry-after")?;
     if let Ok(seconds) = value.parse::<f64>() {
-        return Some(Duration::from_secs_f64(seconds.max(0.0)));
+        return retry_after_duration(seconds);
     }
     let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
     let remaining = when.with_timezone(&chrono::Utc) - chrono::Utc::now();
@@ -1463,13 +1485,73 @@ mod tests {
             "future HTTP date parsed as {parsed:?}"
         );
 
-        // Negative numeric values clamp to zero; absent headers fall through.
-        assert_eq!(
-            parse_retry_after(&headers(&[("retry-after", "-2")])),
-            Some(Duration::ZERO)
-        );
+        // Absent headers fall through.
         assert_eq!(parse_retry_after(&HeaderMap::new()), None);
         assert_eq!(parse_retry_after(&headers(&[("retry-after", "")])), None);
+    }
+
+    #[test]
+    fn endpoint_preserves_the_base_path_prefix_like_the_go_sdk() {
+        for (base, expected) in [
+            (
+                "https://gw.example/anthropic",
+                "https://gw.example/anthropic/v1/messages",
+            ),
+            (
+                "https://gw.example/anthropic/",
+                "https://gw.example/anthropic/v1/messages",
+            ),
+            (
+                "https://gw.example/anthropic/v1",
+                "https://gw.example/anthropic/v1/v1/messages",
+            ),
+            ("https://gw.example", "https://gw.example/v1/messages"),
+            ("https://gw.example/", "https://gw.example/v1/messages"),
+            (
+                "https://gw.example/anthropic?x=1",
+                "https://gw.example/anthropic/v1/messages",
+            ),
+            (
+                "https://gw.example/anthropic#frag",
+                "https://gw.example/anthropic/v1/messages",
+            ),
+        ] {
+            assert_eq!(
+                resolve_endpoint(base, MESSAGES_PATH).unwrap().as_str(),
+                expected,
+                "{base}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_retry_after_values_fall_back_without_panicking() {
+        for (name, value) in [
+            ("retry-after-ms", "-1"),
+            ("retry-after-ms", "NaN"),
+            ("retry-after-ms", "inf"),
+            ("retry-after-ms", "1e300"),
+            ("retry-after", "-1"),
+            ("retry-after", "NaN"),
+            ("retry-after", "inf"),
+            ("retry-after", "1e300"),
+        ] {
+            assert_eq!(
+                parse_retry_after(&headers(&[(name, value)])),
+                None,
+                "{name}: {value}"
+            );
+        }
+
+        // Ordinary values still parse.
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after-ms", "250")])),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", "2")])),
+            Some(Duration::from_secs(2))
+        );
     }
 
     #[test]
