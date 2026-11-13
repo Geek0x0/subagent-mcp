@@ -304,6 +304,15 @@ fn check_target(
     label: &str,
     allow_existing: bool,
 ) -> Result<(), PatchError> {
+    // A missing target under an existing non-directory parent cannot be
+    // created. Unix `lstat` reports ENOTDIR here; Windows can report NotFound,
+    // so check the parent explicitly to keep the plan platform-independent.
+    if let Some(parent) = path.parent()
+        && let Ok(info) = fs.stat(parent)
+        && !info.is_dir()
+    {
+        return Err(err(format!("{}: parent is not a directory", label)));
+    }
     match fs.lstat(path) {
         Ok(_) if !allow_existing => Err(err(format!("{}: file already exists", label))),
         Ok(info) if info.is_dir() => Err(err(format!("{}: is a directory", label))),
