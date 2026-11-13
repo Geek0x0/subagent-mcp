@@ -9,10 +9,10 @@
 //! The `reqwest` client is built with the Task 1 dependency configuration
 //! (`default-features = false`, `rustls-tls-manual-roots`, rustls `ring`) and
 //! [`crate::provider::tls::client_config`]. HTTP/2 is negotiated via the ALPN
-//! protocols set on that TLS config, and proxy-from-environment is reqwest's
-//! default (`auto_sys_proxy` reads `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY`/
-//! `NO_PROXY`, matching Go's `http.ProxyFromEnvironment`). Neither is disabled
-//! here, and no `Client::timeout` is set: only [`execute_with_header_timeout`]
+//! protocols set on that TLS config. The shared proxy selector matches Go's
+//! loopback bypass and HTTP_PROXY/HTTPS_PROXY/NO_PROXY routing; ALL_PROXY is
+//! ignored and reqwest's automatic proxy routing is disabled. No
+//! `Client::timeout` is set: only [`execute_with_header_timeout`]
 //! bounds the wait for response headers, so long SSE bodies are never cut off.
 //!
 //! [`shared_client`] is the **internal pool only**. It returns a bare
@@ -90,8 +90,7 @@ fn build_client() -> Result<reqwest::Client, ProviderError> {
     let tls = crate::provider::tls::client_config().map_err(|e| ProviderError {
         message: format!("provider transport: {e}"),
     })?;
-    reqwest::Client::builder()
-        .use_preconfigured_tls(tls)
+    super::proxy::configure(reqwest::Client::builder().use_preconfigured_tls(tls))
         // Match Go's http.DefaultTransport dial (30 s) and idle (90 s) bounds.
         .connect_timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(90))

@@ -21,6 +21,8 @@
 //! `ctx.cancel`/`ctx.deadline`, and an already-finished context short-circuits
 //! to `cancelled: not executed`. Nothing relies on the runner's before/after
 //! checks to bound an in-flight tool.
+//! File writes and whole patch plan/commit transactions run on blocking tasks
+//! with owned directory handles, leaving runtime timers and signals live.
 //!
 //! Shell sandboxing: an unapproved call in a confining sandbox uses
 //! [`crate::sandbox::BoundSandbox`] to hand the session's HELD directory
@@ -379,10 +381,8 @@ fn plan_and_commit(
 /// Write `content` to `target` through `fs`: create parent directories then
 /// write with mode 0644, mirroring `tools::WriteFile` / `Beneath.WriteFile`.
 ///
-/// This is deliberately **synchronous** (no `.await`): `tools::write_file`'s
-/// future captures a `&dyn FS`, which is not `Send`, and the `ToolExecutor`
-/// trait requires a `Send` future. Calling `&dyn FS` methods directly keeps the
-/// executor's future `Send` while matching the tool's behavior exactly.
+/// Called inside a blocking task. The borrowed FS never crosses an await;
+/// the task owns the bound directory handle for the entire filesystem operation.
 fn write_target(fs: &dyn FS, target: &Path, content: &str) -> Result<usize, ToolError> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     fs.mkdir_all(parent, 0o755)
@@ -739,16 +739,10 @@ impl BuiltinToolExecutor {
             }
             "write_file" => {
                 let confined = sandbox == Sandbox::WorkspaceWrite && !approved;
-                let written: Result<usize, ToolError> = if confined {
+                let target: Result<PathBuf, ToolError> = if confined {
                     let bc = bound_cwd.as_deref().unwrap();
-                    match confined_path(&cwd, &args.path, bc) {
-                        Ok(target) => {
-                            let os = OS;
-                            let fs: &dyn FS = bc.fs().unwrap_or(&os);
-                            write_target(fs, &target, &args.content)
-                        }
-                        Err(pe) => Err(ToolError::internal(pe.message)),
-                    }
+                    confined_path(&cwd, &args.path, bc)
+                        .map_err(|pe| ToolError::internal(pe.message))
                 } else {
                     // Go `tools.WriteFile(cwd, path, content)`: absolute paths
                     // verbatim, relative paths joined to cwd and cleaned.
@@ -757,7 +751,27 @@ impl BuiltinToolExecutor {
                     } else {
                         lexical_clean(&cwd.join(&args.path))
                     };
-                    write_target(&OS, &resolved, &args.content)
+                    Ok(resolved)
+                };
+                let written = match target {
+                    Ok(target) => {
+                        let bound_cwd = bound_cwd.clone();
+                        let content = args.content;
+                        tokio::task::spawn_blocking(move || {
+                            let os = OS;
+                            let fs: &dyn FS = if confined {
+                                bound_cwd.as_deref().unwrap().fs().unwrap_or(&os)
+                            } else {
+                                &os
+                            };
+                            write_target(fs, &target, &content)
+                        })
+                        .await
+                        .unwrap_or_else(|e| {
+                            Err(ToolError::internal(format!("write_file task failed: {e}")))
+                        })
+                    }
+                    Err(error) => Err(error),
                 };
                 match written {
                     Ok(n) => ToolResult {
@@ -775,8 +789,22 @@ impl BuiltinToolExecutor {
             }
             "apply_patch" => {
                 let patch = parsed_patch.unwrap();
+                let hunks = patch.hunks;
                 let confined = sandbox == Sandbox::WorkspaceWrite && !approved;
-                match plan_and_commit(&cwd, &patch.hunks, confined, bound_cwd.as_deref()) {
+                let patch_cwd = cwd.clone();
+                let patch_bound = bound_cwd.clone();
+                // Own the complete plan + commit, including rollback. Dropping
+                // the awaiting future must not interrupt a transaction midway.
+                let applied = tokio::task::spawn_blocking(move || {
+                    plan_and_commit(&patch_cwd, &hunks, confined, patch_bound.as_deref())
+                })
+                .await
+                .unwrap_or_else(|e| {
+                    Err(ApplyFailure::Execute(format!(
+                        "apply_patch task failed: {e}"
+                    )))
+                });
+                match applied {
                     // Go: a BoundPath mapping failure returns WITHOUT recording.
                     Err(ApplyFailure::Mapping(m)) => {
                         end.tool_err = Some(m.clone());

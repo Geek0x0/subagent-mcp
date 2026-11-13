@@ -19,6 +19,7 @@ pub mod chat_completions;
 pub mod codex;
 pub mod factory;
 pub mod messages;
+pub(crate) mod proxy;
 pub mod responses;
 pub mod sse;
 pub mod tls;

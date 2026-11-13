@@ -401,6 +401,106 @@ fn sandbox_test_dir() -> Option<tempfile::TempDir> {
 // Step 1 tests
 // ===========================================================================
 
+#[cfg(unix)]
+async fn fifo_keeps_runtime_live(tool: &str) {
+    use std::io::{Read, Write};
+    use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+    let cwd = tempfile::tempdir().unwrap();
+    let path = cwd.path().join("pipe");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    let writing = tool == "write_file";
+    let peer = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        // RDWR/nonblocking keeps cleanup bounded even if the tool fails before
+        // opening the FIFO; no peer thread can hang on open or read.
+        let mut pipe = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+            .unwrap();
+        if writing {
+            let start = std::time::Instant::now();
+            let mut data = Vec::new();
+            while data.len() < 5 {
+                let mut buf = [0; 5];
+                match pipe.read(&mut buf) {
+                    Ok(n) => data.extend_from_slice(&buf[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(e) => panic!("FIFO read: {e}"),
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "FIFO writer never completed"
+                );
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(data, b"hello");
+        } else {
+            pipe.write_all(b"old\n").unwrap();
+        }
+    });
+    let events = Events::new();
+    let h = hooks(recording_emitter(&events), approver(false).0);
+    let arguments = if writing {
+        json!({"path":"pipe", "content":"hello"})
+    } else {
+        // A valid Update shape reads the FIFO, then fails context matching.
+        // This avoids trying to commit/roll back a non-regular FIFO target.
+        json!({"patch":"*** Begin Patch\n*** Update File: pipe\n@@\n-missing\n+new\n*** End Patch"})
+    };
+    let operation = async {
+        let result = exec(
+            options(
+                provider(vec![]),
+                cwd.path(),
+                Sandbox::WorkspaceWrite,
+                ApprovalPolicy::Never,
+            ),
+            live_ctx(),
+            tool_call("fifo", tool, arguments),
+            &h,
+        )
+        .await;
+        (result, Instant::now())
+    };
+    let heartbeat = async {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        Instant::now()
+    };
+    let ((result, finished), beat) = tokio::join!(biased; operation, heartbeat);
+    peer.join().unwrap();
+    assert!(beat < finished, "{tool} blocked the current-thread runtime");
+    if writing {
+        assert!(!result.is_error, "{}", result.output);
+        assert_eq!(result.output, "wrote 5 bytes to pipe");
+    } else {
+        assert!(result.is_error, "{}", result.output);
+        assert!(
+            result.output.starts_with("error: update ")
+                && result
+                    .output
+                    .ends_with(": could not find chunk starting with \"missing\""),
+            "{}",
+            result.output
+        );
+    }
+    assert_eq!(events.types(), ["exec_command_begin", "exec_command_end"]);
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn fifo_write_keeps_runtime_heartbeat_live() {
+    fifo_keeps_runtime_live("write_file").await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "current_thread")]
+async fn fifo_patch_read_keeps_runtime_heartbeat_live() {
+    fifo_keeps_runtime_live("apply_patch").await;
+}
+
 /// Port of Go `TestBuiltinTools`: exact names, descriptions and JSON schemas.
 #[test]
 fn builtin_tools_exact_schemas() {
@@ -1194,6 +1294,66 @@ async fn patch_end_rollout_and_transaction_failure() {
             .starts_with("error:")
     );
     assert_eq!(fail["payload"]["changes"].as_object().unwrap().len(), 0);
+
+    #[cfg(unix)]
+    {
+        // Policy sees an in-root file. Swapping after authorization forces the
+        // blocking task's mapping step to reject it without patch_apply_end.
+        struct SwapOnBegin {
+            path: PathBuf,
+            outside: PathBuf,
+        }
+        impl Emitter for SwapOnBegin {
+            fn emit(&self, _: &str, event: Value) {
+                if event["type"] == "exec_command_begin" {
+                    fs::remove_file(&self.path).unwrap();
+                    std::os::unix::fs::symlink(&self.outside, &self.path).unwrap();
+                }
+            }
+        }
+        let mapped_cwd = tempfile::tempdir().unwrap();
+        let target = mapped_cwd.path().join("target");
+        let outside = home.path().join("outside");
+        fs::write(&target, "old\n").unwrap();
+        fs::write(&outside, "safe\n").unwrap();
+        let mut l = lease(options(
+            provider(vec![]),
+            mapped_cwd.path(),
+            Sandbox::WorkspaceWrite,
+            ApprovalPolicy::Never,
+        ))
+        .await;
+        l.rollout = Some(
+            RolloutRecorder::create("mapping", mapped_cwd.path(), "", "stub", "m", "high").unwrap(),
+        );
+        let h = hooks(
+            Arc::new(SwapOnBegin {
+                path: target,
+                outside: outside.clone(),
+            }),
+            approver(false).0,
+        );
+        let result = exec_on(&mut l, live_ctx(), tool_call("c-mapping", "apply_patch", json!({"patch":"*** Begin Patch\n*** Update File: target\n@@\n-old\n+new\n*** End Patch"})), &h).await;
+        assert!(result.is_error);
+        assert!(
+            result.output.contains("resolves outside working directory"),
+            "{}",
+            result.output
+        );
+        assert_eq!(fs::read(outside).unwrap(), b"safe\n");
+        drop(l);
+        let mut files = Vec::new();
+        collect_jsonl(home.path(), &mut files);
+        for file in files {
+            for line in fs::read_to_string(file).unwrap().lines() {
+                let line: Value = serde_json::from_str(line).unwrap();
+                assert!(
+                    !(line["payload"]["type"] == "patch_apply_end"
+                        && line["payload"]["call_id"] == "c-mapping")
+                );
+            }
+        }
+    }
 }
 
 /// Panic AFTER an `.await` becomes `internal error: tool execution panicked`.

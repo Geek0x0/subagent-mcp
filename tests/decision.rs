@@ -20,6 +20,47 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
+#[path = "support/proxy_isolation.rs"]
+mod proxy_isolation;
+
+#[test]
+fn decision_proxy_bypasses_loopback() {
+    if let Some(requests) = proxy_isolation::run("decision_proxy_bypasses_loopback", "HTTP_PROXY") {
+        assert!(
+            requests.is_empty(),
+            "decision leaked to proxy: {requests:?}"
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let (base, _, rx) = spawn_mock(Reply::Response {
+                status: 200,
+                body: r#"{"answers":{"model":{"type":"choice","choice":"c1","confidence":0.5}}}"#
+                    .into(),
+            })
+            .await;
+            let client = make_client(&auto_config(&base));
+            let result = client
+                .choose(
+                    &plain_ctx(),
+                    "private task",
+                    Path::new("/repo"),
+                    &candidates(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(result.provider, "alpha");
+            assert_eq!(
+                recorded(rx).await.header("authorization"),
+                Some("Bearer test-key")
+            );
+        });
+}
+
 // ---------------------------------------------------------------------------
 // Local HTTP mock
 // ---------------------------------------------------------------------------

@@ -29,9 +29,84 @@ use subagent_mcp::util::run::RunContext;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+#[path = "support/proxy_isolation.rs"]
+mod proxy_isolation;
+
+#[test]
+fn proxy_bypasses_loopback_and_routes_non_loopback() {
+    if let Some(requests) = proxy_isolation::run(
+        "proxy_bypasses_loopback_and_routes_non_loopback",
+        "HTTP_PROXY",
+    ) {
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(
+            requests[0].starts_with("GET http://192.0.2.1:1234/models HTTP/1.1\r\n"),
+            "{requests:?}"
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let base = spawn_mock(Reply::Respond {
+                raw: http_response("text/plain", b"direct", false),
+                tail: None,
+            })
+            .await;
+            let client = transport::shared_client(TransportKind::ChatCompletions, &base).unwrap();
+            let response = client
+                .get(format!("{base}/models"))
+                .bearer_auth("local-secret")
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), "direct");
+            let response = client
+                .get("http://192.0.2.1:1234/models")
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), "proxied");
+        });
+}
+
 // ---------------------------------------------------------------------------
 // Local HTTP mock (stand-in for Go's httptest.Server)
 // ---------------------------------------------------------------------------
+
+#[test]
+fn all_proxy_is_ignored() {
+    if let Some(requests) = proxy_isolation::run("all_proxy_is_ignored", "ALL_PROXY") {
+        assert!(
+            requests.is_empty(),
+            "ALL_PROXY must not receive requests: {requests:?}"
+        );
+        return;
+    }
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            let base = spawn_mock(Reply::Respond {
+                raw: http_response("text/plain", b"direct", false),
+                tail: None,
+            })
+            .await;
+            let client = transport::shared_client(TransportKind::Responses, &base).unwrap();
+            let response = client
+                .get(format!("{base}/models"))
+                .timeout(Duration::from_secs(2))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.text().await.unwrap(), "direct");
+        });
+}
 
 enum Reply {
     /// Accept, read the request, then never send response headers.

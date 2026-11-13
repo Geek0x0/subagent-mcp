@@ -265,7 +265,8 @@ fn build_http_client_with_tls(
     cfg: &AutoConfig,
     tls: rustls::ClientConfig,
 ) -> Result<reqwest::Client, DecisionError> {
-    let mut builder = reqwest::Client::builder().use_preconfigured_tls(tls);
+    let mut builder =
+        crate::provider::proxy::configure(reqwest::Client::builder().use_preconfigured_tls(tls));
     if cfg.timeout_seconds > 0 {
         builder = builder.timeout(Duration::from_secs(cfg.timeout_seconds));
     }
