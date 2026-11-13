@@ -298,6 +298,15 @@ impl Server {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        #[cfg(windows)]
+        {
+            command.env("USERPROFILE", home);
+            for name in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        }
         for (name, value) in envs {
             command.env(name, value);
         }
@@ -615,6 +624,15 @@ fn eof_with_stdin_closed_exits_zero() {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
+    #[cfg(windows)]
+    {
+        command.env("USERPROFILE", home.path());
+        for name in ["SystemRoot", "WINDIR", "TEMP", "TMP"] {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+    }
     let mut child = command.spawn().expect("spawn subagent-mcp");
     let start = Instant::now();
     let status = loop {
