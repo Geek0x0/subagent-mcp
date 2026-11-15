@@ -22,6 +22,9 @@ pub fn run(test: &str, proxy_var: &str) -> Option<Vec<String>> {
         while !stopped.load(Ordering::SeqCst) && Instant::now() < deadline {
             match listener.accept() {
                 Ok((mut socket, _)) => {
+                    // BSD/macOS accepted sockets inherit the listener's O_NONBLOCK
+                    // (Linux does not), which would bypass the read timeout below.
+                    socket.set_nonblocking(false).unwrap();
                     socket
                         .set_read_timeout(Some(Duration::from_secs(1)))
                         .unwrap();
