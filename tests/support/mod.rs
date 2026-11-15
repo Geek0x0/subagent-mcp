@@ -589,7 +589,7 @@ pub fn user_only() -> Vec<subagent_mcp::provider::Message> {
 pub fn request(model: &str, messages: Vec<subagent_mcp::provider::Message>) -> TurnRequest {
     TurnRequest {
         model: model.to_string(),
-        messages,
+        messages: std::sync::Arc::new(messages),
         ..TurnRequest::default()
     }
 }

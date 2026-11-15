@@ -48,7 +48,9 @@ pub struct TurnRequest {
     pub model: String,
     pub effort: Option<String>,
     pub system: String,
-    pub messages: Vec<Message>,
+    /// Shared with the session so a turn borrows the history instead of
+    /// copying it; mutation goes through `Arc::make_mut`.
+    pub messages: std::sync::Arc<Vec<Message>>,
     pub tools: Vec<ToolSpec>,
 }
 

@@ -28,6 +28,7 @@ use subagent_mcp::provider::{
 use subagent_mcp::util::run::RunContext;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+use tokio_util::sync::CancellationToken;
 
 #[path = "support/proxy_isolation.rs"]
 mod proxy_isolation;
@@ -151,6 +152,32 @@ async fn spawn_mock(reply: Reply) -> String {
     base
 }
 
+#[tokio::test]
+async fn shared_client_does_not_follow_redirects() {
+    // A redirect could carry `x-api-key` and the request body to another host,
+    // which reqwest would not strip the way it strips Authorization.
+    let target = spawn_mock(Reply::Respond {
+        raw: b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok".to_vec(),
+        tail: None,
+    })
+    .await;
+    let redirect =
+        format!("HTTP/1.1 302 Found\r\nLocation: {target}/steal\r\nContent-Length: 0\r\n\r\n");
+    let base = spawn_mock(Reply::Respond {
+        raw: redirect.into_bytes(),
+        tail: Some(Duration::from_millis(50)),
+    })
+    .await;
+    let client = transport::shared_client(TransportKind::ChatCompletions, &base).unwrap();
+    let response = client
+        .get(format!("{base}/v1/chat/completions"))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::FOUND);
+}
+
 /// A mock that captures the full request body (Content-Length aware) so a test
 /// can assert what the transport actually put on the wire.
 async fn spawn_recording_mock() -> (String, tokio::sync::oneshot::Receiver<Vec<u8>>) {
@@ -259,10 +286,7 @@ fn factory_registers_and_rejects_unsupported_api() {
     factory::register(
         Api::ChatCompletions.as_str(),
         Arc::new(
-            |name: &str,
-             _cfg: &ProviderConfig,
-             _key: &str|
-             -> Result<Arc<dyn Provider>, ProviderError> {
+            |name: &str, _cfg: &ProviderConfig| -> Result<Arc<dyn Provider>, ProviderError> {
                 Ok(Arc::new(NopProvider {
                     name: name.to_string(),
                 }))
@@ -271,11 +295,11 @@ fn factory_registers_and_rejects_unsupported_api() {
     );
 
     // A registered api is found and its constructor is invoked.
-    let provider = factory::new("mine", &provider_config(Api::ChatCompletions), "k").unwrap();
+    let provider = factory::new("mine", &provider_config(Api::ChatCompletions)).unwrap();
     assert_eq!(provider.name(), "mine");
 
     // An unregistered api produces the exact subagent-mcp-authored error.
-    let err = factory::new("x", &provider_config(Api::Messages), "k")
+    let err = factory::new("x", &provider_config(Api::Messages))
         .err()
         .expect("an unregistered api must fail");
     assert_eq!(
@@ -384,7 +408,7 @@ async fn extra_body_is_applied_automatically_by_pooled_client() {
     let client_a = PooledClient::from_config(TransportKind::ChatCompletions, &cfg).unwrap();
     let url_a = Url::parse(&format!("{base_a}/chat/completions")).unwrap();
     let resp_a = client_a
-        .execute_json(url_a, HeaderMap::new(), original)
+        .execute_json(url_a, HeaderMap::new(), bytes::Bytes::from_static(original))
         .await
         .unwrap();
     resp_a.close().await;
@@ -653,6 +677,53 @@ async fn pooled_client_executes_and_reads_the_body() {
     }
     assert_eq!(out, b"data: hello\n\n");
     resp.close().await;
+}
+
+#[tokio::test]
+async fn drain_error_body_stops_at_the_byte_limit() {
+    // An error body larger than the cap is read only up to the cap, so a
+    // misbehaving server cannot make error classification buffer megabytes.
+    let body = vec![b'x'; transport::ERROR_BODY_LIMIT + 4096];
+    let raw = http_response("application/json", &body, false);
+    let base = spawn_mock(Reply::Respond { raw, tail: None }).await;
+    let client = PooledClient::new(TransportKind::Responses, &base).unwrap();
+    let resp = client
+        .execute(request_for(&base, "/responses"))
+        .await
+        .unwrap();
+    let text = transport::drain_error_body(None, resp).await.unwrap();
+    assert_eq!(text.len(), transport::ERROR_BODY_LIMIT);
+}
+
+#[tokio::test]
+async fn drain_error_body_stops_at_the_run_deadline() {
+    // The body never finishes; the run deadline must end the drain instead of
+    // waiting for the server to close the connection.
+    let body = b"{\"error\":\"slow\"}";
+    let raw = format!(
+        "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        body.len() + 1_000_000,
+        String::from_utf8_lossy(body)
+    )
+    .into_bytes();
+    let base = spawn_mock(Reply::Respond {
+        raw,
+        tail: Some(Duration::from_secs(30)),
+    })
+    .await;
+    let client = PooledClient::new(TransportKind::Responses, &base).unwrap();
+    let resp = client
+        .execute(request_for(&base, "/responses"))
+        .await
+        .unwrap();
+    let ctx = RunContext {
+        cancel: CancellationToken::new(),
+        deadline: Some(tokio::time::Instant::now() - Duration::from_secs(1)),
+    };
+    let reason = transport::drain_error_body(Some(&ctx), resp)
+        .await
+        .expect_err("an elapsed deadline must end the drain");
+    assert_eq!(reason, "context deadline exceeded");
 }
 
 #[tokio::test]

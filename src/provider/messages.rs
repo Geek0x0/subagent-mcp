@@ -23,7 +23,9 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::ProviderConfig;
 use crate::provider::sse::SSE_MAX_LINE;
-use crate::provider::transport::{PooledClient, PooledResponse};
+use crate::provider::transport::{
+    MAX_SERVER_RETRY_DELAY, PooledClient, PooledResponse, drain_error_body, parse_retry_after,
+};
 use crate::provider::{
     DeltaSink, Message, ModelInfo, ModelLister, Provider, ProviderError, Role, ToolCall, ToolSpec,
     TransportKind, TurnRequest, TurnResult, Usage,
@@ -46,12 +48,13 @@ pub type RetryDelay = Arc<dyn Fn(usize, Option<Duration>) -> Duration + Send + S
 
 static RETRY_SEED: AtomicU64 = AtomicU64::new(0);
 
-/// Go SDK `retryDelay`: the server's `Retry-After` when present, otherwise
-/// `0.5s * 2^attempt` capped at 8s with up to a quarter of it jittered away. A
+/// Go SDK `retryDelay`: the server's `Retry-After` when present (capped at
+/// [`MAX_SERVER_RETRY_DELAY`]), otherwise `0.5s * 2^attempt` capped at 8s with
+/// up to a quarter of it jittered away. A
 /// cheap time+seed mix stands in for `math/rand` (no `rand` dependency).
 pub fn default_retry_delay(attempt: usize, retry_after: Option<Duration>) -> Duration {
     if let Some(retry_after) = retry_after {
-        return retry_after;
+        return retry_after.min(MAX_SERVER_RETRY_DELAY);
     }
     let max_delay = Duration::from_secs(8);
     let base = Duration::from_millis(500).saturating_mul(1u32 << attempt.min(4) as u32);
@@ -87,22 +90,13 @@ impl Messages {
     /// Build a Messages adapter, resolving the API key from `cfg.key` or, when
     /// that is empty, the environment variable named by `cfg.env_key`.
     pub fn new(name: &str, cfg: &ProviderConfig) -> Result<Self, ProviderError> {
-        let api_key = match cfg.key.as_deref().filter(|key| !key.is_empty()) {
-            Some(key) => key.to_string(),
-            None => {
-                let env_key = cfg.env_key.clone().unwrap_or_default();
-                match std::env::var(&env_key) {
-                    Ok(value) if !value.is_empty() => value,
-                    _ => {
-                        return Err(ProviderError {
-                            message: format!(
-                                "environment variable {env_key} (providers.{name}.env_key) must be set to the API key"
-                            ),
-                        });
-                    }
-                }
-            }
-        };
+        let api_key = crate::config::api_key(cfg.key.as_deref(), cfg.env_key.as_deref())
+            .ok_or_else(|| ProviderError {
+                message: format!(
+                    "environment variable {} (providers.{name}.env_key) must be set to the API key",
+                    cfg.env_key.as_deref().unwrap_or("")
+                ),
+            })?;
         Ok(Self {
             name: name.to_string(),
             client: PooledClient::from_config(TransportKind::Messages, cfg)?,
@@ -149,7 +143,7 @@ impl Messages {
         ctx: &RunContext,
         url: &Url,
         headers: &HeaderMap,
-        body: &[u8],
+        body: &bytes::Bytes,
     ) -> Result<PooledResponse, ProviderError> {
         let mut attempt = 0usize;
         loop {
@@ -195,13 +189,13 @@ impl Messages {
         ctx: &RunContext,
         url: &Url,
         headers: &HeaderMap,
-        body: &[u8],
+        body: &bytes::Bytes,
         attempt: usize,
     ) -> SendOutcome {
         tokio::select! {
-            response = self.client.execute_json(url.clone(), headers.clone(), body) => {
+            response = self.client.execute_json(url.clone(), headers.clone(), body.clone()) => {
                 match response {
-                    Ok(response) => self.classify("POST", url, response, attempt).await,
+                    Ok(response) => self.classify(ctx, "POST", url, response, attempt).await,
                     Err(error) => SendOutcome::Failed(AttemptFailure::Connection(error.message)),
                 }
             }
@@ -226,7 +220,7 @@ impl Messages {
         tokio::select! {
             response = self.client.execute(request) => {
                 match response {
-                    Ok(response) => self.classify("GET", url, response, attempt).await,
+                    Ok(response) => self.classify(ctx, "GET", url, response, attempt).await,
                     Err(error) => SendOutcome::Failed(AttemptFailure::Connection(error.message)),
                 }
             }
@@ -245,9 +239,10 @@ impl Messages {
     /// failure that ends the turn reads its body for the error text.
     async fn classify(
         &self,
+        ctx: &RunContext,
         method: &str,
         url: &Url,
-        mut response: PooledResponse,
+        response: PooledResponse,
         attempt: usize,
     ) -> SendOutcome {
         let status = response
@@ -265,10 +260,12 @@ impl Messages {
                 retry_after: parse_retry_after(&headers),
             });
         }
-        let body = read_body(&mut response).await;
-        response.close().await;
+        // Bounded and ctx-aware: a stalled error body cannot hang the turn.
+        let body = drain_error_body(Some(ctx), response)
+            .await
+            .unwrap_or_default();
         SendOutcome::Failed(AttemptFailure::Failure(ProviderError {
-            message: api_error(method, url, status, &body),
+            message: api_error(method, url, status, body.as_bytes()),
         }))
     }
 
@@ -310,9 +307,11 @@ impl Messages {
         on_delta: &mut DeltaSink,
     ) -> Result<Accumulator, ProviderError> {
         let url = self.endpoint(MESSAGES_PATH)?;
-        let body = serde_json::to_vec(&params.to_json()).map_err(|error| ProviderError {
-            message: format!("messages: encode request: {error}"),
-        })?;
+        let body = bytes::Bytes::from(serde_json::to_vec(&params.to_json()).map_err(|error| {
+            ProviderError {
+                message: format!("messages: encode request: {error}"),
+            }
+        })?);
         let headers = self.headers()?;
 
         let mut response = self
@@ -1201,8 +1200,12 @@ async fn next_line(
     eof: &mut bool,
     ctx: &RunContext,
 ) -> Result<Option<Vec<u8>>, ProviderError> {
+    // Only the newly appended bytes are searched for a newline, so framing is
+    // linear in the stream size instead of quadratic in the buffer size.
+    let mut scan_from = 0usize;
     loop {
-        if let Some(position) = buffer.iter().position(|byte| *byte == b'\n') {
+        if let Some(offset) = buffer[scan_from..].iter().position(|byte| *byte == b'\n') {
+            let position = scan_from + offset;
             if position > SSE_MAX_LINE {
                 return Err(line_too_long());
             }
@@ -1228,6 +1231,7 @@ async fn next_line(
             }
             return Ok(Some(line));
         }
+        scan_from = buffer.len();
         tokio::select! {
             chunk = response.chunk() => match chunk? {
                 Some(bytes) => buffer.extend_from_slice(&bytes),
@@ -1315,47 +1319,6 @@ fn resolve_endpoint(base_url: &str, path: &str) -> Result<Url, ProviderError> {
     base.join(path).map_err(|error| ProviderError {
         message: format!("messages: invalid base URL {base_url:?}: {error}"),
     })
-}
-
-/// Convert an untrusted `Retry-After` delay, in nanoseconds, into a `Duration`
-/// without the panics `Duration::from_secs_f64` has for negatives, `NaN`,
-/// infinities and overflow. Go converts the float to a signed 64-bit
-/// nanosecond count and then clamps with `max(0, d)`: negatives, `NaN`,
-/// infinities, and values at or above `2^63` ns (which wrap negative in int64)
-/// all become an immediate retry.
-fn retry_after_duration(nanoseconds: f64) -> Duration {
-    if !nanoseconds.is_finite() || nanoseconds < 0.0 {
-        return Duration::ZERO;
-    }
-    if nanoseconds >= i64::MAX as f64 {
-        return Duration::ZERO;
-    }
-    Duration::from_nanos(nanoseconds as u64)
-}
-
-/// Go SDK `parseRetryAfterHeader`: `Retry-After-Ms` first, then `Retry-After`
-/// (fractional seconds or an RFC 1123 HTTP date). Invalid numeric values clamp
-/// to zero, matching Go's `max(0, retryAfterDelay)`.
-fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
-    let value = |name: &str| {
-        headers
-            .get(name)
-            .and_then(|value| value.to_str().ok())
-            .filter(|value| !value.is_empty())
-    };
-    if let Some(value) = value("retry-after-ms")
-        && let Ok(milliseconds) = value.parse::<f64>()
-    {
-        return Some(retry_after_duration(milliseconds * 1_000_000.0));
-    }
-    let value = value("retry-after")?;
-    if let Ok(seconds) = value.parse::<f64>() {
-        return Some(retry_after_duration(seconds * 1_000_000_000.0));
-    }
-    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
-    let remaining = when.with_timezone(&chrono::Utc) - chrono::Utc::now();
-    // A date in the past means "retry now", not "use the exponential default".
-    Some(remaining.to_std().unwrap_or(Duration::ZERO))
 }
 
 /// Why the caller stopped the run, if it did (Go `callerCtx.Err()`).
@@ -1482,14 +1445,21 @@ mod tests {
             Some(Duration::ZERO)
         );
 
-        // A future HTTP date is honored.
+        // A future HTTP date is honored, but clamped to the server cap.
         let future = (chrono::Utc::now() + chrono::Duration::seconds(120))
             .format("%a, %d %b %Y %H:%M:%S GMT")
             .to_string();
-        let parsed = parse_retry_after(&headers(&[("retry-after", &future)])).unwrap();
+        assert_eq!(
+            parse_retry_after(&headers(&[("retry-after", &future)])),
+            Some(MAX_SERVER_RETRY_DELAY)
+        );
+        let soon = (chrono::Utc::now() + chrono::Duration::seconds(5))
+            .format("%a, %d %b %Y %H:%M:%S GMT")
+            .to_string();
+        let parsed = parse_retry_after(&headers(&[("retry-after", &soon)])).unwrap();
         assert!(
-            parsed >= Duration::from_secs(100) && parsed <= Duration::from_secs(130),
-            "future HTTP date parsed as {parsed:?}"
+            parsed >= Duration::from_secs(1) && parsed <= Duration::from_secs(6),
+            "near-future HTTP date parsed as {parsed:?}"
         );
 
         // Absent headers fall through.
@@ -1532,24 +1502,33 @@ mod tests {
     }
 
     #[test]
-    fn invalid_retry_after_values_clamp_to_zero_without_panicking() {
-        // Go parses any float and `retryDelay` clamps with max(0, d): NaN/inf/
-        // overflow convert to a negative duration, so all become immediate.
+    fn invalid_retry_after_values_are_bounded_without_panicking() {
+        // Negative and NaN mean "retry now"; an absurd finite value, infinity,
+        // or an int64 overflow is capped instead of collapsing to an immediate
+        // retry (which would hammer the server).
         for (name, value) in [
             ("retry-after-ms", "-1"),
             ("retry-after-ms", "NaN"),
+            ("retry-after", "-1"),
+            ("retry-after", "NaN"),
+        ] {
+            assert_eq!(
+                parse_retry_after(&headers(&[(name, value)])),
+                Some(Duration::ZERO),
+                "{name}: {value}"
+            );
+        }
+        for (name, value) in [
             ("retry-after-ms", "inf"),
             ("retry-after-ms", "1e13"),
             ("retry-after-ms", "1e300"),
-            ("retry-after", "-1"),
-            ("retry-after", "NaN"),
             ("retry-after", "inf"),
             ("retry-after", "1e10"),
             ("retry-after", "1e300"),
         ] {
             assert_eq!(
                 parse_retry_after(&headers(&[(name, value)])),
-                Some(Duration::ZERO),
+                Some(MAX_SERVER_RETRY_DELAY),
                 "{name}: {value}"
             );
         }
@@ -1583,10 +1562,14 @@ mod tests {
             capped >= Duration::from_secs(6) && capped <= Duration::from_secs(8),
             "capped retry delay {capped:?}"
         );
-        // A server-provided delay is used verbatim.
+        // A server-provided delay is honored up to the cap.
         assert_eq!(
             default_retry_delay(0, Some(Duration::from_millis(7))),
             Duration::from_millis(7)
+        );
+        assert_eq!(
+            default_retry_delay(0, Some(Duration::from_secs(3600))),
+            MAX_SERVER_RETRY_DELAY
         );
     }
 }

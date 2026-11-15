@@ -584,11 +584,11 @@ pub fn context() -> RunContext {
 pub fn request(model: &str) -> TurnRequest {
     TurnRequest {
         model: model.to_string(),
-        messages: vec![Message {
+        messages: std::sync::Arc::new(vec![Message {
             role: Role::User,
             text: "hi".to_string(),
             ..Default::default()
-        }],
+        }]),
         ..Default::default()
     }
 }

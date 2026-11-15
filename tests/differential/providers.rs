@@ -113,11 +113,11 @@ fn first_turn_request() -> TurnRequest {
         model: "mock-model".to_string(),
         effort: Some("high".to_string()),
         system: DEFAULT_SYSTEM_PROMPT.to_string(),
-        messages: vec![Message {
+        messages: std::sync::Arc::new(vec![Message {
             role: Role::User,
             text: "hi".to_string(),
             ..Default::default()
-        }],
+        }]),
         tools: subagent_mcp::agent::builtin_tools(),
     }
 }
@@ -479,10 +479,10 @@ fn apply_patch_case() -> tempfile::TempDir {
 
     outer_block_on(async {
         let executor = real_executor();
-        let manager = SessionManager::new();
         let provider = build_adapter(Api::ChatCompletions, "http://127.0.0.1:1");
         let mut opts = session_options(provider, cwd.path());
         opts.sandbox = Sandbox::WorkspaceWrite;
+        let manager = SessionManager::new();
         let session = manager.create(opts).await.unwrap();
         let id = session.id.clone();
         let mut lease = manager.acquire(&id).await.unwrap();
@@ -575,15 +575,15 @@ fn differential_auto_selection_matches_jev_golden() {
             key: None,
             model: "jev-latest".to_string(),
             timeout_seconds: 5,
+            descriptions: std::collections::BTreeMap::new(),
         }),
+        limits: Default::default(),
     };
 
     let cwd = tempfile::tempdir().unwrap();
-    let manager = SessionManager::new();
     let selection = outer_block_on(subagent_mcp::mcp::auto::resolve_auto(
         &run_ctx(),
         &config,
-        &manager,
         "fix the parser",
         cwd.path(),
     ))

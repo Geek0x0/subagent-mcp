@@ -61,6 +61,14 @@ pub const A_TRUNCATE: u64 = 1 << 14;
 pub const A_IOCTL_DEV: u64 = 1 << 15;
 pub const A_RESOLVE_UNIX: u64 = 1 << 16;
 
+// Landlock scopes (`linux/landlock.h`, ABI >= 6). File-system rules cannot stop
+// a sandboxed command from asking an unsandboxed process over IPC (or a signal)
+// to write outside the roots, so restrict those two channels as well.
+pub const SCOPE_ABSTRACT_UNIX_SOCKET: u64 = 1 << 0;
+pub const SCOPE_SIGNAL: u64 = 1 << 1;
+/// Both scopes available on ABI >= 6.
+pub const SCOPES_ALL: u64 = SCOPE_ABSTRACT_UNIX_SOCKET | SCOPE_SIGNAL;
+
 // Go `accessFSRead`, `accessFSWrite`, `accessFile` (config.go).
 const FS_READ: u64 = A_EXECUTE | A_READ_FILE | A_READ_DIR;
 const FS_WRITE: u64 = A_WRITE_FILE
@@ -93,6 +101,8 @@ pub struct RulesetPlan {
     pub device: u64,
     /// Whether `.WithRefer()` is applied (ABI >= 2).
     pub refer: bool,
+    /// Scoped rights handled by the ruleset (ABI >= 6, else 0).
+    pub scoped: u64,
 }
 
 /// Go `V10.BestEffort().RestrictPaths(...)` reduced to pure bit arithmetic:
@@ -104,6 +114,7 @@ pub fn plan(abi: i32) -> RulesetPlan {
     let readable = FS_READ & handled;
     let writable = (FS_READ_WRITE & handled) | if refer { A_REFER & handled } else { 0 };
     let device = (FS_READ_WRITE & FS_FILE) & handled;
+    let scoped = if abi >= 6 { SCOPES_ALL } else { 0 };
     RulesetPlan {
         abi,
         handled,
@@ -111,6 +122,7 @@ pub fn plan(abi: i32) -> RulesetPlan {
         writable,
         device,
         refer,
+        scoped,
     }
 }
 

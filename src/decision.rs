@@ -19,7 +19,7 @@ use futures_util::StreamExt;
 use serde::Deserialize;
 
 use crate::config::AutoConfig;
-use crate::util::json::go_quote;
+use crate::util::json::{go_quote, null_default};
 use crate::util::run::RunContext;
 
 const MAX_CANDIDATES: usize = 255;
@@ -250,13 +250,45 @@ impl DecisionClient {
 // Client construction
 // ---------------------------------------------------------------------------
 
+/// One client per configured timeout. Rebuilding it on every decision call
+/// reloaded the platform trust store and threw away the connection pool, so a
+/// burst of auto selections paid a full TLS handshake each time.
+static DECISION_CLIENTS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<u64, reqwest::Client>>,
+> = std::sync::OnceLock::new();
+
 /// The single construction site for the reqwest client. The TLS configuration
 /// comes from [`crate::provider::tls::client_config`], so auto selection uses
 /// the same platform trust policy as the provider transport.
 fn build_http_client(cfg: &AutoConfig) -> Result<reqwest::Client, DecisionError> {
-    let tls = crate::provider::tls::client_config()
+    let cache = DECISION_CLIENTS.get_or_init(Default::default);
+    if let Some(client) = cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get(&cfg.timeout_seconds)
+    {
+        return Ok(client.clone());
+    }
+    let tls = shared_tls_config()?;
+    let client = build_http_client_with_tls(cfg, tls)?;
+    cache
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .insert(cfg.timeout_seconds, client.clone());
+    Ok(client)
+}
+
+/// The rustls configuration is immutable and expensive (it loads the platform
+/// roots), so build it once and hand out cheap `Arc` clones.
+fn shared_tls_config() -> Result<rustls::ClientConfig, DecisionError> {
+    static TLS: std::sync::OnceLock<rustls::ClientConfig> = std::sync::OnceLock::new();
+    if let Some(config) = TLS.get() {
+        return Ok(config.clone());
+    }
+    let config = crate::provider::tls::client_config()
         .map_err(|e| derr(format!("build HTTP client: {}", e)))?;
-    build_http_client_with_tls(cfg, tls)
+    let _ = TLS.set(config.clone());
+    Ok(config)
 }
 
 /// Build the client with an explicit rustls configuration. Kept separate so the
@@ -270,23 +302,21 @@ fn build_http_client_with_tls(
     if cfg.timeout_seconds > 0 {
         builder = builder.timeout(Duration::from_secs(cfg.timeout_seconds));
     }
+    // The decision request carries the model list and a task summary; do not
+    // let a redirect hand them (and the API key) to another host.
+    builder = builder.redirect(reqwest::redirect::Policy::none());
     builder
         .build()
         .map_err(|e| derr(format!("build HTTP client: {}", e)))
 }
 
 fn resolve_api_key(cfg: &AutoConfig) -> Result<String, DecisionError> {
-    if let Some(k) = cfg.key.as_deref().filter(|s| !s.is_empty()) {
-        return Ok(k.to_string());
-    }
     let name = cfg.env_key.as_deref().unwrap_or("");
-    match std::env::var(name) {
-        Ok(v) if !v.is_empty() => Ok(v),
-        _ => Err(derr(format!(
-            "environment variable {} (auto.env_key) must be set to the decision model API key",
-            name
-        ))),
-    }
+    crate::config::api_key(cfg.key.as_deref(), cfg.env_key.as_deref()).ok_or_else(|| {
+        derr(format!(
+            "environment variable {name} (auto.env_key) must be set to the decision model API key"
+        ))
+    })
 }
 
 async fn deadline_wait(deadline: Option<tokio::time::Instant>) {
@@ -348,16 +378,8 @@ fn build_request_body(
 
 /// Go `json.Unmarshal` treats an explicit `null` for a non-pointer struct field
 /// as "no effect" (the zero value: nil map, `""`, `0`) and produces no error.
-/// serde's `#[serde(default)]` only covers a *missing* field, so route these
-/// fields through a helper that collapses `null` into `T::default()` while
-/// leaving real values intact; `#[serde(default)]` still handles the absent case.
-fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: serde::Deserialize<'de> + Default,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
+/// The shared [`crate::util::json::null_default`] helper routes such fields
+/// through `T::default()`.
 
 #[derive(Deserialize)]
 struct SystemOneResponse {
@@ -538,6 +560,7 @@ mod tests {
             key: Some(key.to_string()),
             model: "jev-latest".to_string(),
             timeout_seconds: 0,
+            descriptions: std::collections::BTreeMap::new(),
         }
     }
 
@@ -645,6 +668,30 @@ mod tests {
             .expect("temporary root rejected by reqwest");
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         assert_eq!(response.text().await.unwrap(), "ok");
+    }
+
+    #[test]
+    fn build_http_client_reuses_one_client_per_timeout() {
+        // Two decisions with the same timeout must share the pooled client;
+        // a different timeout needs its own request timeout, so it gets a
+        // second entry.
+        let mut first = cfg("key");
+        first.timeout_seconds = 7;
+        let mut same = first.clone();
+        same.key = Some("other-key".into());
+        let mut other = first.clone();
+        other.timeout_seconds = 9;
+
+        build_http_client(&first).unwrap();
+        build_http_client(&same).unwrap();
+        build_http_client(&other).unwrap();
+
+        // Keyed by timeout: the second call with timeout 7 reuses the entry,
+        // and a different timeout gets its own.
+        let cache = DECISION_CLIENTS.get().expect("cache initialised");
+        let cache = cache.lock().unwrap_or_else(|poison| poison.into_inner());
+        assert!(cache.contains_key(&7));
+        assert!(cache.contains_key(&9));
     }
 
     #[tokio::test]

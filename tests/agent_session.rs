@@ -19,7 +19,6 @@ use subagent_mcp::provider::{
     TurnRequest, TurnResult, Usage,
 };
 use subagent_mcp::util::run::RunContext;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -253,6 +252,49 @@ fn load_agents_md_read_error_fails() {
     assert!(err.message.contains("AGENTS.md"), "error: {err}");
 }
 
+#[cfg(unix)]
+#[test]
+fn load_agents_md_rejects_symlink_escaping_the_repo() {
+    let (_dir, cwd) = tmp_dir();
+    write(&cwd.join(".git/HEAD"), b"ref: refs/heads/main\n");
+    let outside = tempfile::tempdir().unwrap();
+    write(&outside.path().join("secret"), b"TOP-SECRET");
+    std::os::unix::fs::symlink(outside.path().join("secret"), cwd.join("AGENTS.md")).unwrap();
+
+    let err = load_agents_md(&cwd).unwrap_err();
+    assert!(
+        err.message.contains("outside the repository root"),
+        "error: {err}"
+    );
+    assert!(!err.message.contains("TOP-SECRET"), "error: {err}");
+}
+
+#[cfg(unix)]
+#[test]
+fn load_agents_md_allows_symlink_inside_the_repo() {
+    let (_dir, cwd) = tmp_dir();
+    write(&cwd.join(".git/HEAD"), b"ref: refs/heads/main\n");
+    write(&cwd.join("docs/rules.md"), b"repo rules");
+    std::os::unix::fs::symlink(cwd.join("docs/rules.md"), cwd.join("AGENTS.md")).unwrap();
+
+    let got = load_agents_md(&cwd).unwrap();
+    assert!(got.contains("repo rules"), "got: {got}");
+}
+
+#[cfg(unix)]
+#[test]
+fn load_agents_md_rejects_a_fifo_without_blocking() {
+    use std::os::unix::ffi::OsStrExt;
+    let (_dir, cwd) = tmp_dir();
+    let path = cwd.join("AGENTS.md");
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+
+    // Would hang forever if the FIFO were opened for reading without a writer.
+    let err = load_agents_md(&cwd).unwrap_err();
+    assert!(err.message.contains("not a regular file"), "error: {err}");
+}
+
 #[test]
 fn load_agents_md_resolves_symlinked_cwd() {
     let dir = tempfile::tempdir().unwrap();
@@ -357,7 +399,7 @@ async fn lease_deref_mut_persists_state_and_blocks_second_acquire() {
 
     let mut lease = m.acquire(&s.id).await.unwrap();
     // Mutate SessionState through DerefMut.
-    lease.messages.push(Message {
+    std::sync::Arc::make_mut(&mut lease.messages).push(Message {
         role: Role::User,
         text: "hello".into(),
         tool_calls: vec![ToolCall {
@@ -521,13 +563,11 @@ async fn sweep_does_not_cause_false_busy() {
 }
 
 #[tokio::test]
-async fn close_cancels_token_and_clears_sessions() {
+async fn close_clears_sessions() {
     let m = SessionManager::new();
     let a = m.create(options()).await.unwrap();
     let b = m.create(options()).await.unwrap();
-    let cancel = CancellationToken::new();
-    m.close(&cancel).await;
-    assert!(cancel.is_cancelled());
+    m.close().await;
     assert_eq!(
         m.acquire(&a.id).await.unwrap_err(),
         SessionError::UnknownSession
@@ -536,6 +576,24 @@ async fn close_cancels_token_and_clears_sessions() {
         m.acquire(&b.id).await.unwrap_err(),
         SessionError::UnknownSession
     );
+}
+
+#[tokio::test]
+async fn close_one_removes_the_session_and_closes_its_thread() {
+    // The server calls this when a start request created a session but could
+    // not acquire its lease; leaking the session would leave the provider
+    // thread running with no way to reach it.
+    let m = SessionManager::new();
+    let mut opts = options();
+    opts.thread = Some(Arc::new(FakeThread));
+    let session = m.create(opts).await.unwrap();
+    m.close_one(&session.id).await;
+    assert_eq!(
+        m.acquire(&session.id).await.unwrap_err(),
+        SessionError::UnknownSession
+    );
+    // Closing an unknown id is a no-op.
+    m.close_one(&session.id).await;
 }
 
 #[tokio::test]

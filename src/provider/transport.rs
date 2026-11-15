@@ -33,6 +33,7 @@ use serde_json::value::RawValue;
 
 use crate::config::ProviderConfig;
 use crate::provider::{ProviderError, TransportKind, Usage};
+use crate::util::run::RunContext;
 
 // --- Constants (Go transport.go) ------------------------------------------
 
@@ -46,6 +47,15 @@ pub const DRAIN_TIMEOUT: Duration = Duration::from_millis(250);
 pub const UPSTREAM_SCAN_LIMIT: usize = 16 << 10;
 /// Env var naming the directory that receives raw debug SSE captures.
 pub const DEBUG_STREAM_ENV: &str = "SUBAGENT_MCP_DEBUG_STREAM";
+/// Upper bound on any server-supplied `Retry-After` delay. A hostile or
+/// misconfigured gateway must not be able to stall a run for hours.
+pub const MAX_SERVER_RETRY_DELAY: Duration = Duration::from_secs(60);
+/// How long a response body may stay silent between chunks before the turn
+/// fails. Long SSE streams are fine (they keep sending), but a connection that
+/// goes dead without closing would otherwise hang forever.
+pub const DEFAULT_BODY_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+/// Maximum bytes retained from a failed response's error body.
+pub const ERROR_BODY_LIMIT: usize = 64 << 10;
 
 /// Wire label for a transport kind; used as the registry key and the `<kind>`
 /// segment of a debug capture file name.
@@ -94,6 +104,13 @@ fn build_client() -> Result<reqwest::Client, ProviderError> {
         // Match Go's http.DefaultTransport dial (30 s) and idle (90 s) bounds.
         .connect_timeout(Duration::from_secs(30))
         .pool_idle_timeout(Duration::from_secs(90))
+        // Detect a half-open connection instead of waiting on TCP's default
+        // (often hours) before the body read notices.
+        .tcp_keepalive(Duration::from_secs(30))
+        // reqwest follows up to 10 redirects by default and only strips
+        // `Authorization`/`Cookie` when the host changes. `x-api-key` and the
+        // prompt body would follow a 307/308 to any host, so never redirect.
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .map_err(|e| ProviderError {
             message: format!("provider transport: build reqwest client: {e}"),
@@ -367,6 +384,99 @@ pub async fn drain_response(resp: reqwest::Response) -> usize {
     drain_response_with(resp, None, Arc::new(Mutex::new(UpstreamRecorder::new()))).await
 }
 
+/// Read a failed response's error body, bounded in bytes and by the run
+/// context. `Ok(text)` always has at most [`ERROR_BODY_LIMIT`] bytes; `Err`
+/// carries the context reason when the run ended before the body did. The
+/// response is closed either way so the connection can be reused.
+pub async fn drain_error_body(
+    ctx: Option<&RunContext>,
+    mut response: PooledResponse,
+) -> Result<String, &'static str> {
+    let mut buf = Vec::new();
+    let reason = loop {
+        if buf.len() >= ERROR_BODY_LIMIT {
+            break None;
+        }
+        let chunk = match ctx {
+            Some(ctx) => tokio::select! {
+                chunk = response.chunk() => chunk,
+                _ = ctx.cancel.cancelled() => break Some("context canceled"),
+                _ = wait_deadline(ctx.deadline) => break Some("context deadline exceeded"),
+            },
+            None => response.chunk().await,
+        };
+        match chunk {
+            Ok(Some(bytes)) => {
+                let take = (ERROR_BODY_LIMIT - buf.len()).min(bytes.len());
+                buf.extend_from_slice(&bytes[..take]);
+            }
+            // A read error ends the drain the way Go's `io.ReadAll` does; the
+            // status classification still comes from the HTTP status.
+            Ok(None) | Err(_) => break None,
+        }
+    };
+    response.close().await;
+    let text = String::from_utf8_lossy(&buf).into_owned();
+    match reason {
+        Some(reason) => Err(reason),
+        None => Ok(text),
+    }
+}
+
+async fn wait_deadline(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// Convert an untrusted `Retry-After` delay, in nanoseconds, into a `Duration`
+/// without the panics `Duration::from_secs_f64` has for negatives, `NaN`,
+/// infinities and overflow. Negative and `NaN` values mean "retry now";
+/// anything larger than [`MAX_SERVER_RETRY_DELAY`] (including infinities and
+/// values that overflow int64) is clamped to that cap instead of collapsing to
+/// an immediate retry.
+pub fn retry_after_duration(nanoseconds: f64) -> Duration {
+    if nanoseconds.is_nan() || nanoseconds < 0.0 {
+        return Duration::ZERO;
+    }
+    let cap = MAX_SERVER_RETRY_DELAY.as_nanos() as f64;
+    if nanoseconds >= cap {
+        return MAX_SERVER_RETRY_DELAY;
+    }
+    Duration::from_nanos(nanoseconds as u64)
+}
+
+/// Parse `Retry-After-Ms` first, then `Retry-After` (fractional seconds or an
+/// RFC 1123 HTTP date). Invalid numeric values clamp to zero; the result is
+/// always bounded by [`MAX_SERVER_RETRY_DELAY`].
+pub fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let value = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(value) = value("retry-after-ms")
+        && let Ok(milliseconds) = value.parse::<f64>()
+    {
+        return Some(retry_after_duration(milliseconds * 1_000_000.0));
+    }
+    let value = value("retry-after")?;
+    if let Ok(seconds) = value.parse::<f64>() {
+        return Some(retry_after_duration(seconds * 1_000_000_000.0));
+    }
+    let when = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let remaining = when.with_timezone(&chrono::Utc) - chrono::Utc::now();
+    // A date in the past means "retry now", not "use the exponential default".
+    Some(
+        remaining
+            .to_std()
+            .unwrap_or(Duration::ZERO)
+            .min(MAX_SERVER_RETRY_DELAY),
+    )
+}
+
 /// A response whose unread body is drained on drop, so the pooled connection
 /// can be reused like Go's transport. Reading through [`PooledResponse::chunk`]
 /// tees bytes to the debug capture and upstream recorder.
@@ -382,7 +492,18 @@ impl PooledResponse {
         let Some(resp) = self.inner.as_mut() else {
             return Ok(None);
         };
-        match resp.chunk().await {
+        let chunk = match tokio::time::timeout(DEFAULT_BODY_IDLE_TIMEOUT, resp.chunk()).await {
+            Ok(chunk) => chunk,
+            Err(_) => {
+                return Err(ProviderError {
+                    message: format!(
+                        "response body idle timeout after {}s",
+                        DEFAULT_BODY_IDLE_TIMEOUT.as_secs()
+                    ),
+                });
+            }
+        };
+        match chunk {
             Ok(Some(bytes)) => {
                 if let Some(d) = self.debug.as_mut() {
                     d.write_chunk(&bytes);
@@ -521,7 +642,7 @@ impl PooledClient {
         &self,
         url: reqwest::Url,
         headers: reqwest::header::HeaderMap,
-        body: &[u8],
+        body: bytes::Bytes,
     ) -> Result<PooledResponse, ProviderError> {
         let mut req = reqwest::Request::new(reqwest::Method::POST, url);
         *req.headers_mut() = headers;
@@ -529,7 +650,9 @@ impl PooledClient {
             reqwest::header::CONTENT_TYPE,
             reqwest::header::HeaderValue::from_static("application/json"),
         );
-        *req.body_mut() = Some(reqwest::Body::from(body.to_vec()));
+        // `Bytes` moves into the request body without a copy; retry loops
+        // clone the handle instead of re-copying the whole history.
+        *req.body_mut() = Some(reqwest::Body::from(body));
         self.execute(req).await
     }
 

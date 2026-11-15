@@ -44,14 +44,26 @@ const _: () = {
     assert!(A::Truncate as u64 == crate::sandbox::A_TRUNCATE);
     assert!(A::IoctlDev as u64 == crate::sandbox::A_IOCTL_DEV);
     assert!(A::ResolveUnix as u64 == crate::sandbox::A_RESOLVE_UNIX);
+    use landlock::Scope as S;
+    assert!(S::AbstractUnixSocket as u64 == crate::sandbox::SCOPE_ABSTRACT_UNIX_SOCKET);
+    assert!(S::Signal as u64 == crate::sandbox::SCOPE_SIGNAL);
 };
 
 /// Minimal `struct landlock_ruleset_attr` (ABI v1 size). The kernel zero-extends
-/// missing trailing fields, so net/scoped rights stay unhandled — exactly the
-/// FS-only sandbox the Go helper builds.
+/// missing trailing fields, so net rights stay unhandled.
 #[repr(C)]
 struct RulesetAttr {
     handled_access_fs: u64,
+}
+
+/// `struct landlock_ruleset_attr` as of ABI 6 (`handled_access_fs`,
+/// `handled_access_net`, `scoped`). Only passed when scopes are handled, which
+/// requires ABI >= 6; older kernels reject the larger size with `E2BIG`.
+#[repr(C)]
+struct ScopedRulesetAttr {
+    handled_access_fs: u64,
+    handled_access_net: u64,
+    scoped: u64,
 }
 
 /// `struct landlock_path_beneath_attr` is packed (12 bytes) in the uapi.
@@ -78,18 +90,32 @@ pub fn landlock_abi() -> io::Result<i32> {
     Ok(v as i32)
 }
 
-fn create_ruleset(handled: u64) -> io::Result<OwnedFd> {
-    let attr = RulesetAttr {
-        handled_access_fs: handled,
-    };
-    // SAFETY: `attr` outlives the syscall; size is the struct's byte length.
+fn create_ruleset(handled: u64, scoped: u64) -> io::Result<OwnedFd> {
+    // SAFETY: the chosen `attr` outlives the syscall; size is its byte length.
     let fd = unsafe {
-        libc::syscall(
-            libc::SYS_landlock_create_ruleset,
-            &attr as *const RulesetAttr,
-            std::mem::size_of::<RulesetAttr>(),
-            0u32,
-        )
+        if scoped == 0 {
+            let attr = RulesetAttr {
+                handled_access_fs: handled,
+            };
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                &attr as *const RulesetAttr,
+                std::mem::size_of::<RulesetAttr>(),
+                0u32,
+            )
+        } else {
+            let attr = ScopedRulesetAttr {
+                handled_access_fs: handled,
+                handled_access_net: 0,
+                scoped,
+            };
+            libc::syscall(
+                libc::SYS_landlock_create_ruleset,
+                &attr as *const ScopedRulesetAttr,
+                std::mem::size_of::<ScopedRulesetAttr>(),
+                0u32,
+            )
+        }
     };
     if fd < 0 {
         return Err(io::Error::last_os_error());
@@ -140,8 +166,8 @@ fn add_rule(
 }
 
 fn restrict(roots: &[PathBuf], p: &RulesetPlan) -> Result<(), Error> {
-    let ruleset_fd =
-        create_ruleset(p.handled).map_err(|e| err(format!("landlock unavailable: {e}")))?;
+    let ruleset_fd = create_ruleset(p.handled, p.scoped)
+        .map_err(|e| err(format!("landlock unavailable: {e}")))?;
     let rfd = ruleset_fd.as_raw_fd();
 
     // RODirs("/"): read/execute everywhere.

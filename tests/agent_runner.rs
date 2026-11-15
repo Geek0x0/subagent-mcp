@@ -388,7 +388,7 @@ impl ToolExecutor for StubExecutor {
                         thread_id: lease.id().to_string(),
                         tool: call.name.clone(),
                         command: None,
-                        path: None,
+                        paths: Vec::new(),
                         reason: "test".into(),
                     },
                 )
@@ -1750,7 +1750,7 @@ async fn rollout_records_turn_context_usage_and_messages() {
     }]));
     let events = Events::new();
     let mut l = lease(options(provider)).await;
-    let recorder = RolloutRecorder::create("t", Path::new(""), "", "stub", "m", "high").unwrap();
+    let recorder = RolloutRecorder::create("t").unwrap();
     l.rollout = Some(recorder);
     let hooks = hooks(&events);
     let runner = Runner {
@@ -2082,8 +2082,7 @@ async fn delegated_thread_usage_reaches_the_rollout() {
     });
     let events = Events::new();
     let mut l = lease(thread_options(thread)).await;
-    let recorder =
-        RolloutRecorder::create("thread-usage", Path::new(""), "", "codex", "m", "high").unwrap();
+    let recorder = RolloutRecorder::create("thread-usage").unwrap();
     l.rollout = Some(recorder);
     let hooks = hooks(&events);
     let runner = runner();
@@ -2130,8 +2129,7 @@ async fn delegated_thread_preserves_a_real_error_after_cancellation() {
         message: "codex thread closed; start a new session",
     })))
     .await;
-    let recorder =
-        RolloutRecorder::create("thread-error", Path::new(""), "", "codex", "m", "high").unwrap();
+    let recorder = RolloutRecorder::create("thread-error").unwrap();
     l.rollout = Some(recorder);
     let ctx = run_ctx();
     ctx.cancel.cancel();
@@ -2158,8 +2156,7 @@ async fn delegated_thread_records_usage_as_events_arrive() {
     let _guard = EnvGuard::new(tmp.path());
 
     let mut files = vec![];
-    let recorder =
-        RolloutRecorder::create("thread-mid", Path::new(""), "", "codex", "m", "high").unwrap();
+    let recorder = RolloutRecorder::create("thread-mid").unwrap();
     collect_jsonl(tmp.path(), &mut files);
     assert_eq!(files.len(), 1, "rollout file is created up front");
     let seen = Arc::new(Mutex::new(0));
@@ -2209,8 +2206,7 @@ async fn delegated_thread_accounts_usage_emitted_after_the_run_returns() {
     let mut opts = thread_options(thread);
     opts.max_total_tokens = 12;
     let mut l = lease(opts).await;
-    let recorder =
-        RolloutRecorder::create("thread-late", Path::new(""), "", "codex", "m", "high").unwrap();
+    let recorder = RolloutRecorder::create("thread-late").unwrap();
     l.rollout = Some(recorder);
     let hooks = hooks(&events);
     let runner = runner();

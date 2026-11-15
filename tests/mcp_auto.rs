@@ -59,7 +59,7 @@ fn ensure_test_factory() {
     ONCE.get_or_init(|| {
         factory::register(
             Api::Responses.as_str(),
-            Arc::new(|_name, cfg, _key| {
+            Arc::new(|_name, cfg| {
                 STUBS
                     .lock()
                     .unwrap()
@@ -190,6 +190,7 @@ fn test_config(providers: Vec<(&str, Arc<dyn Provider>)>) -> Config {
         path: PathBuf::from("/test/config.toml"),
         providers: map,
         auto: None,
+        limits: Default::default(),
     }
 }
 
@@ -201,6 +202,7 @@ fn auto_config(base_url: &str) -> AutoConfig {
         key: Some("jev-key".into()),
         model: "jev-latest".into(),
         timeout_seconds: 5,
+        descriptions: std::collections::BTreeMap::new(),
     }
 }
 
@@ -414,12 +416,10 @@ async fn resolve_auto_selects_provider_from_jev() {
         ("bravo", Arc::new(StubProvider::new("bravo"))),
     ]);
     config.auto = Some(auto_config(&mock.base));
-    let manager = SessionManager::new();
 
     let selection = resolve_auto(
         &plain_ctx(),
         &config,
-        &manager,
         "fix the parser",
         &cwd().to_path_buf(),
     )
@@ -456,17 +456,10 @@ async fn single_candidate_skips_jev() {
         description: String::new(),
     }];
     config.auto = Some(auto_config(&mock.base));
-    let manager = SessionManager::new();
 
-    let selection = resolve_auto(
-        &plain_ctx(),
-        &config,
-        &manager,
-        "task",
-        &cwd().to_path_buf(),
-    )
-    .await
-    .unwrap();
+    let selection = resolve_auto(&plain_ctx(), &config, "task", &cwd().to_path_buf())
+        .await
+        .unwrap();
     assert_eq!(selection.provider, "alpha");
     assert_eq!(selection.model, "m-fast");
     assert!(selection.skipped);
@@ -503,17 +496,10 @@ async fn omits_provider_without_key() {
         bravo.env_key = Some(missing.into());
     }
     config.auto = Some(auto_config(&mock.base));
-    let manager = SessionManager::new();
 
-    let selection = resolve_auto(
-        &plain_ctx(),
-        &config,
-        &manager,
-        "task",
-        &cwd().to_path_buf(),
-    )
-    .await
-    .unwrap();
+    let selection = resolve_auto(&plain_ctx(), &config, "task", &cwd().to_path_buf())
+        .await
+        .unwrap();
     assert_eq!(selection.provider, "alpha");
     let meta = selection.meta();
     let omitted = meta["omitted"].as_array().unwrap();
@@ -555,17 +541,10 @@ async fn no_reachable_provider_fails() {
         provider.env_key = Some(missing.into());
     }
     config.auto = Some(auto_config(&mock.base));
-    let manager = SessionManager::new();
 
-    let error = resolve_auto(
-        &plain_ctx(),
-        &config,
-        &manager,
-        "task",
-        &cwd().to_path_buf(),
-    )
-    .await
-    .unwrap_err();
+    let error = resolve_auto(&plain_ctx(), &config, "task", &cwd().to_path_buf())
+        .await
+        .unwrap_err();
     for want in [
         "no provider is usable",
         "TEST_AUTO_MISSING_ALPHA_TASK24A",
@@ -614,16 +593,9 @@ async fn rejects_provider_argument() {
 async fn requires_auto_section() {
     let _env = env_guard();
     let config = test_config(vec![("alpha", Arc::new(StubProvider::new("alpha")))]);
-    let manager = SessionManager::new();
-    let error = resolve_auto(
-        &plain_ctx(),
-        &config,
-        &manager,
-        "task",
-        &cwd().to_path_buf(),
-    )
-    .await
-    .unwrap_err();
+    let error = resolve_auto(&plain_ctx(), &config, "task", &cwd().to_path_buf())
+        .await
+        .unwrap_err();
     assert!(error.message.contains("[auto]"), "{}", error.message);
 }
 
@@ -650,17 +622,11 @@ async fn requires_jev_key_when_choosing() {
         key: None,
         model: "jev-latest".into(),
         timeout_seconds: 5,
+        descriptions: std::collections::BTreeMap::new(),
     });
-    let manager = SessionManager::new();
-    let error = resolve_auto(
-        &plain_ctx(),
-        &config,
-        &manager,
-        "task",
-        &cwd().to_path_buf(),
-    )
-    .await
-    .unwrap_err();
+    let error = resolve_auto(&plain_ctx(), &config, "task", &cwd().to_path_buf())
+        .await
+        .unwrap_err();
     for want in [missing, "auto.env_key"] {
         assert!(
             error.message.contains(want),
@@ -684,16 +650,9 @@ async fn reports_jev_failure() {
         ("bravo", Arc::new(StubProvider::new("bravo"))),
     ]);
     config.auto = Some(auto_config(&mock.base));
-    let manager = SessionManager::new();
-    let error = resolve_auto(
-        &plain_ctx(),
-        &config,
-        &manager,
-        "task",
-        &cwd().to_path_buf(),
-    )
-    .await
-    .unwrap_err();
+    let error = resolve_auto(&plain_ctx(), &config, "task", &cwd().to_path_buf())
+        .await
+        .unwrap_err();
     assert!(error.message.contains("auto model selection"));
     assert!(error.message.contains("500"));
 }
@@ -711,16 +670,9 @@ async fn rejects_unknown_choice() {
         ("bravo", Arc::new(StubProvider::new("bravo"))),
     ]);
     config.auto = Some(auto_config(&mock.base));
-    let manager = SessionManager::new();
-    let error = resolve_auto(
-        &plain_ctx(),
-        &config,
-        &manager,
-        "task",
-        &cwd().to_path_buf(),
-    )
-    .await
-    .unwrap_err();
+    let error = resolve_auto(&plain_ctx(), &config, "task", &cwd().to_path_buf())
+        .await
+        .unwrap_err();
     for want in ["unknown choice", "nope"] {
         assert!(
             error.message.contains(want),
@@ -763,16 +715,9 @@ async fn candidate_descriptions_use_defaults_and_config() {
     let mut config = test_config(vec![("alpha", Arc::new(StubProvider::new("alpha")))]);
     config.providers.get_mut("alpha").unwrap().models = models;
     config.auto = Some(auto_config(&mock.base));
-    let manager = SessionManager::new();
-    let _ = resolve_auto(
-        &plain_ctx(),
-        &config,
-        &manager,
-        "task",
-        &cwd().to_path_buf(),
-    )
-    .await
-    .unwrap();
+    let _ = resolve_auto(&plain_ctx(), &config, "task", &cwd().to_path_buf())
+        .await
+        .unwrap();
 
     let (request, _) = recorded(mock).await;
     let criteria = request.json()["questions"]["model"]["criteria"]
@@ -816,6 +761,7 @@ async fn codex_single_candidate_is_skipped_without_a_judge() {
         path: PathBuf::from("/test/config.toml"),
         providers: BTreeMap::new(),
         auto: None,
+        limits: Default::default(),
     };
     config
         .providers
@@ -824,16 +770,9 @@ async fn codex_single_candidate_is_skipped_without_a_judge() {
     // Constructing the tools registers the Codex adapter, making the
     // configured candidate available.
     let _tools = tools(config.clone());
-    let manager = SessionManager::new();
-    let selection = resolve_auto(
-        &plain_ctx(),
-        &config,
-        &manager,
-        "task",
-        &cwd().to_path_buf(),
-    )
-    .await
-    .unwrap();
+    let selection = resolve_auto(&plain_ctx(), &config, "task", &cwd().to_path_buf())
+        .await
+        .unwrap();
     assert_eq!(selection.provider, "codex");
     assert_eq!(selection.model, "gpt-6.1-terra");
     assert!(selection.skipped);
@@ -873,16 +812,9 @@ async fn codex_candidate_can_be_chosen_by_the_judge() {
         .insert("codex".into(), codex_provider_config());
     config.auto = Some(auto_config(&mock.base));
     let _tools = tools(config.clone());
-    let manager = SessionManager::new();
-    let selection = resolve_auto(
-        &plain_ctx(),
-        &config,
-        &manager,
-        "task",
-        &cwd().to_path_buf(),
-    )
-    .await
-    .unwrap();
+    let selection = resolve_auto(&plain_ctx(), &config, "task", &cwd().to_path_buf())
+        .await
+        .unwrap();
     assert_eq!(selection.provider, "codex");
     assert_eq!(selection.model, "gpt-6.1-terra");
     assert!(!selection.skipped);
@@ -990,6 +922,7 @@ async fn handle_start_auto_single_candidate_needs_no_jev_key() {
         key: None,
         model: "jev-latest".into(),
         timeout_seconds: 5,
+        descriptions: std::collections::BTreeMap::new(),
     });
     let tools = tools(config);
     let result = tools
@@ -1052,6 +985,7 @@ async fn handle_start_auto_skipped_metadata_preserves_omitted_providers() {
         key: Some("jev-key".into()),
         model: "jev-latest".into(),
         timeout_seconds: 5,
+        descriptions: std::collections::BTreeMap::new(),
     });
     let tools = tools(config);
     let result = tools
@@ -1366,8 +1300,8 @@ fn factory_new_works_for_the_http_apis() {
         api: Api::Messages,
         ..chat.clone()
     };
-    assert!(factory::new("chat", &chat, "test-key").is_ok());
-    assert!(factory::new("messages", &messages, "test-key").is_ok());
+    assert!(factory::new("chat", &chat).is_ok());
+    assert!(factory::new("messages", &messages).is_ok());
     assert!(factory::lookup(Api::ChatCompletions.as_str()).is_some());
     assert!(factory::lookup(Api::Messages.as_str()).is_some());
     assert!(factory::lookup(Api::Responses.as_str()).is_some());

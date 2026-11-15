@@ -18,8 +18,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio_util::sync::CancellationToken;
-
 use crate::agent::session::SessionManager;
 use crate::check;
 use crate::config::{self, Config};
@@ -177,8 +175,7 @@ pub async fn serve(config: Config, tool_name: String) -> Result<(), CliError> {
         // Sessions go next: releasing their bound directories and closing their
         // provider threads (which interrupts a pending Codex turn) is what makes
         // the provider pool safe to release.
-        let session_cancel = CancellationToken::new();
-        match tokio::time::timeout(remaining(deadline), manager.close(&session_cancel)).await {
+        match tokio::time::timeout(remaining(deadline), manager.close()).await {
             Ok(()) => {}
             Err(_) => {
                 log_line("shutdown: a session is still busy; leaving it to process exit");
@@ -508,7 +505,22 @@ fn configure_runtime(config: &Config) {
             "warning: /proc environment protection could not be enabled: {error}; continuing"
         );
     }
-    crate::tools::set_scrubbed_env(check::env_keys(config), vec!["SUBAGENT_MCP_".to_string()]);
+    // Exact names come from the providers' `env_key`s plus `server.scrub_env`;
+    // an entry ending in `*` is a prefix. `SUBAGENT_MCP_*` is always hidden so
+    // a child cannot call back into the server with its own settings.
+    let mut names = check::env_keys(config);
+    let mut prefixes = vec!["SUBAGENT_MCP_".to_string()];
+    for entry in &config.limits.scrub_env {
+        match entry.strip_suffix('*') {
+            // `config::load` rejects a bare `*`, but a `Limits` built another
+            // way must not strip the whole environment either: every name
+            // starts with the empty string, PATH included.
+            Some("") => {}
+            Some(prefix) => prefixes.push(prefix.to_string()),
+            None => names.push(entry.clone()),
+        }
+    }
+    crate::tools::set_scrubbed_env(names, prefixes);
     crate::tools::set_protected_files(vec![config.path.clone()]);
 }
 

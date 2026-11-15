@@ -211,7 +211,7 @@ fn version_prints_expected() {
         assert_eq!(out.status.code(), Some(0));
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            "subagent-mcp 0.14.0\n"
+            "subagent-mcp 0.14.1\n"
         );
     }
 }
@@ -656,12 +656,7 @@ struct StubFactory {
 }
 
 impl AdapterFactory for StubFactory {
-    fn build(
-        &self,
-        _name: &str,
-        _cfg: &ProviderConfig,
-        _key: &str,
-    ) -> Result<Built, ProviderError> {
+    fn build(&self, _name: &str, _cfg: &ProviderConfig) -> Result<Built, ProviderError> {
         Ok(self.built.clone())
     }
 }
@@ -669,12 +664,7 @@ impl AdapterFactory for StubFactory {
 struct FailingFactory;
 
 impl AdapterFactory for FailingFactory {
-    fn build(
-        &self,
-        _name: &str,
-        _cfg: &ProviderConfig,
-        _key: &str,
-    ) -> Result<Built, ProviderError> {
+    fn build(&self, _name: &str, _cfg: &ProviderConfig) -> Result<Built, ProviderError> {
         Err(ProviderError {
             message: "adapter boom".to_string(),
         })
@@ -731,6 +721,7 @@ fn config_with(providers: Vec<(&str, ProviderConfig)>, auto: Option<AutoConfig>)
             .map(|(name, cfg)| (name.to_string(), cfg))
             .collect(),
         auto,
+        limits: Default::default(),
     }
 }
 
@@ -1390,6 +1381,7 @@ fn check_run_reports_auto_section() {
             key: None,
             model: "jev-latest".to_string(),
             timeout_seconds: 20,
+            descriptions: std::collections::BTreeMap::new(),
         }),
     );
 
@@ -1434,6 +1426,7 @@ fn check_run_reports_auto_url_and_warns_when_unset() {
             key: None,
             model: "clef".to_string(),
             timeout_seconds: 20,
+            descriptions: std::collections::BTreeMap::new(),
         }),
     );
 
@@ -1477,6 +1470,7 @@ fn check_run_key_from_config_file_is_never_printed() {
             key: Some(FILE_KEY.to_string()),
             model: "jev-latest".to_string(),
             timeout_seconds: 20,
+            descriptions: std::collections::BTreeMap::new(),
         }),
     );
 
@@ -1550,6 +1544,7 @@ fn env_keys_are_sorted_and_deduplicated() {
             key: None,
             model: "m".to_string(),
             timeout_seconds: 20,
+            descriptions: std::collections::BTreeMap::new(),
         }),
     );
     assert_eq!(check::env_keys(&config), vec!["A_KEY", "M_KEY", "Z_KEY"]);

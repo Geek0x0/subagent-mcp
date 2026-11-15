@@ -4,9 +4,10 @@
 use std::collections::HashMap;
 use std::fs::Metadata;
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 use super::{Change, ChangeKind, Chunk, Patch, PatchError, bytes_to_string, err};
+use crate::util::fs::lexical_clean;
 use crate::util::json::go_quote;
 
 /// The filesystem a patch is planned against and committed to. `OS` is the
@@ -293,7 +294,7 @@ fn planner_read(
         }
         return Ok(state.content.clone());
     }
-    fs.read(path).map_err(|e| e.to_string())
+    read_bounded(fs, path).map_err(|e| e.to_string())
 }
 
 /// Reject, before anything is written, a target Commit could not write as a
@@ -316,10 +317,38 @@ fn check_target(
     match fs.lstat(path) {
         Ok(_) if !allow_existing => Err(err(format!("{}: file already exists", label))),
         Ok(info) if info.is_dir() => Err(err(format!("{}: is a directory", label))),
-        Ok(_) => Ok(()),
+        Ok(info) if !info.is_file() && !info.file_type().is_symlink() => {
+            Err(err(format!("{}: is not a regular file", label)))
+        }
+        // An existing entry that is a symlink reaches here: `lstat` cannot see
+        // what the write would actually open, so check the resolved target the
+        // same way the plain Add/Update paths do.
+        Ok(_) => check_write_destination(fs, path, label),
         Err(e) if is_not_exist(&e) => Ok(()),
         Err(e) => Err(err(format!("{}: {}", label, e))),
     }
+}
+
+/// Reject, before anything is written, a write destination Commit would not
+/// safely overwrite. `lstat` in [`check_target`] deliberately lets a symlink
+/// through, so the destination is re-checked with the symlink-following
+/// [`check_write_target`]: a link to a FIFO would block the commit forever on
+/// open, and a link to a device such as `/proc/self/fd/1` would write the patch
+/// bytes into the server's own stdout instead of a file. The existing content
+/// is snapshotted for rollback, so it must also fit [`MAX_PATCH_READ_BYTES`]
+/// (the same limit an Update source obeys).
+fn check_write_destination(fs: &dyn FS, path: &Path, label: &str) -> Result<(), PatchError> {
+    let existing = stat_write_target(fs, path).map_err(|e| err(format!("{}: {}", label, e)))?;
+    if let Some(info) = existing
+        && info.len() > MAX_PATCH_READ_BYTES
+    {
+        return Err(err(format!(
+            "{}: file is too large ({} bytes)",
+            label,
+            info.len()
+        )));
+    }
+    Ok(())
 }
 
 /// Go `resolve`: absolute paths are cleaned, relative ones joined to cwd.
@@ -332,26 +361,55 @@ fn resolve(cwd: &Path, path: &str) -> PathBuf {
     }
 }
 
-/// Go `filepath.Clean`, lexically.
-fn lexical_clean(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-            Component::RootDir => out.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() && !path.is_absolute() {
-                    out.push("..");
-                }
-            }
-            Component::Normal(part) => out.push(part),
-        }
+/// The largest file a patch plan or snapshot will read into memory.
+pub const MAX_PATCH_READ_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read a whole file through `fs`, but only when it is a regular file within
+/// [`MAX_PATCH_READ_BYTES`]. Planning a patch against a device, FIFO or an
+/// enormous file must fail instead of allocating without bound.
+fn read_bounded(fs: &dyn FS, path: &Path) -> io::Result<Vec<u8>> {
+    let info = fs.stat(path)?;
+    if !info.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
     }
-    if out.as_os_str().is_empty() {
-        out.push(".");
+    if info.len() > MAX_PATCH_READ_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("file is too large ({} bytes)", info.len()),
+        ));
     }
-    out
+    let data = fs.read(path)?;
+    if data.len() as u64 > MAX_PATCH_READ_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "file grew past the read limit",
+        ));
+    }
+    Ok(data)
+}
+
+/// Follow `path` (symlinks included) and reject an existing non-regular target
+/// (device, FIFO, socket or directory), returning what the write would open.
+fn stat_write_target(fs: &dyn FS, path: &Path) -> io::Result<Option<Metadata>> {
+    match fs.stat(path) {
+        Ok(info) if !info.is_file() => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "refusing to write to a non-regular file",
+        )),
+        Ok(info) => Ok(Some(info)),
+        Err(e) if is_not_exist(&e) => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Refuse to write to an existing non-regular target (device, FIFO, socket or
+/// directory). Opening such a path can block forever or write into the
+/// process's own standard streams (`/proc/self/fd/1`) instead of a file.
+pub fn check_write_target(fs: &dyn FS, path: &Path) -> io::Result<()> {
+    stat_write_target(fs, path).map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -641,7 +699,7 @@ impl<'a> CommitTx<'a> {
             if info.file_type().is_symlink() {
                 snap.link = Some(self.fs.readlink(path)?);
             }
-            match self.fs.read(path) {
+            match read_bounded(self.fs, path) {
                 Ok(data) => snap.data = Some(data),
                 Err(_) => snap.data = None,
             }

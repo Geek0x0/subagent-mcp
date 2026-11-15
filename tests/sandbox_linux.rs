@@ -17,12 +17,12 @@ use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use subagent_mcp::patch::FS;
-use subagent_mcp::sandbox::BoundDirectory;
 use subagent_mcp::sandbox::{
     A_IOCTL_DEV, A_REFER, A_RESOLVE_UNIX, A_TRUNCATE, DEVICE_FILES, HELPER_ARG, HelperArgs,
     RulesetPlan, Sandbox, available, command, command_fd, dedupe_paths, device_files, landlock_abi,
     parse_args, parse_directory_fd, plan, writable_roots,
 };
+use subagent_mcp::sandbox::{BoundDirectory, SCOPES_ALL};
 use subagent_mcp::tools::process::CommandSpec;
 use subagent_mcp::tools::shell::SandboxLauncher;
 
@@ -218,6 +218,7 @@ fn plan_abi_1_no_refer_no_truncate() {
     // RWFiles grants no directory-only rights.
     assert_eq!(p.device & subagent_mcp::sandbox::A_READ_DIR, 0);
     assert_eq!(p.handled & A_RESOLVE_UNIX, 0);
+    assert_eq!(p.scoped, 0);
 }
 
 #[test]
@@ -229,6 +230,7 @@ fn plan_abi_2_grants_refer() {
     assert_eq!(p.handled & A_REFER, A_REFER);
     assert_eq!(p.writable & A_TRUNCATE, 0);
     assert_eq!(p.handled & A_TRUNCATE, 0);
+    assert_eq!(p.scoped, 0);
 }
 
 #[test]
@@ -241,6 +243,7 @@ fn plan_abi_3_grants_truncate() {
     assert_eq!(p.device & A_TRUNCATE, A_TRUNCATE);
     assert_eq!(p.handled & A_IOCTL_DEV, 0);
     assert_eq!(p.handled & A_RESOLVE_UNIX, 0);
+    assert_eq!(p.scoped, 0);
 }
 
 #[test]
@@ -259,6 +262,17 @@ fn plan_abi_8_and_9_masks() {
 }
 
 #[test]
+fn plan_abi_6_scopes_ipc_and_signals() {
+    // ABI 6 is the first release with `scoped`; older kernels must keep the
+    // 8-byte attribute or `landlock_create_ruleset` fails with `E2BIG`.
+    assert_eq!(plan(5).scoped, 0);
+    for abi in [6, 7, 8, 9] {
+        assert_eq!(plan(abi).scoped, SCOPES_ALL, "abi {abi}");
+    }
+    assert_eq!(SCOPES_ALL, (1 << 2) - 1);
+}
+
+#[test]
 fn plan_abi_0_is_unavailable() {
     let p = plan(0);
     assert!(!p.refer);
@@ -266,6 +280,7 @@ fn plan_abi_0_is_unavailable() {
     assert_eq!(p.writable, 0);
     assert_eq!(p.readable, 0);
     assert_eq!(p.device, 0);
+    assert_eq!(p.scoped, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -635,4 +650,25 @@ fn bound_directory_check_inode_identity_and_path() {
     );
     // The held fd still reaches the original inode (now at `saved`).
     assert_eq!(fs::read(dir.path().join("marker")).unwrap(), b"original");
+}
+
+#[test]
+fn chmod_refuses_a_symlink_target() {
+    // `fchmodat` has no no-follow mode on Linux; following a symlink here would
+    // change an unrelated in-tree file's mode during a rollback.
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("root");
+    fs::create_dir(&root).unwrap();
+    let dir = BoundDirectory::open(&root).unwrap();
+    let fs: &dyn FS = dir.fs().unwrap();
+    let p = |rel: &str| dir.path().join(rel);
+
+    fs.write(&p("target.txt"), b"x", 0o644).unwrap();
+    fs.symlink(Path::new("target.txt"), &p("link")).unwrap();
+    let error = fs.chmod(&p("link"), 0o600).unwrap_err();
+    assert!(
+        error.to_string().contains("refusing to chmod a symlink"),
+        "{error}"
+    );
+    fs.chmod(&p("target.txt"), 0o600).unwrap();
 }

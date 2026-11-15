@@ -52,11 +52,15 @@ pub trait SandboxLauncher: Send + Sync {
     fn wrap(&self, spec: &mut CommandSpec);
 }
 
-/// Go `const shellScript`. Byte-for-byte identical to
-/// `internal/tools/tools.go`; keep the raw string exactly as written there.
-/// It removes configured env names/prefixes *after* bash has loaded the login
-/// profile, disables profile aliases/functions that could replace allowlisted
-/// executables, and wraps allowlisted Git reads with safe config overrides.
+/// Go `const shellScript`, with one deliberate deviation: the Git wrapper
+/// forces `--ignore-submodules=dirty` (the Go version and older releases used
+/// `all`) so submodule pointer changes remain visible in `git status` and
+/// `git diff` without entering the submodule's worktree, where its own
+/// `.git/config` filters could run. The lexer rejects every overriding
+/// abbreviation of that flag. The script removes configured env names/prefixes
+/// *after* bash has loaded the login profile, disables profile
+/// aliases/functions that could replace allowlisted executables, and wraps
+/// allowlisted Git reads with safe config overrides.
 pub const SHELL_SCRIPT: &str = r##"exact_count=$1
 prefix_count=$2
 shift 2
@@ -101,7 +105,7 @@ __subagent_mcp_safe_git() {
         "alias.$subcommand=" core.fsmonitor=false core.fsmonitorHookPath= diff.external=
         core.pager=cat core.sshCommand= credential.helper= core.hooksPath=/dev/null
         log.showSignature=false status.submoduleSummary=false submodule.recurse=false
-        diff.submodule=short interactive.diffFilter=
+        diff.submodule=short interactive.diffFilter= protocol.allow=never protocol.ext.allow=never
         gpg.program=/bin/false gpg.openpgp.program=/bin/false gpg.x509.program=/bin/false
         gpg.ssh.program=/bin/false
     )
@@ -134,12 +138,16 @@ __subagent_mcp_safe_git() {
         done <<< "$drivers"
     fi
     case "$subcommand" in
+    status|diff) set -- --ignore-submodules=dirty "$@" ;;
+    esac
+    case "$subcommand" in
     diff|show|log|blame) set -- --no-ext-diff --no-textconv "$@" ;;
     esac
     (
         local i
         export GIT_CONFIG_COUNT=${#keys[@]} GIT_CONFIG_PARAMETERS= GIT_OPTIONAL_LOCKS=0 \
-            GIT_EXTERNAL_DIFF= GIT_PAGER=cat PAGER=cat GIT_SSH= GIT_SSH_COMMAND= GIT_ASKPASS=
+            GIT_NO_LAZY_FETCH=1 GIT_EXTERNAL_DIFF= GIT_PAGER=cat PAGER=cat GIT_SSH= \
+            GIT_SSH_COMMAND= GIT_ASKPASS=
         for ((i = 0; i < ${#keys[@]}; i++)); do
             export "GIT_CONFIG_KEY_$i=${keys[i]}" "GIT_CONFIG_VALUE_$i=${vals[i]}"
         done
@@ -349,6 +357,11 @@ pub async fn run_shell(
     }
 
     let child_token = ctx.child().cancel;
+    // If this future is dropped (caller cancelled, session torn down) nothing
+    // would otherwise cancel the blocking task, so the child would lose its
+    // timeout watchdog and keep running. The guard cancels on drop, and the
+    // managed runner turns that into a process-group kill.
+    let _abort_on_drop = child_token.clone().drop_guard();
     let blocking_token = child_token.clone();
     let mut join = tokio::task::spawn_blocking(move || {
         process::run_managed_command(spec, &blocking_token, WAIT_DELAY)
@@ -359,12 +372,25 @@ pub async fn run_shell(
         TimedOut(Reason),
     }
     let outcome = tokio::select! {
-        res = &mut join => Outcome::Done(res.expect("managed command task panicked")),
+        res = &mut join => Outcome::Done(join_managed(res)),
         r = watchdog(ctx, effective, &child_token) => Outcome::TimedOut(r),
     };
     let (result, reason) = match outcome {
         Outcome::Done(r) => (r, None),
-        Outcome::TimedOut(r) => (join.await.expect("managed command task panicked"), Some(r)),
+        Outcome::TimedOut(r) => (join_managed(join.await), Some(r)),
     };
     assemble(result, effective, reason, ctx)
+}
+
+/// A runtime shutdown cancels the blocking task and the join fails; report it as
+/// an I/O error instead of panicking inside the tool.
+fn join_managed(res: Result<io::Result<Output>, tokio::task::JoinError>) -> io::Result<Output> {
+    match res {
+        Ok(result) => result,
+        Err(error) if error.is_cancelled() => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "command task cancelled",
+        )),
+        Err(error) => Err(io::Error::other(error)),
+    }
 }

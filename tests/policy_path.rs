@@ -362,6 +362,12 @@ fn git_subcommands_and_flags_match_go() {
         "git log --verify-signatures",
         "git log --submodule",
         "git log --submodule=short",
+        "git ls-files --recurse",
+        "git ls-files --recurse-submodules",
+        "git log --recurse-submodules=yes",
+        "git status --help",
+        "git log -h",
+        "git diff --help=all",
         "git log --format=%G?",
         "git show --pretty=%G",
         "git blame --ext-diff file",
@@ -387,6 +393,121 @@ fn git_subcommands_and_flags_match_go() {
         "git branch --color=always",
     ] {
         assert!(!allowed(command), "analyze_shell({command:?}) should deny");
+    }
+}
+
+/// The safe-git wrapper prepends `--ignore-submodules=dirty`, but git takes the
+/// last occurrence. parse-options resolves any unique prefix of
+/// `--ignore-submodules` and `--no-ignore-submodules`, so all abbreviations
+/// (with or without a `=value`) must be rejected for every allowed subcommand.
+#[test]
+fn git_ignore_submodules_abbreviations_are_denied() {
+    for command in [
+        "git status --ignore-submodules",
+        "git status --ignore-submodules=none",
+        "git status --ignore-submodules=untracked",
+        "git status --ignore-=none",
+        "git status --ignore-s=none",
+        "git status --ignore-su=none",
+        "git status --ignore-sub=none",
+        "git status --ignore-subm=none",
+        "git status --ignore-submodule=none",
+        "git status --ignore-s",
+        "git status --no-ignore-submodules",
+        "git status --no-ignore-=none",
+        "git status --no-ignore-s",
+        "git status --no-ignore-su=none",
+        "git status --no-ignore-sub=none",
+        "git status --no-ignore-subm=none",
+        "git status --no-ignore-submodule",
+        "git diff --ignore-submodules=none",
+        "git diff --ignore-s=none",
+        "git diff HEAD --ignore-submodules=none",
+        "git diff HEAD --ignore-su=none",
+        "git diff --no-ignore-submodules",
+        "git log --ignore-submodule=none",
+        "git show --ignore-submodules=untracked",
+        "git blame --ignore-su=none file",
+        // Ambiguous in git status, but every prefix is rejected so a different
+        // option table can never turn one of them into ignore-submodules.
+        "git status --i",
+        "git status --ignore",
+        "git status --no-i",
+        "git status --no-ignore",
+    ] {
+        assert!(!allowed(command), "analyze_shell({command:?}) should deny");
+    }
+
+    // Neighbours that merely share the "ignore-" prefix are unrelated options
+    // and must stay allowed.
+    for command in [
+        "git status --ignored",
+        "git status --ignored=matching",
+        "git status --renames",
+        "git status --untracked-files=all",
+        "git diff --ignore-all-space",
+        "git diff --ignore-space-change",
+        "git diff --ignore-space-at-eol",
+        "git diff --ignore-blank-lines",
+        "git diff --ignore-cr-at-eol",
+        "git diff --ignore-matching-lines=x",
+        "git diff --no-renames",
+        "git log --no-merges",
+        "git ls-files --ignored",
+        "git blame --ignore-rev HEAD",
+    ] {
+        assert!(allowed(command), "analyze_shell({command:?}) should allow");
+    }
+}
+
+/// `git branch --rec` and `git ls-files --rec` are accepted as unique
+/// abbreviations of `--recurse-submodules` by Git 2.43; every longer prefix
+/// recurses too. Shorter prefixes stay allowed so unrelated options such as
+/// `--reverse` and `--relative` are not caught.
+#[test]
+fn git_recurse_submodules_abbreviations_are_denied() {
+    for command in [
+        "git branch --rec",
+        "git branch --recu",
+        "git branch --recur",
+        "git branch --recurs",
+        "git branch --recurse",
+        "git branch --recurse-sub",
+        "git branch --recurse-submodules",
+        "git branch --rec=yes",
+        "git ls-files --rec",
+        "git ls-files --recu",
+        "git ls-files --recur",
+        "git ls-files --recurs",
+        "git ls-files --recurse",
+        "git ls-files --recurse-s",
+        "git ls-files --recurse-submodules",
+        "git ls-files --rec=yes",
+        "git log --recurse-submodules",
+        "git log --recurse-submodules=yes",
+        "git diff --rec",
+        "git show --recu",
+        "git status --rec",
+    ] {
+        assert!(!allowed(command), "analyze_shell({command:?}) should deny");
+    }
+
+    // `--re`/`--r` are shorter than the shortest prefix git resolves to
+    // --recurse-submodules (and select unrelated options); --reverse,
+    // --relative, --reflog and --remotes do not share a prefix with it.
+    for command in [
+        "git status --re",
+        "git status --r",
+        "git log --reverse",
+        "git log --relative-date",
+        "git log --reflog",
+        "git log --remotes",
+        "git diff --relative",
+        "git diff --reverse",
+        "git branch --remotes",
+        "git blame --reverse HEAD file",
+    ] {
+        assert!(allowed(command), "analyze_shell({command:?}) should allow");
     }
 }
 

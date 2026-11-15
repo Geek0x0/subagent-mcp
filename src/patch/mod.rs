@@ -14,7 +14,7 @@ pub mod parse;
 use std::fmt;
 use std::path::PathBuf;
 
-pub use apply::{FS, OS, commit_fs, plan_fs};
+pub use apply::{FS, MAX_PATCH_READ_BYTES, OS, check_write_target, commit_fs, plan_fs};
 pub use parse::parse_patch;
 
 /// Go `patch.Kind`. Shared by hunks and planned changes.

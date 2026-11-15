@@ -1072,3 +1072,112 @@ fn valid_aot_models_config_loads() {
     assert_eq!(p.models[0].description, "a model");
     drop(dir);
 }
+
+// --- [server] ceilings -----------------------------------------------------
+
+/// Render a path as a TOML basic string: a Windows path's backslashes are
+/// escapes there, so they have to be doubled.
+fn toml_path(path: &std::path::Path) -> String {
+    format!("\"{}\"", path.display().to_string().replace('\\', "\\\\"))
+}
+
+#[test]
+fn server_limits_are_parsed() {
+    // Absolute roots are built from a tempdir rather than hardcoded: `/srv/work`
+    // is not an absolute path on Windows, so `config::load` would reject it
+    // there.
+    let dir = tempfile::tempdir().unwrap();
+    let work = dir.path().join("work");
+    let other = dir.path().join("other");
+    let toml = format!(
+        "{AUTO_PROVIDER_TOML}\n[server]\nmax_sandbox = \"workspace-write\"\nmax_approval_policy = \"on-request\"\nallowed_cwd_roots = [{}, {}]\nscrub_env = [\"GITHUB_TOKEN\", \"AWS_*\"]\n",
+        toml_path(&work),
+        toml_path(&other)
+    );
+    let (_dir, path) = write_config(&toml);
+    let config = config::load(&path).unwrap();
+    assert_eq!(
+        config.limits.max_sandbox,
+        Some(subagent_mcp::policy::Sandbox::WorkspaceWrite)
+    );
+    assert_eq!(
+        config.limits.max_approval_policy,
+        Some(subagent_mcp::policy::ApprovalPolicy::OnRequest)
+    );
+    assert_eq!(
+        config.limits.allowed_cwd_roots,
+        vec![work.clone(), other.clone()]
+    );
+    assert_eq!(
+        config.limits.scrub_env,
+        vec!["GITHUB_TOKEN".to_string(), "AWS_*".to_string()]
+    );
+}
+
+#[test]
+fn scrub_env_rejects_a_bare_star() {
+    // `*` reduces to the empty prefix, which every environment name starts
+    // with, so the whole environment (PATH included) would be stripped.
+    let (_dir, path) = write_config(&format!(
+        "{AUTO_PROVIDER_TOML}\n[server]\nscrub_env = [\"*\"]\n"
+    ));
+    let error = config::load(&path).unwrap_err().to_string();
+    assert_eq!(
+        error.replace(&path.display().to_string(), "<PATH>"),
+        r#"config file <PATH>: server.scrub_env entry "*" is invalid; a prefix pattern must keep a non-empty prefix (for example "AWS_*")"#,
+    );
+}
+
+#[test]
+fn scrub_env_keeps_prefix_patterns() {
+    let (_dir, path) = write_config(&format!(
+        "{AUTO_PROVIDER_TOML}\n[server]\nscrub_env = [\"AWS_*\", \"GITHUB_TOKEN\"]\n"
+    ));
+    let limits = config::load(&path).unwrap().limits;
+    assert_eq!(
+        limits.scrub_env,
+        vec!["AWS_*".to_string(), "GITHUB_TOKEN".to_string()]
+    );
+}
+
+#[test]
+fn server_limits_default_to_unbounded() {
+    let (_dir, path) = write_config(AUTO_PROVIDER_TOML);
+    let limits = config::load(&path).unwrap().limits;
+    assert_eq!(limits.max_sandbox, None);
+    assert_eq!(limits.max_approval_policy, None);
+    assert!(limits.allowed_cwd_roots.is_empty());
+    assert!(limits.scrub_env.is_empty());
+}
+
+#[test]
+fn invalid_server_limits_are_rejected() {
+    let cases: Vec<(&str, &str)> = vec![
+        (
+            "[server]\nmax_sandbox = \"root\"\n",
+            r#"config file <PATH>: server.max_sandbox "root" is invalid; valid values: read-only, workspace-write, danger-full-access"#,
+        ),
+        (
+            "[server]\nmax_approval_policy = \"sometimes\"\n",
+            r#"config file <PATH>: server.max_approval_policy "sometimes" is invalid; valid values: untrusted, on-request, on-failure, never"#,
+        ),
+        (
+            "[server]\nallowed_cwd_roots = [\"relative/dir\"]\n",
+            r#"config file <PATH>: server.allowed_cwd_roots entry "relative/dir" must be an absolute path"#,
+        ),
+        (
+            "[server]\nunknown = true\n",
+            "config file <PATH>: unknown keys: server.unknown",
+        ),
+    ];
+    for (extra, expected) in cases {
+        let toml = format!("{AUTO_PROVIDER_TOML}\n{extra}");
+        let (_dir, path) = write_config(&toml);
+        let error = config::load(&path).unwrap_err().to_string();
+        assert_eq!(
+            error.replace(&path.display().to_string(), "<PATH>"),
+            expected,
+            "for {extra:?}"
+        );
+    }
+}

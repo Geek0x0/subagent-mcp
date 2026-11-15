@@ -85,6 +85,7 @@ fn config() -> Config {
             },
         )]),
         auto: None,
+        limits: Default::default(),
     }
 }
 
@@ -98,7 +99,7 @@ async fn codex_app_server_without_agent_capability_is_a_clear_error() {
     // adapter: `register_if_absent` keeps this non-agent constructor.
     factory::register(
         Api::CodexAppServer.as_str(),
-        Arc::new(|_name, _cfg, _key| Ok(Arc::new(PlainProvider) as Arc<dyn Provider>)),
+        Arc::new(|_name, _cfg| Ok(Arc::new(PlainProvider) as Arc<dyn Provider>)),
     );
 
     let tools = SubagentTools::new(

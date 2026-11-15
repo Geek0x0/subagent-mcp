@@ -202,15 +202,8 @@ fn open_layout_modes_and_line_shape() {
     _guard.set("CODEX_HOME", home.path().to_str().unwrap());
     _guard.set("SUBAGENT_MCP_ROLLOUT", "");
 
-    let mut recorder = RolloutRecorder::create(
-        "thread-1",
-        Path::new("/ignored/cwd"),
-        "ignored system prompt",
-        "ignored provider",
-        "ignored model",
-        "ignored effort",
-    )
-    .expect("recorder should be created when rollout is enabled");
+    let mut recorder = RolloutRecorder::create("thread-1")
+        .expect("recorder should be created when rollout is enabled");
 
     let path = find_rollout(home.path(), "thread-1");
 
@@ -316,14 +309,7 @@ fn disabled_when_off() {
     _guard.set("CODEX_HOME", home.path().to_str().unwrap());
     _guard.set("SUBAGENT_MCP_ROLLOUT", "off");
 
-    let result = RolloutRecorder::create(
-        "thread-off",
-        Path::new("/cwd"),
-        "sys",
-        "prov",
-        "model",
-        "high",
-    );
+    let result = RolloutRecorder::create("thread-off");
     assert!(result.is_err(), "SUBAGENT_MCP_ROLLOUT=off must disable");
     assert!(
         !home.path().join("sessions").exists(),
@@ -341,14 +327,7 @@ fn unwritable_home_returns_error() {
     _guard.set("CODEX_HOME", file.to_str().unwrap());
     _guard.set("SUBAGENT_MCP_ROLLOUT", "");
 
-    let result = RolloutRecorder::create(
-        "thread-x",
-        Path::new("/cwd"),
-        "sys",
-        "prov",
-        "model",
-        "high",
-    );
+    let result = RolloutRecorder::create("thread-x");
     assert!(result.is_err(), "CODEX_HOME as a file must disable");
 }
 
@@ -386,8 +365,7 @@ fn full_rollout_matches_go_golden() {
     ];
     let prompt = "do it";
 
-    let mut recorder =
-        RolloutRecorder::create(thread_id, &cwd, system_prompt, provider, model, effort).unwrap();
+    let mut recorder = RolloutRecorder::create(thread_id).unwrap();
     let path = find_rollout(home.path(), thread_id);
 
     // session_meta: constructed here, exactly as Go's server.go builds it
@@ -722,15 +700,7 @@ fn provider_request_error_suppresses_upstream() {
     _guard.set("CODEX_HOME", home.path().to_str().unwrap());
     _guard.set("SUBAGENT_MCP_ROLLOUT", "");
 
-    let mut recorder = RolloutRecorder::create(
-        "thread-err",
-        Path::new("/cwd"),
-        "sys",
-        "prov",
-        "model",
-        "high",
-    )
-    .unwrap();
+    let mut recorder = RolloutRecorder::create("thread-err").unwrap();
     let path = find_rollout(home.path(), "thread-err");
     recorder.record_provider_request(
         "prov",
@@ -775,15 +745,7 @@ fn sandbox_policy_writable_roots_null_vs_empty() {
     ];
     let empty: &[PathBuf] = &[];
 
-    let mut recorder = RolloutRecorder::create(
-        "thread-roots",
-        Path::new("/cwd"),
-        "sys",
-        "prov",
-        "model",
-        "high",
-    )
-    .unwrap();
+    let mut recorder = RolloutRecorder::create("thread-roots").unwrap();
     let path = find_rollout(home.path(), "thread-roots");
 
     // (label, sandbox type, roots option, expected JSON writable_roots)
@@ -854,15 +816,7 @@ fn turn_context_current_date_is_local() {
     _guard.set("CODEX_HOME", home.path().to_str().unwrap());
     _guard.set("SUBAGENT_MCP_ROLLOUT", "");
 
-    let mut recorder = RolloutRecorder::create(
-        "thread-date",
-        Path::new("/cwd"),
-        "sys",
-        "prov",
-        "model",
-        "high",
-    )
-    .unwrap();
+    let mut recorder = RolloutRecorder::create("thread-date").unwrap();
     let path = find_rollout(home.path(), "thread-date");
 
     let empty: &[PathBuf] = &[];

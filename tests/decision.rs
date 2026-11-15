@@ -202,6 +202,7 @@ fn auto_config(base: &str) -> AutoConfig {
         key: Some("test-key".to_string()),
         model: "jev-latest".to_string(),
         timeout_seconds: 5,
+        descriptions: std::collections::BTreeMap::new(),
     }
 }
 

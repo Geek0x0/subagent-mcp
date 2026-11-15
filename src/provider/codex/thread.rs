@@ -344,7 +344,7 @@ impl CodexThread {
 
         let mut last = String::new();
         let mut final_text: Option<String> = None;
-        let mut paths: HashMap<String, String> = HashMap::new();
+        let mut paths: HashMap<String, Vec<String>> = HashMap::new();
         loop {
             if self.is_closed() {
                 return Err(message_error(THREAD_CLOSED));
@@ -374,7 +374,7 @@ impl CodexThread {
             };
             if message.method.as_deref() == Some("item/started") && params.item.kind == "fileChange"
             {
-                paths.insert(params.item.id.clone(), params.item.paths().join(", "));
+                paths.insert(params.item.id.clone(), params.item.paths());
             }
             if message.method.as_deref() == Some("item/completed")
                 && params.item.kind == "agentMessage"
@@ -421,7 +421,7 @@ impl CodexThread {
         ctx: &RunContext,
         conn: &Arc<Conn>,
         message: &Message,
-        paths: &HashMap<String, String>,
+        paths: &HashMap<String, Vec<String>>,
         callbacks: &ThreadCallbacks,
     ) -> Result<(), ClientError> {
         let Some(id) = message.id.as_ref() else {
@@ -442,13 +442,13 @@ impl CodexThread {
             thread_id: self.id.clone(),
             tool: "shell".to_string(),
             command: non_empty(command),
-            path: None,
+            paths: Vec::new(),
             reason: params.reason.clone(),
         };
         if method == "item/fileChange/requestApproval" {
             request.tool = "apply_patch".to_string();
             request.command = None;
-            request.path = non_empty(paths.get(&params.item_id).cloned().unwrap_or_default());
+            request.paths = paths.get(&params.item_id).cloned().unwrap_or_default();
         }
         let client_done = conn.client.done();
         let decision = decide_approval(
@@ -867,7 +867,9 @@ async fn route_message(
             };
         }
         if !reject && let Some(active) = inner.active.as_mut() {
-            active.queue.enqueue(message.clone());
+            // A backlog overflow drops the request; reject it so the server
+            // does not wait for an answer that will never come.
+            reject = !active.queue.enqueue(message.clone());
         }
         reject
     };
@@ -1146,7 +1148,7 @@ mod tests {
                 thread_id: "thread-1".to_string(),
                 tool: "shell".to_string(),
                 command: Some("ls".to_string()),
-                path: None,
+                paths: Vec::new(),
                 reason: String::new(),
             },
             &CancellationToken::new(),

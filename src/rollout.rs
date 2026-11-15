@@ -59,19 +59,16 @@ impl RolloutRecorder {
     ///
     /// Returns `Err` when `SUBAGENT_MCP_ROLLOUT=off`, when the home directory
     /// cannot be resolved, or when the directory/file cannot be created (Go's
-    /// `Open` returns a nil/no-op recorder and logs in these cases). The extra
-    /// context arguments are the ones the server uses to build `session_meta`;
-    /// the recorder itself starts at turn records and does not consume them.
-    pub fn create(
-        thread_id: &str,
-        cwd: &Path,
-        system_prompt: &str,
-        provider: &str,
-        model: &str,
-        effort: &str,
-    ) -> Result<Self, RolloutError> {
-        let _ = (cwd, system_prompt, provider, model, effort);
+    /// `Open` returns a nil/no-op recorder and logs in these cases). Callers
+    /// use [`Self::disabled_by_env`] to tell the intentional opt-out from a
+    /// creation failure they should report.
+    pub fn create(thread_id: &str) -> Result<Self, RolloutError> {
         create_at(thread_id, SystemTime::now())
+    }
+
+    /// Whether rollout writing was disabled on purpose (`SUBAGENT_MCP_ROLLOUT=off`).
+    pub fn disabled_by_env() -> bool {
+        disabled_by_env()
     }
 
     /// Append one `{timestamp, type, payload}` line and flush it. On failure,
@@ -86,23 +83,40 @@ impl RolloutRecorder {
             "type": line_type,
             "payload": payload,
         });
-        let result: io::Result<()> = (|| {
-            // Marshal fully first (like Go's json.Marshal), then one write.
-            let mut bytes = serde_json::to_vec(&line).map_err(io::Error::other)?;
-            bytes.push(b'\n');
-            self.file.write_all(&bytes)?;
-            self.file.flush()?;
-            Ok(())
-        })();
+        // The write blocks on the filesystem. On the multi-thread runtime used
+        // by the server, run it on the blocking pool so a slow disk cannot
+        // stall a turn; `block_in_place` panics on the current-thread runtime,
+        // so the tests keep the inline path (and stay deterministic).
+        let multi_thread = tokio::runtime::Handle::try_current()
+            .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
+            .unwrap_or(false);
+        let write = |recorder: &mut Self| recorder.write_line_io(&line);
+        let result: io::Result<()> = if multi_thread {
+            tokio::task::block_in_place(|| write(self))
+        } else {
+            write(self)
+        };
         if let Err(err) = result {
             eprintln!("rollout disabled: {err}");
             self.disabled = true;
         }
     }
+
+    /// Marshal fully first (like Go's `json.Marshal`), then one write+flush.
+    fn write_line_io(&mut self, line: &Value) -> io::Result<()> {
+        let mut bytes = serde_json::to_vec(line).map_err(io::Error::other)?;
+        bytes.push(b'\n');
+        self.file.write_all(&bytes)?;
+        self.file.flush()
+    }
+}
+
+fn disabled_by_env() -> bool {
+    std::env::var("SUBAGENT_MCP_ROLLOUT").as_deref() == Ok("off")
 }
 
 fn create_at(thread_id: &str, created: SystemTime) -> Result<RolloutRecorder, RolloutError> {
-    if std::env::var("SUBAGENT_MCP_ROLLOUT").as_deref() == Ok("off") {
+    if disabled_by_env() {
         return Err(RolloutError::new(
             "rollout disabled by SUBAGENT_MCP_ROLLOUT=off",
         ));
@@ -145,10 +159,9 @@ fn codex_home() -> io::Result<PathBuf> {
     {
         return Ok(PathBuf::from(home));
     }
-    let user_home = std::env::var("HOME")
-        .or_else(|_| std::env::var("USERPROFILE"))
-        .map_err(|_| io::Error::other("resolve home directory"))?;
-    Ok(PathBuf::from(user_home).join(".codex"))
+    let user_home =
+        crate::config::user_home().ok_or_else(|| io::Error::other("resolve home directory"))?;
+    Ok(user_home.join(".codex"))
 }
 
 /// Go's `os.MkdirAll(dir, 0o700)`: every newly created component gets mode

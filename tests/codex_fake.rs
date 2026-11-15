@@ -1275,7 +1275,7 @@ async fn run_command_approval() {
             assert_eq!(got[0].tool, "shell");
             assert_eq!(got[0].command.as_deref(), Some("rm x"));
             assert_eq!(got[0].reason, "cleanup");
-            assert_eq!(got[0].path, None);
+            assert!(got[0].paths.is_empty());
         }
         let reply = reply_rx.recv().await.expect("approval reply");
         assert_eq!(
@@ -1396,7 +1396,7 @@ async fn run_file_change_approval_paths() {
     {
         let got = got.lock().unwrap();
         assert_eq!(got[0].tool, "apply_patch");
-        assert_eq!(got[0].path.as_deref(), Some("/a, /b"));
+        assert_eq!(got[0].paths, ["/a", "/b"]);
         assert_eq!(got[0].command, None);
     }
     assert_eq!(
@@ -1987,6 +1987,26 @@ async fn lost_before_first_turn() {
     assert_eq!(error.message, "codex session lost; start a new session");
     second.assert_no("thread/resume");
     second.assert_no("turn/start");
+}
+
+#[tokio::test]
+async fn pool_replaces_a_connection_closed_while_still_attached() {
+    let first = FakeCodex::new();
+    let second = FakeCodex::new();
+    let pool = fake_pool(&[first.clone(), second.clone()]);
+    let conn = with_timeout(pool.get(&ctx())).await.expect("first acquire");
+    // Closing the connection is what `failure` does after a dead transport;
+    // the pool must redial instead of handing the corpse to the next caller.
+    conn.close().await;
+    let replacement = with_timeout(pool.get(&ctx()))
+        .await
+        .expect("second acquire");
+    assert!(
+        !Arc::ptr_eq(&conn.client, &replacement.client),
+        "the closed connection must not be reused"
+    );
+    assert_eq!(replacement.generation, conn.generation + 1);
+    pool.close().await;
 }
 
 #[tokio::test]

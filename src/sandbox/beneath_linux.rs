@@ -288,6 +288,14 @@ impl FS for BoundDirectory {
 
     fn chmod(&self, path: &Path, mode: u32) -> io::Result<()> {
         let rel = self.rel(path)?;
+        // Linux `fchmodat` has no no-follow mode, so a trailing symlink would
+        // make this chmod an unrelated in-tree file. Check first and refuse.
+        if self.lstat(path)?.file_type().is_symlink() {
+            return Err(io_err(format!(
+                "refusing to chmod a symlink: {}",
+                quote(path)
+            )));
+        }
         let (parent_fd, base) = self.parent(&rel)?;
         chmodat(
             parent_fd.as_fd(),

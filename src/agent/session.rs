@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio::time::Instant;
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::agent::prompt::DEFAULT_SYSTEM_PROMPT;
@@ -86,10 +85,11 @@ pub struct ThreadAccounting {
 /// Mutable per-session state. All fields are `pub` so the runner can mutate
 /// them through a [`SessionLease`]'s `DerefMut`.
 pub struct SessionState {
-    pub messages: Vec<Message>,
+    /// Shared with in-flight `TurnRequest`s (see `TurnRequest::messages`).
+    pub messages: std::sync::Arc<Vec<Message>>,
     pub history_bytes: u64,
     pub total_usage: Usage,
-    /// Attached by Task 24, not here.
+    /// Attached by the MCP server when a session starts, not here.
     pub rollout: Option<RolloutRecorder>,
     /// Delegated-thread accounting cell, created on the first delegated run so
     /// its event callback can record usage and rollout lines while it runs. The
@@ -161,7 +161,7 @@ impl SessionManager {
             id: Uuid::new_v4().to_string(),
             options: opts,
             state: Arc::new(Mutex::new(SessionState {
-                messages: Vec::new(),
+                messages: std::sync::Arc::new(Vec::new()),
                 history_bytes: 0,
                 total_usage: Usage::default(),
                 rollout: None,
@@ -210,10 +210,31 @@ impl SessionManager {
         Ok(lease)
     }
 
-    /// Go `Manager.Close`: signal shutdown, drop every session from the table,
-    /// release bound directories, and close provider threads.
-    pub async fn close(&self, cancel: &CancellationToken) {
-        cancel.cancel();
+    /// Close one session by id. The server uses it when a `start` request
+    /// created a session but could not acquire its lease, so the provider
+    /// thread is not left running with no way to reach it.
+    pub async fn close_one(&self, id: &str) {
+        let session = {
+            let mut map = self.sessions.lock().await;
+            map.remove(id)
+        };
+        let Some(session) = session else {
+            return;
+        };
+        if let Ok(mut guard) = session.state.clone().try_lock_owned() {
+            guard.bound_cwd = None;
+            guard.bound_roots.clear();
+            guard.bind_err = Some("session is closed".to_string());
+            guard.root_paths.clear();
+        }
+        if let Some(thread) = &session.options.thread {
+            let _ = thread.close().await;
+        }
+    }
+
+    /// Go `Manager.Close`: drop every session from the table, release bound
+    /// directories, and close provider threads.
+    pub async fn close(&self) {
         let sessions: Vec<Arc<Session>> = {
             let mut map = self.sessions.lock().await;
             map.drain().map(|(_, s)| s).collect()

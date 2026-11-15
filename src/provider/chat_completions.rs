@@ -18,12 +18,16 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use reqwest::Url;
 use reqwest::header::{
     ACCEPT, AUTHORIZATION, CACHE_CONTROL, CONNECTION, CONTENT_TYPE, HeaderMap, HeaderValue,
+    LOCATION,
 };
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 
 use crate::config::ProviderConfig;
-use crate::provider::transport::PooledClient;
+use crate::provider::sse::SSE_MAX_LINE;
+use crate::provider::transport::{
+    MAX_SERVER_RETRY_DELAY, PooledClient, drain_error_body, parse_retry_after,
+};
 use crate::provider::{
     DeltaSink, ModelInfo, ModelLister, Provider, ProviderError, Role, ToolCall, ToolSpec,
     TransportKind, TurnRequest, TurnResult, Usage,
@@ -373,7 +377,14 @@ impl ToolCallAssembler {
     fn position_for(&mut self, entry: &WireToolCallChunk) -> usize {
         if let Some(index) = entry.index {
             if let Some(&pos) = self.index_pos.get(&index) {
-                return pos;
+                // The index is only a stream position, not an identity: a
+                // provider that reuses it for a different id starts a new call
+                // instead of appending one call's arguments to another.
+                let existing = &self.calls[pos].call.id;
+                if entry.id.is_empty() || existing.is_empty() || *existing == entry.id {
+                    return pos;
+                }
+                return self.append(index);
             }
             return self.append(index);
         }
@@ -441,7 +452,12 @@ impl ToolCallAssembler {
 // --- Setup retry loop ------------------------------------------------------
 
 enum SetupError {
-    Status { status: u16, message: String },
+    Status {
+        status: u16,
+        message: String,
+        /// Server-requested retry delay (`Retry-After`), already bounded.
+        retry_after: Option<Duration>,
+    },
     Connection(String),
     Context(&'static str),
 }
@@ -463,7 +479,9 @@ impl SetupError {
 
     fn into_error(self) -> ProviderError {
         match self {
-            SetupError::Status { status, message } => ProviderError {
+            SetupError::Status {
+                status, message, ..
+            } => ProviderError {
                 message: format!("chat completions: HTTP {status}: {message}"),
             },
             SetupError::Connection(message) => ProviderError { message },
@@ -474,11 +492,29 @@ impl SetupError {
     }
 }
 
-/// Go `isFailureStatusCode`: anything below 200 or at/above 400. A 3xx is not a
-/// failure for the stream setup (the client follows redirects; a bodiless 3xx
-/// then reads as an empty stream).
+/// Go `isFailureStatusCode` widened to every non-2xx status: the shared client
+/// does not follow redirects (`redirect::Policy::none()`), so a 3xx reaches the
+/// adapter with a redirect body. Treating it as a stream would parse that body
+/// as SSE and report a truncated stream instead of the HTTP status.
 fn is_failure_status(status: u16) -> bool {
-    !(200..400).contains(&status)
+    !(200..300).contains(&status)
+}
+
+/// Text for a 3xx reply, appended to the `HTTP <status>` prefix: the client
+/// never follows a redirect, so the caller needs the `Location` the server
+/// offered (when it sent one) instead of a body-parsing failure.
+fn redirect_message(location: Option<&str>, body: &str) -> String {
+    let mut message = String::from("redirects are not followed");
+    match location {
+        Some(location) => message.push_str(&format!("; Location: {location}")),
+        None => message.push_str("; no Location header"),
+    }
+    let body = body.trim();
+    if !body.is_empty() {
+        message.push_str("; body: ");
+        message.push_str(body);
+    }
+    message
 }
 
 fn context_ended(ctx: &RunContext) -> Option<&'static str> {
@@ -511,32 +547,6 @@ async fn wait_for_backoff(ctx: &RunContext, delay: Duration) -> Result<(), &'sta
     }
 }
 
-/// Drain a failed response's error body under the run context. Go reads the
-/// body with `io.ReadAll` on a ctx-bound request, so cancellation or the
-/// deadline aborts the read; without that bound an unterminated 429/5xx body
-/// would hang the turn forever. Returns the context reason when the run ends
-/// before the body does.
-async fn drain_error_body(
-    ctx: &RunContext,
-    mut response: PooledResponse,
-) -> Result<String, &'static str> {
-    let mut buf = Vec::new();
-    loop {
-        tokio::select! {
-            chunk = response.chunk() => match chunk {
-                Ok(Some(bytes)) => buf.extend_from_slice(&bytes),
-                // A read error ends the drain the way Go's `io.ReadAll` does;
-                // the status classification still comes from the HTTP status.
-                Ok(None) | Err(_) => break,
-            },
-            _ = ctx.cancel.cancelled() => return Err("context canceled"),
-            _ = wait_deadline(ctx.deadline) => return Err("context deadline exceeded"),
-        }
-    }
-    response.close().await;
-    Ok(String::from_utf8_lossy(&buf).into_owned())
-}
-
 /// go-openai's `ReasoningValidator` (`reasoning_validator.go`): the SDK rejects
 /// a `max_tokens` on an `o1*`/`o3*`/`o4*`/`gpt-5*` model before any request is
 /// sent, with `ErrReasoningModelMaxTokensDeprecated` surfaced unwrapped. The
@@ -558,6 +568,14 @@ fn reasoning_model_guard(model: &str, max_tokens: Option<i64>) -> Result<(), Pro
 // Alias kept short for the retry helpers.
 type PooledResponse = crate::provider::transport::PooledResponse;
 
+/// The error go-openai's `bufio.Scanner` reports when a single SSE line
+/// exceeds its buffer; mirrored so an unbounded line cannot exhaust memory.
+fn line_too_long() -> ProviderError {
+    ProviderError {
+        message: "bufio.Scanner: token too long".to_string(),
+    }
+}
+
 // --- Chat-completions SSE framer (go-openai stream_reader.go) --------------
 
 /// Trim exactly Go's regexp `\s` (`[\t\n\f\r ]`) after the `data:` prefix; the
@@ -568,9 +586,13 @@ fn trim_sse_space(text: &str) -> &str {
 }
 
 /// Line-based framer: one event per `^data:\s*` line, no blank-line
-/// requirement, no fixed line cap.
+/// requirement, and a 32 MiB cap on a single line.
 struct LineFramer {
     buf: Vec<u8>,
+    /// How much of `buf` has already been searched for a newline. Without it
+    /// the unterminated-line scan restarts from the front on every chunk,
+    /// making a long line quadratic.
+    scan_from: usize,
     eof: bool,
     empty_messages: usize,
 }
@@ -579,6 +601,7 @@ impl LineFramer {
     fn new() -> Self {
         Self {
             buf: Vec::new(),
+            scan_from: 0,
             eof: false,
             empty_messages: 0,
         }
@@ -639,22 +662,37 @@ impl LineFramer {
         response: &mut PooledResponse,
     ) -> Result<Option<Vec<u8>>, ProviderError> {
         loop {
-            if let Some(pos) = self.buf.iter().position(|&byte| byte == b'\n') {
+            if let Some(offset) = self.buf[self.scan_from..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+            {
+                let pos = self.scan_from + offset;
+                if pos > SSE_MAX_LINE {
+                    return Err(line_too_long());
+                }
                 let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
                 line.pop(); // trailing '\n'
                 if line.last() == Some(&b'\r') {
                     line.pop();
                 }
+                self.scan_from = 0;
                 return Ok(Some(line));
+            }
+            if self.buf.len() > SSE_MAX_LINE {
+                return Err(line_too_long());
             }
             if self.eof {
                 // go-openai's `ReadBytes('\n')` returns io.EOF for a final line
                 // with no newline; that partial line is not delivered.
                 self.buf.clear();
+                self.scan_from = 0;
                 return Ok(None);
             }
             match response.chunk().await? {
-                Some(bytes) => self.buf.extend_from_slice(&bytes),
+                Some(bytes) => {
+                    self.scan_from = self.buf.len();
+                    self.buf.extend_from_slice(&bytes);
+                }
                 None => self.eof = true,
             }
         }
@@ -678,22 +716,13 @@ impl ChatCompletions {
     /// Build a chat-completions adapter, resolving the API key from `cfg.key`
     /// or, when that is empty, the environment variable named by `cfg.env_key`.
     pub fn new(name: &str, cfg: &ProviderConfig) -> Result<Self, ProviderError> {
-        let api_key = match cfg.key.as_deref().filter(|key| !key.is_empty()) {
-            Some(key) => key.to_string(),
-            None => {
-                let env_key = cfg.env_key.clone().unwrap_or_default();
-                match std::env::var(&env_key) {
-                    Ok(value) if !value.is_empty() => value,
-                    _ => {
-                        return Err(ProviderError {
-                            message: format!(
-                                "environment variable {env_key} (providers.{name}.env_key) must be set to the API key"
-                            ),
-                        });
-                    }
-                }
-            }
-        };
+        let api_key = crate::config::api_key(cfg.key.as_deref(), cfg.env_key.as_deref())
+            .ok_or_else(|| ProviderError {
+                message: format!(
+                    "environment variable {} (providers.{name}.env_key) must be set to the API key",
+                    cfg.env_key.as_deref().unwrap_or("")
+                ),
+            })?;
         Ok(Self {
             name: name.to_string(),
             client: PooledClient::from_config(TransportKind::ChatCompletions, cfg)?,
@@ -740,7 +769,7 @@ impl ChatCompletions {
                 ..Default::default()
             });
         }
-        for message in &req.messages {
+        for message in req.messages.iter() {
             match message.role {
                 Role::User => messages.push(WireMessage {
                     role: "user".into(),
@@ -811,10 +840,10 @@ impl ChatCompletions {
         ctx: &RunContext,
         url: &Url,
         headers: &HeaderMap,
-        body: &[u8],
+        body: &bytes::Bytes,
     ) -> Result<PooledResponse, SetupError> {
         let response = tokio::select! {
-            response = self.client.execute_json(url.clone(), headers.clone(), body) => {
+            response = self.client.execute_json(url.clone(), headers.clone(), body.clone()) => {
                 response.map_err(|error| SetupError::Connection(error.message))?
             }
             _ = ctx.cancel.cancelled() => return Err(SetupError::Context("context canceled")),
@@ -824,11 +853,31 @@ impl ChatCompletions {
         };
         let status = response.status().map_or(0, |status| status.as_u16());
         if is_failure_status(status) {
-            let message = match drain_error_body(ctx, response).await {
+            // Read the delay before the body is consumed, and honor it on the
+            // next attempt (Go's SDK does not, but a gateway 429 is explicit).
+            let retry_after = response.headers().and_then(parse_retry_after);
+            // The drained body replaces the stream; a redirect's `Location` is
+            // the part of that body worth surfacing. `is_retryable` never
+            // retries a 3xx, so the hint cannot outlive this attempt.
+            let location = response
+                .headers()
+                .and_then(|headers| headers.get(LOCATION))
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string);
+            let message = match drain_error_body(Some(ctx), response).await {
                 Ok(message) => message,
                 Err(reason) => return Err(SetupError::Context(reason)),
             };
-            return Err(SetupError::Status { status, message });
+            let message = if (300..400).contains(&status) {
+                redirect_message(location.as_deref(), &message)
+            } else {
+                message
+            };
+            return Err(SetupError::Status {
+                status,
+                message,
+                retry_after,
+            });
         }
         Ok(response)
     }
@@ -838,7 +887,7 @@ impl ChatCompletions {
         ctx: &RunContext,
         url: &Url,
         headers: &HeaderMap,
-        body: &[u8],
+        body: &bytes::Bytes,
     ) -> Result<PooledResponse, ProviderError> {
         for attempt in 0..MAX_ATTEMPTS {
             if let Some(reason) = context_ended(ctx) {
@@ -853,7 +902,13 @@ impl ChatCompletions {
                     if attempt + 1 >= MAX_ATTEMPTS || !retryable {
                         return Err(error.into_error());
                     }
-                    let delay = (self.backoff)(attempt);
+                    let delay = match &error {
+                        SetupError::Status {
+                            retry_after: Some(delay),
+                            ..
+                        } => (*delay).min(MAX_SERVER_RETRY_DELAY),
+                        _ => (self.backoff)(attempt),
+                    };
                     if let Err(reason) = wait_for_backoff(ctx, delay).await {
                         return Err(ProviderError {
                             message: reason.to_string(),
@@ -871,7 +926,7 @@ impl ChatCompletions {
         req: TurnRequest,
         mut on_delta: DeltaSink,
     ) -> Result<TurnResult, ProviderError> {
-        let body = self.build_body(&req)?;
+        let body = bytes::Bytes::from(self.build_body(&req)?);
         // go-openai validates the request inside `CreateChatCompletionStream`
         // before it builds or sends anything, so this guard runs after the
         // tool-schema checks and before the retry loop (including its
@@ -1046,5 +1101,37 @@ impl ModelLister for ChatCompletions {
             }
         }
         Ok(models)
+    }
+}
+
+#[cfg(test)]
+mod assembler_tests {
+    use super::{ToolCallAssembler, WireFunctionChunk, WireToolCallChunk};
+
+    fn chunk(index: i64, id: &str, name: &str, arguments: &str) -> WireToolCallChunk {
+        WireToolCallChunk {
+            index: Some(index),
+            id: id.to_string(),
+            function: WireFunctionChunk {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn a_reused_index_with_a_new_id_starts_a_new_call() {
+        // Some servers restart their index counter mid-stream; keying only on
+        // the index would append one call's arguments to another's.
+        let mut assembler = ToolCallAssembler::new();
+        assembler.add(&chunk(0, "call_a", "shell", "{\"command\":"));
+        assembler.add(&chunk(0, "call_a", "", "\"ls\"}"));
+        assembler.add(&chunk(0, "call_b", "get_weather", "{\"city\":\"Oslo\"}"));
+        let calls = assembler.result().unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].id, "call_a");
+        assert_eq!(calls[0].arguments, "{\"command\":\"ls\"}");
+        assert_eq!(calls[1].id, "call_b");
+        assert_eq!(calls[1].arguments, "{\"city\":\"Oslo\"}");
     }
 }

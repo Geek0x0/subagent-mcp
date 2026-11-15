@@ -67,20 +67,14 @@ pub struct Built {
 /// blank-import `init` functions; the explicit table keeps `check` independent
 /// of the MCP server wiring owned by Tasks 24/25B.
 pub trait AdapterFactory {
-    fn build(&self, name: &str, config: &ProviderConfig, key: &str)
-    -> Result<Built, ProviderError>;
+    fn build(&self, name: &str, config: &ProviderConfig) -> Result<Built, ProviderError>;
 }
 
 /// The production factory: build the concrete adapter for `config.api`.
 pub struct ProductionFactory;
 
 impl AdapterFactory for ProductionFactory {
-    fn build(
-        &self,
-        name: &str,
-        config: &ProviderConfig,
-        _key: &str,
-    ) -> Result<Built, ProviderError> {
+    fn build(&self, name: &str, config: &ProviderConfig) -> Result<Built, ProviderError> {
         match config.api {
             Api::ChatCompletions => {
                 let adapter = Arc::new(ChatCompletions::new(name, config)?);
@@ -190,6 +184,31 @@ pub fn run_to<W: Write>(out: &mut W, config: &Config, live: bool) -> i32 {
     run_with(out, config, live, &ProductionFactory)
 }
 
+/// `http://` to anything but loopback sends the API key and prompts in the
+/// clear. Configuration is still usable (a local gateway may need it), so this
+/// is a warning, not a failure.
+fn warn_if_cleartext<W: Write>(out: &mut W, name: &str, base_url: &str) {
+    let Ok(url) = reqwest::Url::parse(base_url) else {
+        return;
+    };
+    if url.scheme() != "http" {
+        return;
+    }
+    let host = url.host_str().unwrap_or_default();
+    let loopback = host == "localhost"
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !loopback {
+        let _ = writeln!(
+            out,
+            "warning  provider {name}: base_url uses cleartext http to {host}; the API key and prompts are not encrypted"
+        );
+    }
+}
+
 /// [`run_to`] with an explicit adapter factory (the test seam).
 pub fn run_with<W: Write, F: AdapterFactory + ?Sized>(
     out: &mut W,
@@ -233,6 +252,7 @@ async fn run_async<W: Write, F: AdapterFactory + ?Sized>(
     // BTreeMap iterates in sorted name order, matching Go's sort.Strings.
     for (name, provider) in &config.providers {
         let _ = writeln!(out, "provider {name} ({})", provider.api.as_str());
+        warn_if_cleartext(out, name, &provider.base_url);
 
         if provider.api == Api::CodexAppServer {
             let (auth_ok, check_failed) = check_codex(out, name, provider, live, factory).await;
@@ -246,7 +266,7 @@ async fn run_async<W: Write, F: AdapterFactory + ?Sized>(
         }
 
         // Never print the key itself, only where it comes from.
-        let key = if let Some(key) = provider.key.as_deref().filter(|key| !key.is_empty()) {
+        let _key = if let Some(key) = provider.key.as_deref().filter(|key| !key.is_empty()) {
             let _ = writeln!(out, "  key    config file   set");
             key.to_string()
         } else {
@@ -268,7 +288,7 @@ async fn run_async<W: Write, F: AdapterFactory + ?Sized>(
         };
         checked += 1;
 
-        let built = match factory.build(name, provider, &key) {
+        let built = match factory.build(name, provider) {
             Ok(built) => built,
             Err(error) => {
                 let _ = writeln!(out, "  api    {}   FAIL: {error}", provider.base_url);
@@ -386,7 +406,7 @@ async fn check_codex<W: Write, F: AdapterFactory + ?Sized>(
     live: bool,
     factory: &F,
 ) -> (bool, bool) {
-    let built = match factory.build(name, provider, "") {
+    let built = match factory.build(name, provider) {
         Ok(built) => built,
         Err(error) => {
             let _ = writeln!(out, "  auth   FAIL: {error}");
@@ -519,7 +539,7 @@ async fn round_trip_inner(provider: &dyn Provider, model: &str) -> Result<(), Pr
             TurnRequest {
                 model: model.to_string(),
                 effort: Some("low".to_string()),
-                messages: history.clone(),
+                messages: std::sync::Arc::new(history.clone()),
                 tools: tools.clone(),
                 ..Default::default()
             },
@@ -554,7 +574,7 @@ async fn round_trip_inner(provider: &dyn Provider, model: &str) -> Result<(), Pr
             TurnRequest {
                 model: model.to_string(),
                 effort: Some("low".to_string()),
-                messages: history,
+                messages: std::sync::Arc::new(history),
                 tools,
                 ..Default::default()
             },
@@ -637,4 +657,31 @@ impl Approver for DenyApprover {
 fn round_millis(duration: Duration) -> String {
     let millis = (duration.as_nanos() + 500_000) / 1_000_000;
     format_go_duration(Duration::from_millis(millis as u64))
+}
+
+#[cfg(test)]
+mod cleartext_tests {
+    use super::warn_if_cleartext;
+
+    fn warning(base_url: &str) -> String {
+        let mut out = Vec::new();
+        warn_if_cleartext(&mut out, "acme", base_url);
+        String::from_utf8(out).unwrap()
+    }
+
+    #[test]
+    fn remote_cleartext_is_reported() {
+        assert_eq!(
+            warning("http://api.example.com/v1"),
+            "warning  provider acme: base_url uses cleartext http to api.example.com; the API key and prompts are not encrypted\n"
+        );
+    }
+
+    #[test]
+    fn loopback_and_https_are_silent() {
+        assert!(warning("http://127.0.0.1:8080").is_empty());
+        assert!(warning("http://[::1]:8080").is_empty());
+        assert!(warning("http://localhost:11434").is_empty());
+        assert!(warning("https://api.example.com/v1").is_empty());
+    }
 }

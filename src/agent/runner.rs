@@ -166,7 +166,7 @@ pub fn message_size(m: &Message) -> u64 {
 /// step. All state mutation flows through the lease's `DerefMut`.
 pub fn append_message(lease: &mut SessionLease, msg: Message) {
     lease.history_bytes += message_size(&msg);
-    lease.messages.push(msg);
+    std::sync::Arc::make_mut(&mut lease.messages).push(msg);
 }
 
 /// Go `truncateMessages`: drop entries from `n` onwards and roll the byte
@@ -175,7 +175,7 @@ pub fn append_message(lease: &mut SessionLease, msg: Message) {
 pub fn truncate_messages(lease: &mut SessionLease, n: usize) {
     let removed: u64 = lease.messages[n..].iter().map(message_size).sum();
     lease.history_bytes -= removed;
-    lease.messages.truncate(n);
+    std::sync::Arc::make_mut(&mut lease.messages).truncate(n);
 }
 
 /// Go `budgetError`: report the first spent ceiling before a turn costs
@@ -544,7 +544,7 @@ impl Runner {
                 model: model.clone(),
                 effort: effort_sent.clone(),
                 system: system.clone(),
-                messages: lease.messages.clone(),
+                messages: std::sync::Arc::clone(&lease.messages),
                 tools: self.executor.tools(),
             };
             let sink = Arc::clone(&coalescer);

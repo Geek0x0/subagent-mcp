@@ -48,7 +48,7 @@ use windows_sys::Win32::System::JobObjects::{
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Pipes::CreatePipe;
+use windows_sys::Win32::System::Pipes::{CreatePipe, PeekNamedPipe};
 use windows_sys::Win32::System::Threading::{
     CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
     EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, InitializeProcThreadAttributeList,
@@ -146,29 +146,35 @@ impl WindowsChild {
     }
 
     /// Wait for the process to exit (honouring cancellation) and drain the shared
-    /// output pipe within one `wait_delay` deadline. Returns the
-    /// exit status, the capped/merged/marked bytes, and whether cancellation
-    /// killed a still-live child.
+    /// output pipe within one `wait_delay` deadline. When that deadline expires
+    /// the reader is told to stop and the call waits up to `READER_STOP_TIMEOUT`
+    /// for it to exit, so the thread and its read handle are released rather than
+    /// abandoned. Returns the exit status, the capped/merged/marked bytes, and
+    /// whether cancellation killed a still-live child.
     pub fn wait(
         &mut self,
         cancel: &CancellationToken,
         wait_delay: Duration,
     ) -> io::Result<(ExitStatus, Vec<u8>, bool)> {
         let limited = Arc::new(Mutex::new(LimitedBuffer::new()));
+        // Set once the pipe drain deadline has expired: the reader polls it
+        // between peeks, so it can be released without any I/O cancellation.
         let stop = Arc::new(AtomicBool::new(false));
-        // The read ends live in shared slots so they can be dropped on
-        // WaitDelay expiry (closing the pipe handles) while readers run.
-        let out_slot = Arc::new(Mutex::new(self.stdout_read.take().map(into_file)));
 
         // A single recv_timeout bounds inherited-pipe drain. The reader drops
         // its done_tx on exit so done_rx reports Disconnected.
         let (done_tx, done_rx) = mpsc::channel::<()>();
-        spawn_reader(
-            Arc::clone(&out_slot),
-            Arc::clone(&limited),
-            Arc::clone(&stop),
-            done_tx.clone(),
-        );
+        // The reader owns the read end for its whole life and never blocks in a
+        // `ReadFile` (it peeks first), so `stop` can always release it -- even
+        // when a descendant holds the write end (see `spawn_reader`).
+        if let Some(reader) = self.stdout_read.take().map(into_file) {
+            spawn_reader(
+                reader,
+                Arc::clone(&limited),
+                Arc::clone(&stop),
+                done_tx.clone(),
+            );
+        }
         drop(done_tx);
 
         // Mirror Task 17: only kill a STILL-LIVE child on cancellation. A cancel
@@ -192,11 +198,16 @@ impl WindowsChild {
 
         // One deadline for process-exit pipe drain.
         let _ = done_rx.recv_timeout(wait_delay);
+        // WaitDelay expiry (a surviving descendant still holds the write end, so
+        // EOF never arrives) or any other path where the reader is still
+        // draining: set `stop`, which the reader observes within one poll
+        // interval. It then closes the read handle and exits, so waiting for that
+        // (bounded) releases the thread and its handle instead of abandoning
+        // them. When the reader already exited on EOF this returns immediately
+        // (Disconnected).
         stop.store(true, Ordering::SeqCst);
+        let _ = done_rx.recv_timeout(READER_STOP_TIMEOUT);
         drop(done_rx);
-        if let Ok(mut slot) = out_slot.try_lock() {
-            *slot = None;
-        }
 
         // Never discard captured bytes on timeout; they travel with the
         // cancellation error (I-4) or the success Output.
@@ -244,6 +255,88 @@ impl Drop for WindowsChild {
     }
 }
 
+/// Serializes the process-global inheritable-handle window opened by
+/// [`InheritWindow`] against every other Windows spawn in this process that
+/// inherits handles without an explicit handle list.
+static SPAWN_INHERIT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Proof that [`SPAWN_INHERIT_LOCK`] is held; released on drop.
+///
+/// [`InheritWindow`] holds one for the whole mark-inheritable -> spawn -> reset
+/// window. Every other spawn that does not pass a handle list must hold one
+/// around its spawn call, or it can create its child while the shell's pipe
+/// write end is inheritable and inherit that write end. The codex app-server dial
+/// (`crate::provider::codex::pool`) is such a spawn; it is the only other one in
+/// this crate. Hold this guard across the spawn call only -- never across a wait
+/// for a child, or a shell call would be stuck behind a live child.
+pub(crate) struct SpawnGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+/// Take [`SPAWN_INHERIT_LOCK`] for one spawn. A poisoned lock is reused: the
+/// guard protects no data, only the timing window.
+pub(crate) fn spawn_guard() -> SpawnGuard {
+    SpawnGuard {
+        _lock: SPAWN_INHERIT_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    }
+}
+
+/// Marks the child's inherited handles as inheritable for exactly the duration
+/// of one `CreateProcessW` call, and restores them on every exit path.
+///
+/// Handle inheritance is process-global: while `HANDLE_FLAG_INHERIT` is set, any
+/// concurrent spawn without an explicit handle list would inherit our pipe write
+/// end. That keeps the write end open after the child exits, so the reader never
+/// sees EOF and the runtime burns a full `wait_delay` per call. The window is
+/// therefore taken under [`SPAWN_INHERIT_LOCK`], and every such spawn in this
+/// crate takes the same lock via [`spawn_guard`], so none can overlap it. `Drop`
+/// resets the flags and releases the lock even when setup fails midway.
+struct InheritWindow {
+    guard: Option<SpawnGuard>,
+    handles: [HANDLE; 2],
+    marked: usize,
+}
+
+impl InheritWindow {
+    fn new(handles: [HANDLE; 2]) -> io::Result<Self> {
+        let mut window = Self {
+            guard: Some(spawn_guard()),
+            handles,
+            marked: 0,
+        };
+        for (index, &handle) in handles.iter().enumerate() {
+            // SAFETY: handle is a valid handle we own; marking it inheritable is
+            // required for the PROC_THREAD_ATTRIBUTE_HANDLE_LIST attribute.
+            if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) }
+                == 0
+            {
+                window.marked = index;
+                return Err(io::Error::last_os_error());
+            }
+            window.marked = index + 1;
+        }
+        Ok(window)
+    }
+
+    /// Restore the inherit flags and release the spawn lock.
+    fn close(&mut self) {
+        for &handle in &self.handles[..self.marked] {
+            // SAFETY: handle is a valid handle we own.
+            let _ = unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) };
+        }
+        self.marked = 0;
+        self.guard = None;
+    }
+}
+
+impl Drop for InheritWindow {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 /// All raw handles created during setup. `OwnedHandle` closes each on drop, so
 /// any early `?` / error return leaks nothing.
 struct Handles {
@@ -275,13 +368,15 @@ fn spawn_child(spec: &CommandSpec) -> io::Result<WindowsChild> {
     // write end. The PROC_THREAD_ATTRIBUTE_HANDLE_LIST below
     // restricts inheritance to exactly them even though bInheritHandles=TRUE.
     let child_handles: [HANDLE; 2] = [stdin.as_raw_handle(), stdout_write.as_raw_handle()];
-    for &h in &child_handles {
-        // SAFETY: h is a valid handle we own; marking it inheritable is required
-        // for the PROC_THREAD_ATTRIBUTE_HANDLE_LIST attribute.
-        if unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
+
+    // The inheritable window is process-global: a concurrent spawn that does not
+    // pass an explicit handle list would otherwise inherit our pipe write end,
+    // keep it open past its child's exit, and stall our reader. `InheritWindow`
+    // holds the process-wide spawn lock across mark-inheritable -> CreateProcessW
+    // -> reset, and the only other Windows spawn in this crate (the codex
+    // app-server dial) takes the same lock, so the two cannot overlap. The flags
+    // are restored on every exit path, including errors.
+    let mut inherit = InheritWindow::new(child_handles)?;
 
     let job = create_job()?;
     let mut attr_list = ProcThreadAttributeList::new(&child_handles)?;
@@ -323,12 +418,11 @@ fn spawn_child(spec: &CommandSpec) -> io::Result<WindowsChild> {
         return Err(io::Error::other("CreateProcessW returned invalid handles"));
     }
 
-    // Restore the inherit flags (the handles are closed below; this also avoids
-    // leaking inheritable handles into any later CreateProcessW in this process).
-    for &h in &child_handles {
-        // SAFETY: h is a valid handle we own.
-        let _ = unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
-    }
+    // Close the inheritable window as soon as the child exists: reset the
+    // inherit flags and release the process-wide spawn lock so a waiting spawn
+    // (the codex dial) can proceed. Doing it before the job assignment also keeps
+    // the critical section short.
+    inherit.close();
 
     // SAFETY: CreateProcessW succeeded and the handles are ours to close.
     let h = Handles {
@@ -533,7 +627,7 @@ fn create_job() -> io::Result<OwnedHandle> {
     Ok(job)
 }
 
-/// Convert an owned pipe read handle into a `File` so the reader threads can
+/// Convert an owned pipe read handle into a `File` so the reader thread can
 /// use the standard `Read` implementation (and own/close the handle).
 fn into_file(h: OwnedHandle) -> File {
     // SAFETY: h is a valid pipe read handle we own; File takes ownership and
@@ -541,12 +635,38 @@ fn into_file(h: OwnedHandle) -> File {
     unsafe { File::from_raw_handle(h.into_raw_handle()) }
 }
 
-/// Drain one pipe read end into the shared capped buffer. The read end is held
-/// only for a single chunk at a time and dropped when the loop ends (or when
-/// the main thread takes it on WaitDelay expiry). `done_tx` stays alive for the
-/// thread's whole lifetime so dropping it signals `done_rx`.
-fn spawn_reader<R: Read + Send + 'static>(
-    slot: Arc<Mutex<Option<R>>>,
+/// How often the reader peeks at the pipe while it is idle. Data that is
+/// already buffered is read immediately (no sleep), so this only bounds how long
+/// new output waits and how long `stop` takes to be observed.
+const PIPE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long `wait` waits for the reader to exit after setting `stop`: one poll
+/// interval plus the time to drain what was already buffered, i.e. still inside
+/// the `wait_delay + 300 ms` bound the Windows WaitDelay test asserts. Bounded,
+/// so a reader that somehow never comes back cannot hold the call.
+const READER_STOP_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Drain the pipe read end into the shared capped buffer until EOF, or until
+/// `stop` is set.
+///
+/// The handle is owned here for the thread's whole lifetime and closed when the
+/// loop ends. Nothing here may block in `ReadFile` -- that is what makes the
+/// thread releasable on WaitDelay expiry, when a surviving descendant still holds
+/// the write end and EOF never arrives: this crate's enabled `windows-sys`
+/// features have no I/O cancellation (`CancelSynchronousIo`/`CancelIoEx` live
+/// behind `Win32_System_IO`), and closing the handle from the waiting thread
+/// would not unblock a `ReadFile` already in progress. So the loop peeks:
+/// `PeekNamedPipe` does not block, reports how many bytes are already buffered
+/// (0 when none have arrived yet), and fails once every write end is closed.
+/// A read is issued for at most the peeked byte count, which is exactly what is
+/// available, so it returns without waiting for more output.
+///
+/// Draining is not cut short: a pipe whose writers are gone but which still holds
+/// buffered data reports that data first, so the loop reads it before the peek
+/// starts failing, and only then is the failure treated as EOF. `done_tx` stays
+/// alive for the thread's whole lifetime so dropping it signals `done_rx`.
+fn spawn_reader(
+    mut reader: File,
     limited: Arc<Mutex<LimitedBuffer>>,
     stop: Arc<AtomicBool>,
     done_tx: mpsc::Sender<()>,
@@ -558,18 +678,32 @@ fn spawn_reader<R: Read + Send + 'static>(
             if stop.load(Ordering::SeqCst) {
                 break;
             }
-            // Scope the slot guard so it is released before locking `limited`
-            // (no lock-order inversion), even while a read is in progress.
-            let result = {
-                let Ok(mut guard) = slot.lock() else {
-                    break;
-                };
-                let Some(r) = guard.as_mut() else {
-                    break;
-                };
-                r.read(&mut chunk)
+            let mut available: u32 = 0;
+            // SAFETY: `reader` owns a live pipe read handle for the whole loop;
+            // the null buffer/out-params are the documented "count only" form of
+            // the call, and `available` is a valid u32 out-param.
+            let ok = unsafe {
+                PeekNamedPipe(
+                    reader.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
             };
-            match result {
+            if ok == 0 {
+                // ERROR_BROKEN_PIPE (every write end closed, buffer drained) or
+                // an unusable handle: there is nothing left to read.
+                break;
+            }
+            if available == 0 {
+                std::thread::sleep(PIPE_POLL_INTERVAL);
+                continue;
+            }
+            // Never ask for more than the peek reported, so this cannot block.
+            let want = (available as usize).min(chunk.len());
+            match reader.read(&mut chunk[..want]) {
                 Ok(0) => break,
                 Ok(n) => limited.lock().unwrap().push(&chunk[..n]),
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,

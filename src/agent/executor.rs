@@ -32,7 +32,7 @@
 
 use std::any::Any;
 use std::panic::AssertUnwindSafe;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +45,7 @@ use crate::agent::Emitter;
 use crate::agent::runner::{CANCELLED_TOOL_RESULT, RunHooks, ToolExecutor, ToolResult};
 use crate::agent::session::SessionLease;
 use crate::mcp::ToolError;
+use crate::mcp::approval::approval_command_error;
 use crate::patch::{Change, FS, Hunk, OS, Patch, commit_fs, parse_patch, plan_fs, summary};
 use crate::policy::{
     Decision, PolicyError, PolicyRequest, Sandbox, ToolKind, bound_path, evaluate_with_reason,
@@ -56,7 +57,8 @@ use crate::sandbox::{BoundDirectory, Sandbox as LandlockLauncher};
 use crate::tools::files::read_file_range;
 use crate::tools::shell::{SandboxLauncher, ShellResult, run_shell};
 use crate::util::approval::{ApprovalRequest, Approver};
-use crate::util::json::truncate_utf8;
+use crate::util::fs::lexical_clean;
+use crate::util::json::{null_default, truncate_utf8};
 use crate::util::run::RunContext;
 
 /// The executor the runner delegates to. All per-call state (progress and
@@ -190,21 +192,21 @@ impl ToolExecutor for BuiltinToolExecutor {
 /// Go `json.Unmarshal` target for `execToolCall`'s arguments.
 #[derive(Deserialize, Default)]
 struct Args {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     command: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     timeout_seconds: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     path: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     offset: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     limit: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     content: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     patch: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     justification: String,
 }
 
@@ -285,30 +287,10 @@ fn policy_request(
 /// EXDEV.
 fn confined_path(cwd: &Path, target: &str, bound: &BoundDirectory) -> Result<PathBuf, PolicyError> {
     let bp = bound_path(cwd, Path::new(target))?;
-    let relative = bp.path.strip_prefix(cwd).unwrap_or(bp.path.as_path());
-    Ok(bound.path().join(relative))
-}
-
-/// Go `filepath.Clean`, lexically.
-fn lexical_clean(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(p) => out.push(p.as_os_str()),
-            Component::RootDir => out.push(std::path::MAIN_SEPARATOR_STR),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() && !path.is_absolute() {
-                    out.push("..");
-                }
-            }
-            Component::Normal(s) => out.push(s),
-        }
-    }
-    if out.as_os_str().is_empty() {
-        out.push(".");
-    }
-    out
+    // Join the already-computed relative path: `strip_prefix(cwd)` would fail
+    // (and `Path::join` with an absolute path would silently escape the bound)
+    // when `cwd` carries `.`/`..` or a trailing separator.
+    Ok(bound.path().join(&bp.relative))
 }
 
 /// Go `displayPath`: a human-readable path for summary / rollout records.
@@ -388,6 +370,7 @@ fn plan_and_commit(
 fn write_target(fs: &dyn FS, target: &Path, content: &str) -> Result<usize, ToolError> {
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
     fs.mkdir_all(parent, 0o755)
+        .and_then(|_| crate::patch::check_write_target(fs, target))
         .and_then(|_| fs.write(target, content.as_bytes(), 0o644))
         .map(|_| content.len())
         .map_err(|e| ToolError::internal(e.to_string()))
@@ -616,15 +599,30 @@ impl BuiltinToolExecutor {
         }
         let mut approved = false;
         if !reasons.is_empty() {
-            let mut approval_reason = reasons.join("; ");
+            // The prompt shows the whole command, so a command too long for it
+            // is not approvable: a hidden tail would run outside the kernel
+            // sandbox on approval. Refuse with a tool error instead of asking.
+            if name == "shell"
+                && let Some(error) = approval_command_error(&args.command)
+            {
+                return ToolResult {
+                    output: error,
+                    is_error: true,
+                };
+            }
+            // The escalation warning goes first: the reason field is truncated
+            // at a fixed byte limit, and a long model justification appended
+            // last could otherwise hide the fact that approval disables the
+            // kernel sandbox.
+            let mut approval_reason = match escalations_for(name, sandbox) {
+                Some(esc) => format!("[approving this {esc}] {}", reasons.join("; ")),
+                None => reasons.join("; "),
+            };
             if !args.justification.is_empty() {
                 approval_reason = format!(
                     "{approval_reason} (model justification: {})",
                     args.justification
                 );
-            }
-            if let Some(esc) = escalations_for(name, sandbox) {
-                approval_reason = format!("{approval_reason} [approving this {esc}]");
             }
             let req = ApprovalRequest {
                 thread_id: thread_id.clone(),
@@ -634,11 +632,7 @@ impl BuiltinToolExecutor {
                 } else {
                     Some(args.command.clone())
                 },
-                path: if approval_paths.is_empty() {
-                    None
-                } else {
-                    Some(approval_paths.join(", "))
-                },
+                paths: approval_paths.clone(),
                 reason: approval_reason,
             };
             approved = wait_approval(ctx, approver.as_ref(), req).await;

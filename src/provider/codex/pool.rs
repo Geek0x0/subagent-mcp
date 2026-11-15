@@ -172,7 +172,9 @@ impl Pool {
         }
         let current = self.state.lock().unwrap().current.clone();
         if let Some(current) = current {
-            if current.client.is_done() {
+            // `is_done` covers the reader stopping; `closed` covers a
+            // connection whose closer already ran (e.g. after `failure`).
+            if current.client.is_done() || current.closed.load(Ordering::SeqCst) {
                 self.state.lock().unwrap().current = None;
                 current.close().await;
             } else {
@@ -357,9 +359,20 @@ async fn start_process(command: &str) -> Result<Dialed, ClientError> {
     // if a connection is dropped without going through `Closer`.
     cmd.kill_on_drop(true);
 
-    let mut child = cmd.spawn().map_err(|error| {
-        ClientError::context("start codex app-server", ClientError::from(error))
-    })?;
+    let mut child = {
+        // Windows only: the managed shell backend marks its pipe write end
+        // inheritable for the duration of one `CreateProcessW`. This spawn has
+        // no explicit handle list, so it would inherit that write end; the
+        // shell's reader would then never see EOF and every shell call would
+        // pay the full WaitDelay. Take the same process-wide lock for the spawn
+        // call only -- never across an await on the child, which would leave a
+        // shell call stuck behind a live app-server.
+        #[cfg(windows)]
+        let _spawn_guard = crate::tools::process_windows::spawn_guard();
+        cmd.spawn().map_err(|error| {
+            ClientError::context("start codex app-server", ClientError::from(error))
+        })?
+    };
     let stdin = child
         .stdin
         .take()
@@ -434,9 +447,11 @@ impl ProcessInner {
         {
             let _ = self.child.start_kill();
             let _ = tokio::time::timeout(STDERR_WAIT_DELAY, self.child.wait()).await;
-            // Release the reader even if a descendant retained stdout.
-            self.client.abort_reader();
         }
+        // Release the reader unconditionally: even after a clean child exit a
+        // descendant may still hold stdout, and a reader left running keeps the
+        // connection (and its task) alive.
+        self.client.abort_reader();
         // WaitDelay: bound stderr draining if a descendant inherited the pipe.
         if tokio::time::timeout(STDERR_WAIT_DELAY, &mut self.stderr_task)
             .await

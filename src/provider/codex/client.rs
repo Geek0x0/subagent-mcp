@@ -472,7 +472,12 @@ impl Client {
             params,
             ..Message::default()
         };
-        let write = self.inner.write_message_locked(&message).await;
+        // Waiting for the stdin lock must honor the caller's cancellation:
+        // a stuck writer would otherwise pin the turn until the child dies.
+        let write = self
+            .inner
+            .write_message_cancellable(&message, Some(ctx))
+            .await;
         drop(write_guard);
         if let Err(error) = write {
             return Err(ClientError::context(format!("write {method}"), error));
@@ -679,9 +684,26 @@ impl Inner {
     }
 
     async fn write_message_locked(&self, message: &Message) -> Result<(), ClientError> {
+        self.write_message_cancellable(message, None).await
+    }
+
+    /// Serialize `message` to stdin. Only the wait for the writer lock is
+    /// cancellable; once bytes start flowing they are written to completion so
+    /// a cancel cannot leave half a JSON line on the wire.
+    async fn write_message_cancellable(
+        &self,
+        message: &Message,
+        ctx: Option<&RunContext>,
+    ) -> Result<(), ClientError> {
         let mut bytes = serde_json::to_vec(message)?;
         bytes.push(b'\n');
-        let mut writer = self.writer.lock().await;
+        let mut writer = match ctx {
+            Some(ctx) => tokio::select! {
+                writer = self.writer.lock() => writer,
+                error = wait_ctx(ctx) => return Err(error),
+            },
+            None => self.writer.lock().await,
+        };
         let Some(writer) = writer.as_mut() else {
             // Classify like Go's `processWriter`: a write to the closed stdin is
             // a closed pipe, so `Conn::failure` reaps the child and reports its
@@ -723,8 +745,7 @@ impl Inner {
         {
             let state = self.state.lock().unwrap();
             if let Some(subscription) = state.subscriptions.get(&thread_id) {
-                subscription.enqueue(message.clone());
-                routed = true;
+                routed = subscription.enqueue(message.clone());
             }
         }
         if !routed && let Some(id) = &message.id {
@@ -869,10 +890,13 @@ impl Subscription {
         self.inner.state.lock().unwrap().permanent
     }
 
-    pub(crate) fn enqueue(&self, message: Message) {
+    /// Returns `false` when the message was dropped because the subscription
+    /// already failed (including a backlog overflow). Callers must then answer
+    /// a server request with an error instead of leaving the server waiting.
+    pub(crate) fn enqueue(&self, message: Message) -> bool {
         let mut state = self.inner.state.lock().unwrap();
         if state.error.is_some() {
-            return;
+            return false;
         }
         if message.method.as_deref() == Some(DELTA_METHOD)
             && let Some(params) = message
@@ -887,7 +911,7 @@ impl Subscription {
                 // Continuing the run: the queue was already nonempty, so no
                 // waiter needs waking.
                 last.text.push_str(&params.delta);
-                return;
+                return true;
             }
             state.queue.push_back(QueuedEvent {
                 message,
@@ -895,8 +919,8 @@ impl Subscription {
                 text: params.delta,
             });
             self.wake_locked(&mut state);
-            self.fail_on_backlog_locked(&mut state);
-            return;
+            let accepted = !self.fail_on_backlog_locked(&mut state);
+            return accepted;
         }
         state.queue.push_back(QueuedEvent {
             item: String::new(),
@@ -904,16 +928,16 @@ impl Subscription {
             message,
         });
         self.wake_locked(&mut state);
-        self.fail_on_backlog_locked(&mut state);
+        !self.fail_on_backlog_locked(&mut state)
     }
 
     /// Abandon the turn once the queue outgrows its cap. Merging keeps a
     /// streamed turn far below it, so reaching the cap means the consumer is not
     /// draining at all; an error it can report beats a queue that grows until
     /// the process dies.
-    fn fail_on_backlog_locked(&self, state: &mut SubscriptionState) {
+    fn fail_on_backlog_locked(&self, state: &mut SubscriptionState) -> bool {
         if state.queue.len() <= MAX_QUEUED_EVENTS {
-            return;
+            return false;
         }
         state.error = Some(ClientError::message(format!(
             "codex app-server event backlog exceeded {MAX_QUEUED_EVENTS} notifications: \
@@ -923,6 +947,7 @@ impl Subscription {
         state.permanent = true;
         state.queue.clear();
         self.inner.notify.notify_waiters();
+        true
     }
 
     /// Wake waiters only on the empty-to-nonempty transition. No consumer can be
@@ -965,5 +990,38 @@ impl Subscription {
                 error = wait_ctx(ctx) => return Err(error),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod subscription_tests {
+    use super::{MAX_QUEUED_EVENTS, Message, Subscription};
+
+    fn notification(method: &str) -> Message {
+        Message {
+            method: Some(method.to_string()),
+            ..Message::default()
+        }
+    }
+
+    #[test]
+    fn a_backlog_overflow_reports_the_message_as_rejected() {
+        // The caller must answer the server request; a silent drop would leave
+        // the app-server waiting forever for a reply.
+        let subscription = Subscription::new();
+        for _ in 0..MAX_QUEUED_EVENTS {
+            assert!(subscription.enqueue(notification("thread/event")));
+        }
+        assert!(!subscription.enqueue(notification("thread/event")));
+        // Once failed, every later message is rejected too.
+        assert!(!subscription.enqueue(notification("thread/event")));
+    }
+
+    #[test]
+    fn a_failed_subscription_rejects_immediately() {
+        let subscription = Subscription::new();
+        assert!(subscription.enqueue(notification("thread/event")));
+        subscription.close(super::ClientError::message("closed"));
+        assert!(!subscription.enqueue(notification("thread/event")));
     }
 }

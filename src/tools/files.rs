@@ -10,13 +10,14 @@
 //! (Task 17). Only the protected-file table is new global state.
 
 use std::io;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, RwLock};
 
 use tokio::io::AsyncReadExt;
 
 use crate::mcp::ToolError;
 use crate::tools::shell::{DEFAULT_SHELL_TIMEOUT, MAX_OUTPUT_BYTES};
+use crate::util::fs::lexical_clean;
 use crate::util::run::RunContext;
 
 /// Go `bufio.NewReaderSize(file, MaxOutputBytes+1)` buffer size.
@@ -77,30 +78,6 @@ fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
     } else {
         lexical_clean(&cwd.join(p))
     }
-}
-
-/// Go `filepath.Clean`: drop `.` components, resolve `..` lexically, collapse
-/// repeated separators. Rust's `Path::components` already normalizes `.` and
-/// repeated separators, so only `..` needs explicit handling.
-fn lexical_clean(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-            Component::RootDir => out.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() && !path.is_absolute() {
-                    out.push("..");
-                }
-            }
-            Component::Normal(part) => out.push(part),
-        }
-    }
-    if out.as_os_str().is_empty() {
-        out.push(".");
-    }
-    out
 }
 
 fn io_error(err: io::Error) -> ToolError {
@@ -182,6 +159,16 @@ pub async fn read_file_range(
 }
 
 async fn read_inner(path: PathBuf, offset: i64, limit: i64) -> Result<String, ToolError> {
+    // Check the path before opening it. `open(2)` on a FIFO blocks until a
+    // writer appears, so a blocking open would hang the tool (and its worker
+    // thread) before any post-open check could reject the file.
+    let metadata = tokio::fs::metadata(&path).await.map_err(io_error)?;
+    if !metadata.is_file() {
+        return Err(ToolError::internal(format!(
+            "refusing to read a non-regular file: {}",
+            path.display()
+        )));
+    }
     let file = tokio::fs::File::open(&path).await.map_err(io_error)?;
     // Go checks the opened descriptor (not the path) so `/proc/self`,
     // `/proc/thread-self` and symlinks are seen by their real name.
@@ -190,11 +177,20 @@ async fn read_inner(path: PathBuf, offset: i64, limit: i64) -> Result<String, To
             "refusing to read the subagent-mcp process's own /proc entries",
         ));
     }
-    let total_size = file
-        .metadata()
-        .await
-        .map(|meta| meta.len() as i64)
-        .unwrap_or(0);
+    // Re-check on the opened descriptor: the path may have been replaced
+    // between the stat above and the open (a symlink swap or a FIFO swap).
+    let metadata = file.metadata().await.map_err(io_error)?;
+    // Only regular files are readable: a FIFO, character device, socket or
+    // directory can block the read forever or expose another program's stream
+    // (`/dev/stdin`, `/proc/self/fd/0`). A symlink was already followed by
+    // `open`, so this describes the object actually opened.
+    if !metadata.is_file() {
+        return Err(ToolError::internal(format!(
+            "refusing to read a non-regular file: {}",
+            path.display()
+        )));
+    }
+    let total_size = metadata.len() as i64;
     let mut reader = SliceReader::new(file);
     read_file_range_stream(&mut reader, offset, limit, total_size).await
 }
@@ -244,6 +240,10 @@ struct Slice {
 struct SliceReader {
     file: tokio::fs::File,
     buf: Vec<u8>,
+    /// Bytes of `buf` already returned. Keeping a cursor instead of
+    /// `split_off`/`drain`-ing on every line makes a whole-line scan linear:
+    /// the old code copied the entire tail of the buffer once per line.
+    start: usize,
     eof: bool,
 }
 
@@ -252,37 +252,60 @@ impl SliceReader {
         Self {
             file,
             buf: Vec::with_capacity(READ_BUFFER),
+            start: 0,
             eof: false,
+        }
+    }
+
+    /// Bytes buffered but not yet returned.
+    fn available(&self) -> usize {
+        self.buf.len() - self.start
+    }
+
+    /// Drop the consumed prefix once it dominates the buffer.
+    fn compact(&mut self) {
+        if self.start == self.buf.len() {
+            self.buf.clear();
+            self.start = 0;
+        } else if self.start >= READ_BUFFER {
+            self.buf.drain(..self.start);
+            self.start = 0;
         }
     }
 
     /// Go `bufio.Reader.ReadSlice('\n')`.
     async fn read_slice(&mut self) -> io::Result<Slice> {
         loop {
-            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-                let rest = self.buf.split_off(pos + 1);
-                let data = std::mem::replace(&mut self.buf, rest);
+            if let Some(offset) = self.buf[self.start..].iter().position(|&b| b == b'\n') {
+                let end = self.start + offset + 1;
+                let data = self.buf[self.start..end].to_vec();
+                self.start = end;
+                self.compact();
                 return Ok(Slice {
                     data,
                     err: SliceErr::Newline,
                 });
             }
             if self.eof {
-                let data = std::mem::take(&mut self.buf);
+                let data = self.buf[self.start..].to_vec();
+                self.buf.clear();
+                self.start = 0;
                 return Ok(Slice {
                     data,
                     err: SliceErr::Eof,
                 });
             }
-            if self.buf.len() >= READ_BUFFER {
-                let data = std::mem::take(&mut self.buf);
+            if self.available() >= READ_BUFFER {
+                let data = self.buf[self.start..].to_vec();
+                self.buf.clear();
+                self.start = 0;
                 return Ok(Slice {
                     data,
                     err: SliceErr::BufferFull,
                 });
             }
             // Not full, no newline, no pending EOF: fill more (one read).
-            let want = READ_BUFFER - self.buf.len();
+            let want = READ_BUFFER - self.available();
             let mut chunk = vec![0u8; want];
             let n = self.file.read(&mut chunk).await?;
             if n == 0 {
@@ -296,7 +319,7 @@ impl SliceReader {
     /// Go `bufio.Reader.Peek(1) != nil`: is at least one more byte available?
     async fn has_more(&mut self) -> io::Result<bool> {
         loop {
-            if !self.buf.is_empty() {
+            if self.available() > 0 {
                 return Ok(true);
             }
             if self.eof {
@@ -438,6 +461,7 @@ pub async fn write_file(
         None => &default_fs,
     };
     fs.mkdir_all(parent, 0o755).map_err(io_error)?;
+    crate::patch::check_write_target(fs, &resolved).map_err(io_error)?;
     fs.write(&resolved, content.as_bytes(), 0o644)
         .map_err(io_error)?;
     Ok(content.len())

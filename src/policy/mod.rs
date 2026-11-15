@@ -20,12 +20,91 @@ pub enum Sandbox {
     DangerFullAccess,
 }
 
+impl Sandbox {
+    /// Rank by how much the mode grants; a server-side ceiling keeps the
+    /// minimum of the requested and configured ranks.
+    pub fn rank(self) -> u8 {
+        match self {
+            Sandbox::ReadOnly => 0,
+            Sandbox::WorkspaceWrite => 1,
+            Sandbox::DangerFullAccess => 2,
+        }
+    }
+
+    /// The wire spelling accepted by the `start` tool.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "read-only" => Some(Sandbox::ReadOnly),
+            "workspace-write" => Some(Sandbox::WorkspaceWrite),
+            "danger-full-access" => Some(Sandbox::DangerFullAccess),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sandbox::ReadOnly => "read-only",
+            Sandbox::WorkspaceWrite => "workspace-write",
+            Sandbox::DangerFullAccess => "danger-full-access",
+        }
+    }
+
+    /// Clamp to `ceiling` when the requested mode grants more access.
+    pub fn clamp_to(self, ceiling: Option<Self>) -> Self {
+        match ceiling {
+            Some(ceiling) if self.rank() > ceiling.rank() => ceiling,
+            _ => self,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ApprovalPolicy {
     Untrusted,
     OnRequest,
     OnFailure,
     Never,
+}
+
+impl ApprovalPolicy {
+    /// Rank by how few prompts the policy emits; `Never` is the most
+    /// permissive, so a server-side ceiling clamps towards lower ranks.
+    pub fn rank(self) -> u8 {
+        match self {
+            ApprovalPolicy::Untrusted => 0,
+            ApprovalPolicy::OnRequest => 1,
+            ApprovalPolicy::OnFailure => 2,
+            ApprovalPolicy::Never => 3,
+        }
+    }
+
+    /// The wire spelling accepted by the `start` tool.
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "untrusted" => Some(ApprovalPolicy::Untrusted),
+            "on-request" => Some(ApprovalPolicy::OnRequest),
+            "on-failure" => Some(ApprovalPolicy::OnFailure),
+            "never" => Some(ApprovalPolicy::Never),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ApprovalPolicy::Untrusted => "untrusted",
+            ApprovalPolicy::OnRequest => "on-request",
+            ApprovalPolicy::OnFailure => "on-failure",
+            ApprovalPolicy::Never => "never",
+        }
+    }
+
+    /// Clamp to `ceiling` when the requested policy asks for fewer prompts.
+    pub fn clamp_to(self, ceiling: Option<Self>) -> Self {
+        match ceiling {
+            Some(ceiling) if self.rank() > ceiling.rank() => ceiling,
+            _ => self,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]

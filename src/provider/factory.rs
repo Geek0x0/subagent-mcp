@@ -16,12 +16,12 @@ use std::sync::{Arc, LazyLock, Mutex};
 use crate::config::ProviderConfig;
 use crate::provider::{Provider, ProviderError};
 
-/// Constructor for one configured provider. It receives the provider name, the
-/// resolved config, and the API key, and returns a boxed [`Provider`].
+/// Constructor for one configured provider. It receives the provider name and
+/// the resolved config, and returns a boxed [`Provider`]; each adapter resolves
+/// its own API key from the config, so the factory never carries one.
 #[allow(clippy::type_complexity)] // the boxed constructor shape is intentional
-pub type Constructor = Arc<
-    dyn Fn(&str, &ProviderConfig, &str) -> Result<Arc<dyn Provider>, ProviderError> + Send + Sync,
->;
+pub type Constructor =
+    Arc<dyn Fn(&str, &ProviderConfig) -> Result<Arc<dyn Provider>, ProviderError> + Send + Sync>;
 
 /// A hook that releases the process-wide resources one adapter family owns,
 /// such as a shared child process (Go `ShutdownFunc`). `Arc` lets [`shutdown`]
@@ -73,14 +73,10 @@ pub fn lookup(api: &str) -> Option<Constructor> {
 /// Build the adapter for `cfg.api`. The error text is the exact
 /// subagent-mcp-authored string (`fmt.Errorf("unsupported api %q ...")` in Go),
 /// so a missing adapter package is reported verbatim to the operator.
-pub fn new(
-    name: &str,
-    cfg: &ProviderConfig,
-    api_key: &str,
-) -> Result<Arc<dyn Provider>, ProviderError> {
+pub fn new(name: &str, cfg: &ProviderConfig) -> Result<Arc<dyn Provider>, ProviderError> {
     let api = cfg.api.as_str();
     match lookup(api) {
-        Some(ctor) => ctor(name, cfg, api_key),
+        Some(ctor) => ctor(name, cfg),
         None => Err(ProviderError {
             message: format!("unsupported api {api:?} (is its adapter package imported?)"),
         }),

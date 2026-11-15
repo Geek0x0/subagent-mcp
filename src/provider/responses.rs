@@ -22,7 +22,7 @@ use serde_json::{Map, Value};
 
 use crate::config::ProviderConfig;
 use crate::provider::sse::SSE_MAX_LINE;
-use crate::provider::transport::{PooledClient, PooledResponse, preserve_opaque};
+use crate::provider::transport::{PooledClient, PooledResponse, drain_error_body, preserve_opaque};
 use crate::provider::{
     DeltaSink, ModelInfo, ModelLister, Provider, ProviderError, Role, ToolCall, ToolSpec,
     TransportKind, TurnRequest, TurnResult, Usage,
@@ -103,22 +103,13 @@ impl Responses {
     /// Build a Responses adapter, resolving the API key from `cfg.key` or,
     /// when that is empty, the environment variable named by `cfg.env_key`.
     pub fn new(name: &str, cfg: &ProviderConfig) -> Result<Self, ProviderError> {
-        let api_key = match cfg.key.as_deref().filter(|key| !key.is_empty()) {
-            Some(key) => key.to_string(),
-            None => {
-                let env_key = cfg.env_key.clone().unwrap_or_default();
-                match std::env::var(&env_key) {
-                    Ok(value) if !value.is_empty() => value,
-                    _ => {
-                        return Err(ProviderError {
-                            message: format!(
-                                "environment variable {env_key} (providers.{name}.env_key) must be set to the API key"
-                            ),
-                        });
-                    }
-                }
-            }
-        };
+        let api_key = crate::config::api_key(cfg.key.as_deref(), cfg.env_key.as_deref())
+            .ok_or_else(|| ProviderError {
+                message: format!(
+                    "environment variable {} (providers.{name}.env_key) must be set to the API key",
+                    cfg.env_key.as_deref().unwrap_or("")
+                ),
+            })?;
         Ok(Self {
             name: name.to_string(),
             client: PooledClient::from_config(TransportKind::Responses, cfg)?,
@@ -223,7 +214,7 @@ impl Responses {
     /// inserted byte-for-byte from the turn that produced it.
     fn build_body(&self, req: &TurnRequest) -> Result<Vec<u8>, ProviderError> {
         let mut input: Vec<Box<RawValue>> = Vec::new();
-        for message in &req.messages {
+        for message in req.messages.iter() {
             match message.role {
                 Role::User => input.push(json_raw(serde_json::json!({
                     "content": message.text,
@@ -301,8 +292,7 @@ impl Responses {
         if let Some(status) = response.status()
             && !status.is_success()
         {
-            let detail = read_body(&mut response).await;
-            response.close().await;
+            let detail = drain_error_body(None, response).await.unwrap_or_default();
             return Err(ProviderError {
                 message: format!(
                     "list models: GET {:?}: {} {} {}",
@@ -348,7 +338,7 @@ impl Provider for Responses {
     ) -> Result<TurnResult, ProviderError> {
         let body = self.build_body(&req)?;
         let url = self.endpoint(RESPONSES_PATH)?;
-        let mut response = self
+        let response = self
             .send_with_retry(Some(&ctx), || {
                 let mut request = reqwest::Request::new(reqwest::Method::POST, url.clone());
                 *request.headers_mut() = self.headers()?;
@@ -365,8 +355,9 @@ impl Provider for Responses {
         if let Some(status) = response.status()
             && !status.is_success()
         {
-            let detail = read_body(&mut response).await;
-            response.close().await;
+            let detail = drain_error_body(Some(&ctx), response)
+                .await
+                .unwrap_or_default();
             return Err(ProviderError {
                 message: format!(
                     "POST {:?}: {} {} {}",
@@ -466,6 +457,9 @@ struct SseEvent {
 struct EventStream {
     response: Option<PooledResponse>,
     buffer: BytesMut,
+    /// Offset already searched for `\n`; keeps framing linear in the stream
+    /// size instead of rescanning the buffer for every chunk.
+    scan_from: usize,
     eof: bool,
     data: Vec<u8>,
 }
@@ -475,6 +469,7 @@ impl EventStream {
         Self {
             response: Some(response),
             buffer: BytesMut::new(),
+            scan_from: 0,
             eof: false,
             data: Vec::new(),
         }
@@ -519,10 +514,15 @@ impl EventStream {
 
     async fn next_line(&mut self, ctx: &RunContext) -> Result<Option<Vec<u8>>, ProviderError> {
         loop {
-            if let Some(index) = self.buffer.iter().position(|&b| b == b'\n') {
+            if let Some(offset) = self.buffer[self.scan_from..]
+                .iter()
+                .position(|&b| b == b'\n')
+            {
+                let index = self.scan_from + offset;
                 if index >= SSE_MAX_LINE {
                     return Err(line_too_long());
                 }
+                self.scan_from = 0;
                 let mut line = self.buffer.split_to(index + 1);
                 line.truncate(index);
                 if line.last() == Some(&b'\r') {
@@ -534,11 +534,13 @@ impl EventStream {
             if self.buffer.len() >= SSE_MAX_LINE {
                 return Err(line_too_long());
             }
+            self.scan_from = self.buffer.len();
             if self.eof {
                 if self.buffer.is_empty() {
                     return Ok(None);
                 }
                 let mut line = self.buffer.split_to(self.buffer.len());
+                self.scan_from = 0;
                 if line.last() == Some(&b'\r') {
                     let length = line.len();
                     line.truncate(length - 1);
@@ -559,7 +561,10 @@ impl EventStream {
                 chunk = response.chunk() => chunk?,
             };
             match chunk {
-                Some(bytes) => self.buffer.extend_from_slice(&bytes),
+                Some(bytes) => {
+                    // Everything before the new chunk was already scanned.
+                    self.buffer.extend_from_slice(&bytes);
+                }
                 None => self.eof = true,
             }
         }
@@ -951,14 +956,6 @@ struct ModelEntry {
 }
 
 // --- Shared helpers --------------------------------------------------------
-
-async fn read_body(response: &mut PooledResponse) -> String {
-    let mut buffer = Vec::new();
-    while let Ok(Some(chunk)) = response.chunk().await {
-        buffer.extend_from_slice(&chunk);
-    }
-    String::from_utf8_lossy(&buffer).into_owned()
-}
 
 fn context_ended(ctx: &RunContext) -> Option<&'static str> {
     if ctx.cancel.is_cancelled() {

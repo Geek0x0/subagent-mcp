@@ -203,11 +203,21 @@ fn dangerous_shell_flag(fields: &[String]) -> Option<String> {
                 return None;
             }
             for argument in &fields[2..] {
-                if argument == "--recurse-submodules"
+                // `git <cmd> --help` execs the configured man viewer, and the
+                // lazy-fetch/submodule flags can run a promisor remote's helper
+                // or read a submodule's own config. parse-options accepts any
+                // unique prefix of a long option, so compare the option name
+                // before any `=value`; an exact match is not enough
+                // (`--recurse-submodules=yes`, `--ignore-s=none`).
+                if argument == "-h"
+                    || argument == "--help"
+                    || argument.starts_with("--help=")
+                    || is_recurse_submodules_prefix(argument)
+                    || is_ignore_submodules_prefix(argument)
+                    || is_no_ignore_submodules_prefix(argument)
                     || argument == "--show-signature"
                     || argument == "--verify-signatures"
-                    || argument == "--submodule"
-                    || argument.starts_with("--submodule=")
+                    || argument.starts_with("--submodule")
                 {
                     return Some(deny_flag("git", argument));
                 }
@@ -261,6 +271,47 @@ fn dangerous_shell_flag(fields: &[String]) -> Option<String> {
     }
 
     None
+}
+
+/// The option name part of a long option: the text after `--`, up to the first
+/// `=`. A value such as `--ignore-submodules=none` still selects the option, so
+/// the value never participates in the comparison. `None` for anything that is
+/// not a long option.
+fn long_option_name(argument: &str) -> Option<&str> {
+    let name = argument.strip_prefix("--")?;
+    Some(name.split('=').next().unwrap_or(name))
+}
+
+/// `git branch` and `git ls-files` accept `--rec`, `--recu`, ... as unique
+/// abbreviations of `--recurse-submodules` (verified on Git 2.43); shorter
+/// forms are ambiguous, and the full name recurses too. `--reverse`,
+/// `--relative` and `--recursive` are not prefixes and stay allowed. Rejecting
+/// the abbreviation for every allowed subcommand is deliberately conservative:
+/// subcommands that do not take the option simply never reach it.
+fn is_recurse_submodules_prefix(argument: &str) -> bool {
+    const RECURSE_SUBMODULES: &str = "recurse-submodules";
+    long_option_name(argument)
+        .is_some_and(|name| name.len() >= "rec".len() && RECURSE_SUBMODULES.starts_with(name))
+}
+
+/// `git status` accepts any unique abbreviation of `--ignore-submodules` and
+/// `--no-ignore-submodules` (`--ignore-s=none`, `--no-ignore-sub`). The safe-git
+/// wrapper prepends `--ignore-submodules=dirty`, but git honours the last
+/// occurrence, so a model-supplied prefix would re-enable recursion into a
+/// submodule and run its own config's clean filter. Every non-empty prefix is
+/// rejected, including ones Git currently finds ambiguous; unrelated options
+/// such as `--ignored`, `--ignore-all-space` and `--ignore-space-change` are
+/// not prefixes of either name and stay allowed.
+fn is_ignore_submodules_prefix(argument: &str) -> bool {
+    const IGNORE_SUBMODULES: &str = "ignore-submodules";
+    long_option_name(argument)
+        .is_some_and(|name| !name.is_empty() && IGNORE_SUBMODULES.starts_with(name))
+}
+
+fn is_no_ignore_submodules_prefix(argument: &str) -> bool {
+    const NO_IGNORE_SUBMODULES: &str = "no-ignore-submodules";
+    long_option_name(argument)
+        .is_some_and(|name| !name.is_empty() && NO_IGNORE_SUBMODULES.starts_with(name))
 }
 
 /// Go `shortOptionClusterHas`: one shell word is a cluster of short options

@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 
 use toml_edit::{Document, Item, TableLike, Value as TomlValue};
 
+use crate::policy::{ApprovalPolicy, Sandbox};
 use crate::util::fs::lexical_clean;
 use crate::util::json::go_quote;
 
@@ -106,6 +107,10 @@ pub struct AutoConfig {
     pub key: Option<String>,
     pub model: String,
     pub timeout_seconds: u64,
+    /// `[auto.descriptions]`: model id (or its suffix after `/`) to the
+    /// one-line description shown to the decision model. Overrides the
+    /// built-in table, which otherwise goes stale as models are released.
+    pub descriptions: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +118,22 @@ pub struct Config {
     pub path: PathBuf,
     pub providers: BTreeMap<String, ProviderConfig>,
     pub auto: Option<AutoConfig>,
+    /// Server-side ceilings over what one `start` call may request.
+    pub limits: Limits,
+}
+
+/// `[server]` in the config file: defence against an orchestrator that asks
+/// for more access than the operator intended to grant.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Limits {
+    /// Most permissive sandbox a `start` call may select.
+    pub max_sandbox: Option<Sandbox>,
+    /// Most permissive approval policy a `start` call may select.
+    pub max_approval_policy: Option<ApprovalPolicy>,
+    /// When non-empty, `cwd` must live under one of these roots.
+    pub allowed_cwd_roots: Vec<PathBuf>,
+    /// Extra environment names (or `PREFIX_*` patterns) to hide from children.
+    pub scrub_env: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -152,6 +173,27 @@ const HOME_ENV_KEYS: [&str; 2] = ["HOME", "USERPROFILE"];
 const HOME_ENV_ERROR: &str = "%userprofile% is not defined";
 #[cfg(not(windows))]
 const HOME_ENV_ERROR: &str = "$HOME is not defined";
+
+/// The effective API key for one provider (or `[auto]`): the configured
+/// `key` when non-empty, else the environment variable named by `env_key`.
+/// Callers own the error text, which names the provider or section.
+pub fn api_key(key: Option<&str>, env_key: Option<&str>) -> Option<String> {
+    if let Some(key) = key.filter(|key| !key.is_empty()) {
+        return Some(key.to_string());
+    }
+    std::env::var(env_key.unwrap_or(""))
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+/// Go `os.UserHomeDir`, shared with the rollout writer so both resolve the same
+/// home (on Windows `%USERPROFILE%` only, even when Git Bash sets `$HOME`).
+pub(crate) fn user_home() -> Option<PathBuf> {
+    HOME_ENV_KEYS
+        .iter()
+        .find_map(|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+}
 
 /// Return `$SUBAGENT_MCP_CONFIG` or `~/.config/subagent-mcp/config.toml`.
 pub fn default_path() -> Result<PathBuf, ConfigError> {
@@ -458,6 +500,7 @@ fn collect_unknown(doc: &Document<String>) -> Vec<String> {
         match key {
             "providers" => walk_providers(item, &prefix, &mut out),
             "auto" => walk_auto(item, &prefix, &mut out),
+            "server" => walk_server(item, &prefix, &mut out),
             _ => report_unknown(key, item, &prefix, &mut out),
         }
     }
@@ -575,6 +618,23 @@ fn walk_model(t: &dyn TableLike, prefix: &[String], out: &mut Vec<String>) {
     }
 }
 
+fn walk_server(item: &Item, prefix: &[String], out: &mut Vec<String>) {
+    let is_table = matches!(item, Item::Table(_));
+    if let Some(t) = item.as_table_like() {
+        let p = if is_table {
+            with_key(prefix, "server")
+        } else {
+            prefix.to_vec()
+        };
+        for (key, sitem) in t.iter() {
+            match key {
+                "max_sandbox" | "max_approval_policy" | "allowed_cwd_roots" | "scrub_env" => {}
+                _ => report_unknown(key, sitem, &p, out),
+            }
+        }
+    }
+}
+
 fn walk_auto(item: &Item, prefix: &[String], out: &mut Vec<String>) {
     let is_table = matches!(item, Item::Table(_));
     if let Some(t) = item.as_table_like() {
@@ -585,7 +645,8 @@ fn walk_auto(item: &Item, prefix: &[String], out: &mut Vec<String>) {
         };
         for (key, aitem) in t.iter() {
             match key {
-                "base_url" | "url" | "env_key" | "key" | "model" | "timeout_seconds" => {}
+                "base_url" | "url" | "env_key" | "key" | "model" | "timeout_seconds"
+                | "descriptions" => {}
                 _ => report_unknown(key, aitem, &p, out),
             }
         }
@@ -623,11 +684,13 @@ struct RawAuto {
     key: String,
     model: String,
     timeout_seconds: i64,
+    descriptions: BTreeMap<String, String>,
 }
 
 struct RawConfig {
     providers: BTreeMap<String, RawProvider>,
     auto: Option<RawAuto>,
+    limits: Limits,
 }
 
 fn extract(doc: &Document<String>, path: &Path, data: &str) -> Result<RawConfig, ConfigError> {
@@ -663,7 +726,131 @@ fn extract(doc: &Document<String>, path: &Path, data: &str) -> Result<RawConfig,
         None
     };
 
-    Ok(RawConfig { providers, auto })
+    let limits = match root.get("server") {
+        None => Limits::default(),
+        Some(item) if item.is_none() => Limits::default(),
+        Some(item) => match item.as_table_like() {
+            Some(table) => extract_limits(table, path, data)?,
+            None => return Err(item_type_err(path, data, item, "server", "table")),
+        },
+    };
+
+    Ok(RawConfig {
+        providers,
+        auto,
+        limits,
+    })
+}
+
+fn extract_limits(t: &dyn TableLike, path: &Path, data: &str) -> Result<Limits, ConfigError> {
+    let max_sandbox = match str_field(t, "max_sandbox", "server.max_sandbox", path, data)? {
+        raw if raw.is_empty() => None,
+        raw => match Sandbox::parse(&raw) {
+            Some(sandbox) => Some(sandbox),
+            None => {
+                return Err(err(format!(
+                    "config file {}: server.max_sandbox {} is invalid; valid values: read-only, workspace-write, danger-full-access",
+                    path.display(),
+                    go_quote(&raw)
+                )));
+            }
+        },
+    };
+    let max_approval_policy = match str_field(
+        t,
+        "max_approval_policy",
+        "server.max_approval_policy",
+        path,
+        data,
+    )? {
+        raw if raw.is_empty() => None,
+        raw => match ApprovalPolicy::parse(&raw) {
+            Some(policy) => Some(policy),
+            None => {
+                return Err(err(format!(
+                    "config file {}: server.max_approval_policy {} is invalid; valid values: untrusted, on-request, on-failure, never",
+                    path.display(),
+                    go_quote(&raw)
+                )));
+            }
+        },
+    };
+    let mut allowed_cwd_roots = Vec::new();
+    for entry in list_field(
+        t,
+        "allowed_cwd_roots",
+        "server.allowed_cwd_roots",
+        path,
+        data,
+    )? {
+        let root = PathBuf::from(&entry);
+        if !root.is_absolute() {
+            return Err(err(format!(
+                "config file {}: server.allowed_cwd_roots entry {} must be an absolute path",
+                path.display(),
+                go_quote(&entry)
+            )));
+        }
+        allowed_cwd_roots.push(lexical_clean(&root));
+    }
+    let scrub_env = list_field(t, "scrub_env", "server.scrub_env", path, data)?;
+    for entry in &scrub_env {
+        if entry.is_empty() {
+            return Err(err(format!(
+                "config file {}: server.scrub_env entry {} must not be empty",
+                path.display(),
+                go_quote(entry)
+            )));
+        }
+        // An entry ending in `*` is a prefix and every name starts with the
+        // empty string, so a bare `*` would hide the whole environment,
+        // PATH included, from every child.
+        if entry.strip_suffix('*').is_some_and(str::is_empty) {
+            return Err(err(format!(
+                "config file {}: server.scrub_env entry {} is invalid; a prefix pattern must keep a non-empty prefix (for example \"AWS_*\")",
+                path.display(),
+                go_quote(entry)
+            )));
+        }
+    }
+    Ok(Limits {
+        max_sandbox,
+        max_approval_policy,
+        allowed_cwd_roots,
+        scrub_env,
+    })
+}
+
+fn list_field(
+    t: &dyn TableLike,
+    key: &str,
+    field: &str,
+    path: &Path,
+    data: &str,
+) -> Result<Vec<String>, ConfigError> {
+    let mut out = Vec::new();
+    let Some(item) = t.get(key) else {
+        return Ok(out);
+    };
+    if item.is_none() {
+        return Ok(out);
+    }
+    let Some(array) = item.as_array() else {
+        return Err(item_type_err(path, data, item, field, "array"));
+    };
+    for (index, value) in array.iter().enumerate() {
+        let Some(text) = value.as_str() else {
+            return Err(item_type_err(
+                path,
+                data,
+                item,
+                &format!("{field}[{index}]"),
+                "string",
+            ));
+        };
+        out.push(text.to_string());
+    }
+    Ok(out)
 }
 
 fn str_field(
@@ -874,7 +1061,42 @@ fn extract_auto(t: &dyn TableLike, path: &Path, data: &str) -> Result<RawAuto, C
         key: str_field(t, "key", "auto.key", path, data)?,
         model: str_field(t, "model", "auto.model", path, data)?,
         timeout_seconds: int_field(t, "timeout_seconds", "auto.timeout_seconds", path, data)?,
+        descriptions: string_map_field(t, "descriptions", "auto.descriptions", path, data)?,
     })
+}
+
+/// A `name = "value"` table (`[auto.descriptions]`); non-string values are an
+/// unusable config rather than silently ignored.
+fn string_map_field(
+    t: &dyn TableLike,
+    key: &str,
+    field: &str,
+    path: &Path,
+    data: &str,
+) -> Result<BTreeMap<String, String>, ConfigError> {
+    let mut out = BTreeMap::new();
+    let Some(item) = t.get(key) else {
+        return Ok(out);
+    };
+    if item.is_none() {
+        return Ok(out);
+    }
+    let Some(table) = item.as_table_like() else {
+        return Err(item_type_err(path, data, item, field, "table"));
+    };
+    for (name, value) in table.iter() {
+        let Some(text) = value.as_str() else {
+            return Err(item_type_err(
+                path,
+                data,
+                value,
+                &format!("{field}.{name}"),
+                "string",
+            ));
+        };
+        out.insert(name.to_string(), text.to_string());
+    }
+    Ok(out)
 }
 
 // --- toml_edit value -> serde_json::Value (for extra_body) ------------------
@@ -1289,11 +1511,13 @@ fn build_config(path: PathBuf, raw: RawConfig) -> Config {
         key: opt_str(a.key),
         model: a.model,
         timeout_seconds: a.timeout_seconds as u64,
+        descriptions: a.descriptions,
     });
 
     Config {
         path,
         providers,
         auto,
+        limits: raw.limits,
     }
 }

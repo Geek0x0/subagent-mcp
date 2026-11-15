@@ -71,35 +71,28 @@ pub fn codex_available() -> bool {
     factory::lookup(Api::CodexAppServer.as_str()).is_some()
 }
 
-/// Register the adapter constructors once. The factory's `Constructor` takes a
-/// resolved API key, while each adapter resolves its own key from
-/// `ProviderConfig`/env; the third argument is therefore ignored deliberately.
+/// Register the adapter constructors once. Each adapter resolves its own key
+/// from `ProviderConfig`/env, so the constructor only needs name and config.
 fn register_adapters() {
     static ONCE: OnceLock<()> = OnceLock::new();
     ONCE.get_or_init(|| {
         register_if_absent(
             Api::ChatCompletions.as_str(),
-            Arc::new(|name, cfg, _key| {
+            Arc::new(|name, cfg| {
                 Ok(Arc::new(ChatCompletions::new(name, cfg)?) as Arc<dyn Provider>)
             }),
         );
         register_if_absent(
             Api::Responses.as_str(),
-            Arc::new(|name, cfg, _key| {
-                Ok(Arc::new(Responses::new(name, cfg)?) as Arc<dyn Provider>)
-            }),
+            Arc::new(|name, cfg| Ok(Arc::new(Responses::new(name, cfg)?) as Arc<dyn Provider>)),
         );
         register_if_absent(
             Api::Messages.as_str(),
-            Arc::new(
-                |name, cfg, _key| Ok(Arc::new(Messages::new(name, cfg)?) as Arc<dyn Provider>),
-            ),
+            Arc::new(|name, cfg| Ok(Arc::new(Messages::new(name, cfg)?) as Arc<dyn Provider>)),
         );
         register_if_absent(
             Api::CodexAppServer.as_str(),
-            Arc::new(|name, cfg, _key| {
-                Ok(Arc::new(CodexAdapter::new(name, cfg)?) as Arc<dyn Provider>)
-            }),
+            Arc::new(|name, cfg| Ok(Arc::new(CodexAdapter::new(name, cfg)?) as Arc<dyn Provider>)),
         );
     });
 }
@@ -257,6 +250,29 @@ impl SubagentTools {
             }
         };
 
+        // `[server]` ceilings: an orchestrator that was tricked into asking
+        // for a weaker sandbox than the operator allows is clamped, and the
+        // clamp is reported in the result so it is never silent.
+        let mut warnings: Vec<String> = Vec::new();
+        let requested_sandbox = sandbox;
+        let sandbox = sandbox.clamp_to(self.config.limits.max_sandbox);
+        if sandbox != requested_sandbox {
+            warnings.push(format!(
+                "warning: sandbox clamped from {} to {} by server.max_sandbox",
+                requested_sandbox.as_str(),
+                sandbox.as_str()
+            ));
+        }
+        let requested_approval = approval;
+        let approval = approval.clamp_to(self.config.limits.max_approval_policy);
+        if approval != requested_approval {
+            warnings.push(format!(
+                "warning: approval-policy clamped from {} to {} by server.max_approval_policy",
+                requested_approval.as_str(),
+                approval.as_str()
+            ));
+        }
+
         if !auto_requested {
             model = match args.get("model") {
                 None => String::new(),
@@ -303,6 +319,10 @@ impl SubagentTools {
                 go_quote(&cwd.to_string_lossy())
             ));
         }
+        // Normalize `.`/`..`/duplicate separators once, up front: the policy
+        // layer compares this path lexically with tool targets, and a dirty
+        // cwd would make every confinement check fall through.
+        let cwd = crate::util::fs::lexical_clean(&cwd);
         match std::fs::metadata(&cwd) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return fail(format!(
@@ -325,10 +345,34 @@ impl SubagentTools {
             Ok(_) => {}
         }
 
+        // Optional allowlist: with `server.allowed_cwd_roots` set, a start
+        // request may only open a session under one of the configured roots.
+        // Both sides are resolved through symbolic links first: a session can
+        // create a link inside an allowed root, and a lexical comparison would
+        // then bind the new session to whatever the link points at.
+        let allowed = &self.config.limits.allowed_cwd_roots;
+        if !allowed.is_empty() {
+            match resolves_within_any(&cwd, allowed) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return fail(format!(
+                        "cwd {} is outside server.allowed_cwd_roots",
+                        go_quote(&cwd.to_string_lossy())
+                    ));
+                }
+                Err(error) => {
+                    return fail(format!(
+                        "resolve cwd {}: {error}",
+                        go_quote(&cwd.to_string_lossy())
+                    ));
+                }
+            }
+        }
+
         let mut writable_roots = Vec::new();
         let mut budgets = RunBudgets::default();
         if auto_requested {
-            writable_roots = match parse_writable_roots(&loose_config) {
+            writable_roots = match parse_writable_roots(&loose_config, allowed) {
                 Ok(roots) => roots,
                 Err(message) => return fail(message),
             };
@@ -353,24 +397,23 @@ impl SubagentTools {
         };
 
         if auto_requested {
-            let selection =
-                match resolve_auto(&run_ctx, &self.config, &self.manager, &prompt, &cwd).await {
-                    Ok(selection) => selection,
-                    Err(error) => {
-                        // Go's handler reports the run cause (deadline/cancel)
-                        // rather than the decision client's own timeout text.
-                        if run_ctx.cancel.is_cancelled() {
-                            return fail("auto model selection: context canceled");
-                        }
-                        if run_ctx.deadline_reason().is_some() {
-                            return fail(format!(
-                                "auto model selection: run deadline of {} reached",
-                                format_go_duration(budgets.run_deadline)
-                            ));
-                        }
-                        return fail(error.message);
+            let selection = match resolve_auto(&run_ctx, &self.config, &prompt, &cwd).await {
+                Ok(selection) => selection,
+                Err(error) => {
+                    // Go's handler reports the run cause (deadline/cancel)
+                    // rather than the decision client's own timeout text.
+                    if run_ctx.cancel.is_cancelled() {
+                        return fail("auto model selection: context canceled");
                     }
-                };
+                    if run_ctx.deadline_reason().is_some() {
+                        return fail(format!(
+                            "auto model selection: run deadline of {} reached",
+                            format_go_duration(budgets.run_deadline)
+                        ));
+                    }
+                    return fail(error.message);
+                }
+            };
             provider_name = selection.provider.clone();
             model = selection.model.clone();
             let cfg = self
@@ -379,13 +422,11 @@ impl SubagentTools {
                 .get(&provider_name)
                 .expect("resolve_auto validated the provider")
                 .clone();
-            let key = match api_key_for(&self.config, &provider_name) {
-                Ok(key) => key,
-                Err(message) => {
-                    return fail(format!("auto model selection: {message}"));
-                }
-            };
-            adapter = match factory::new(&provider_name, &cfg, &key) {
+            // Validate the key is resolvable; the adapter reads it itself.
+            if let Err(message) = api_key_for(&self.config, &provider_name) {
+                return fail(format!("auto model selection: {message}"));
+            }
+            adapter = match factory::new(&provider_name, &cfg) {
                 Ok(adapter) => Some(adapter),
                 Err(error) => {
                     return fail(format!("auto model selection: {}", error.message));
@@ -454,7 +495,7 @@ impl SubagentTools {
         }
 
         if !auto_requested {
-            writable_roots = match parse_writable_roots(&loose_config) {
+            writable_roots = match parse_writable_roots(&loose_config, allowed) {
                 Ok(roots) => roots,
                 Err(message) => return fail(message),
             };
@@ -493,7 +534,7 @@ impl SubagentTools {
 
         let options = SessionOptions {
             provider: adapter,
-            thread,
+            thread: thread.clone(),
             model: model.clone(),
             reasoning_effort: requested.clone(),
             effort_sent: Some(map_effort(&provider_cfg, &requested)),
@@ -515,36 +556,51 @@ impl SubagentTools {
 
         let session = match self.manager.create(options).await {
             Ok(session) => session,
-            Err(error) => return Err(ToolError::internal(error.message())),
+            Err(error) => {
+                // The provider thread was started before the session existed;
+                // without this it would run unreachable.
+                if let Some(thread) = &thread {
+                    let _ = thread.close().await;
+                }
+                return Err(ToolError::internal(error.message()));
+            }
         };
         let mut lease = match self.manager.acquire(&session.id).await {
             Ok(lease) => lease,
-            Err(error) => return Err(ToolError::internal(error.message())),
+            Err(error) => {
+                // Drop the just-created session (and its provider thread)
+                // instead of leaking it when the lease cannot be taken.
+                self.manager.close_one(&session.id).await;
+                return Err(ToolError::internal(error.message()));
+            }
         };
 
         // Codex owns its own rollout; only HTTP sessions get the server's
         // recorder and `session_meta`.
         let created = SystemTime::now();
-        if !is_agent
-            && let Ok(mut recorder) = RolloutRecorder::create(
-                &session.id,
-                &cwd,
-                &system_prompt,
-                &provider_name,
-                &model,
-                &requested,
-            )
-        {
-            let meta = session_meta(
-                &session.id,
-                &cwd,
-                &system_prompt,
-                &provider_name,
-                auto_selection.as_ref(),
-                created,
-            );
-            recorder.write_line("session_meta", meta);
-            lease.rollout = Some(recorder);
+        let rollout_warning = &mut warnings;
+        if !is_agent {
+            match RolloutRecorder::create(&session.id) {
+                Ok(mut recorder) => {
+                    let meta = session_meta(
+                        &session.id,
+                        &cwd,
+                        &system_prompt,
+                        &provider_name,
+                        auto_selection.as_ref(),
+                        created,
+                    );
+                    recorder.write_line("session_meta", meta);
+                    lease.rollout = Some(recorder);
+                }
+                // Explicit opt-out is not a failure.
+                Err(_) if RolloutRecorder::disabled_by_env() => {}
+                Err(error) => {
+                    // Go degrades to a silent no-op recorder; surface it so the
+                    // caller knows the audit trail is missing.
+                    rollout_warning.push(format!("warning: rollout disabled: {}", error.message));
+                }
+            }
         }
 
         let hooks = RunHooks {
@@ -556,10 +612,18 @@ impl SubagentTools {
             .run_locked(run_ctx, &mut lease, &prompt, &hooks)
             .await;
 
+        let result_text = |text: &str| {
+            if warnings.is_empty() {
+                text.to_string()
+            } else {
+                format!("{}\n{text}", warnings.join("\n"))
+            }
+        };
+
         match outcome {
             Ok(text) => Ok(start_result(
                 &session.id,
-                &text,
+                &result_text(&text),
                 &provider_name,
                 &model,
                 auto_selection.as_ref(),
@@ -567,7 +631,7 @@ impl SubagentTools {
             )),
             Err(error) => Ok(start_result(
                 &session.id,
-                &format!("error: {}", error.message),
+                &result_text(&format!("error: {}", error.message)),
                 &provider_name,
                 &model,
                 auto_selection.as_ref(),
@@ -676,9 +740,10 @@ impl SubagentTools {
             )));
         };
 
-        let key = api_key_for(&self.config, &name).map_err(ResolveError::Tool)?;
+        // Validate the key is resolvable; the adapter reads it itself.
+        api_key_for(&self.config, &name).map_err(ResolveError::Tool)?;
         let adapter =
-            factory::new(&name, &cfg, &key).map_err(|error| ResolveError::Tool(error.message))?;
+            factory::new(&name, &cfg).map_err(|error| ResolveError::Tool(error.message))?;
 
         Ok(ResolvedProvider { name, cfg, adapter })
     }
@@ -836,22 +901,11 @@ fn require_string(args: &Map<String, Value>, name: &str) -> Result<String, Strin
 }
 
 fn parse_sandbox(value: &str) -> Option<Sandbox> {
-    match value {
-        "read-only" => Some(Sandbox::ReadOnly),
-        "workspace-write" => Some(Sandbox::WorkspaceWrite),
-        "danger-full-access" => Some(Sandbox::DangerFullAccess),
-        _ => None,
-    }
+    Sandbox::parse(value)
 }
 
 fn parse_approval(value: &str) -> Option<ApprovalPolicy> {
-    match value {
-        "untrusted" => Some(ApprovalPolicy::Untrusted),
-        "on-request" => Some(ApprovalPolicy::OnRequest),
-        "on-failure" => Some(ApprovalPolicy::OnFailure),
-        "never" => Some(ApprovalPolicy::Never),
-        _ => None,
-    }
+    ApprovalPolicy::parse(value)
 }
 
 fn effort_values_text() -> String {
@@ -958,7 +1012,43 @@ fn parse_budgets(loose_config: &Map<String, Value>) -> Result<RunBudgets, String
     Ok(budgets)
 }
 
-fn parse_writable_roots(loose_config: &Map<String, Value>) -> Result<Vec<PathBuf>, String> {
+/// Whether `path` resolves through every symbolic link to `root` itself or to
+/// a directory below it.
+///
+/// Both sides are canonicalized first, so a link planted inside `root` cannot
+/// smuggle `path` out of it, and the comparison is component-wise, so
+/// `/srv/work2` is not "under" `/srv/work`. A root that cannot be resolved
+/// cannot contain anything, which is a mismatch rather than an error about the
+/// path being checked.
+fn resolves_within(path: &Path, root: &Path) -> std::io::Result<bool> {
+    let resolved = eval_symlinks(path)?;
+    let Ok(resolved_root) = eval_symlinks(root) else {
+        return Ok(false);
+    };
+    Ok(resolved.starts_with(resolved_root))
+}
+
+/// Whether `path` resolves inside any of `roots`.
+fn resolves_within_any(path: &Path, roots: &[PathBuf]) -> std::io::Result<bool> {
+    for root in roots {
+        if resolves_within(path, root)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Parse `config.writable_roots` from the loose config map.
+///
+/// With `server.allowed_cwd_roots` configured, every requested root must pass
+/// the same symlink-resolving containment check as `cwd`: otherwise
+/// `writable_roots: ["/"]` would hand back the write access the allowlist
+/// exists to withhold. Without the allowlist the requested roots are taken as
+/// given.
+fn parse_writable_roots(
+    loose_config: &Map<String, Value>,
+    allowed: &[PathBuf],
+) -> Result<Vec<PathBuf>, String> {
     let Some(raw) = loose_config.get("writable_roots") else {
         return Ok(Vec::new());
     };
@@ -988,7 +1078,25 @@ fn parse_writable_roots(loose_config: &Map<String, Value>) -> Result<Vec<PathBuf
                 ));
             }
         }
-        roots.push(clean_path(path));
+        let root = clean_path(path);
+        if !allowed.is_empty() {
+            match resolves_within_any(&root, allowed) {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(format!(
+                        "config.writable_roots entry {} is outside server.allowed_cwd_roots",
+                        go_quote(path)
+                    ));
+                }
+                Err(error) => {
+                    return Err(format!(
+                        "resolve config.writable_roots entry {}: {error}",
+                        go_quote(path)
+                    ));
+                }
+            }
+        }
+        roots.push(root);
     }
     Ok(roots)
 }
@@ -1023,16 +1131,12 @@ pub(crate) fn api_key_for(config: &Config, name: &str) -> Result<String, String>
     if provider.api == Api::CodexAppServer {
         return Ok(String::new());
     }
-    if let Some(key) = provider.key.as_deref().filter(|key| !key.is_empty()) {
-        return Ok(key.to_string());
-    }
-    let env_key = provider.env_key.clone().unwrap_or_default();
-    match std::env::var(&env_key) {
-        Ok(value) if !value.is_empty() => Ok(value),
-        _ => Err(format!(
+    let env_key = provider.env_key.as_deref().unwrap_or("");
+    crate::config::api_key(provider.key.as_deref(), provider.env_key.as_deref()).ok_or_else(|| {
+        format!(
             "environment variable {env_key} (providers.{name}.env_key) must be set to the API key"
-        )),
-    }
+        )
+    })
 }
 
 fn has_model(provider: &ProviderConfig, id: &str) -> bool {
@@ -1370,7 +1474,7 @@ fn session_meta(
         meta.insert("model_selection".into(), Value::Object(selection));
     }
     if let Ok(resolved) = eval_symlinks(cwd)
-        && git_root(&resolved).is_some()
+        && crate::repo::root(&resolved).is_some()
     {
         let info = repo::git_info(&resolved);
         meta.insert(
@@ -1382,22 +1486,6 @@ fn session_meta(
         );
     }
     Value::Object(meta)
-}
-
-/// Go `repo.Root`: nearest ancestor (inclusive) with a `.git` entry.
-fn git_root(dir: &Path) -> Option<PathBuf> {
-    let mut current = dir.to_path_buf();
-    loop {
-        if std::fs::symlink_metadata(current.join(".git")).is_ok() {
-            return Some(current);
-        }
-        match current.parent() {
-            Some(parent) if parent != current && !parent.as_os_str().is_empty() => {
-                current = parent.to_path_buf();
-            }
-            _ => return None,
-        }
-    }
 }
 
 #[cfg(test)]

@@ -62,11 +62,11 @@ async fn text_turn_sends_the_full_request_and_reports_usage() {
                 model: "gpt-x".to_string(),
                 effort: Some("high".to_string()),
                 system: "sys".to_string(),
-                messages: vec![Message {
+                messages: std::sync::Arc::new(vec![Message {
                     role: Role::User,
                     text: "hi".to_string(),
                     ..Default::default()
-                }],
+                }]),
                 tools: vec![shell_spec()],
             },
             sink,
@@ -159,7 +159,7 @@ async fn replays_every_turn_with_opaque_items() {
             &provider,
             TurnRequest {
                 model: "gpt-x".to_string(),
-                messages: history.clone(),
+                messages: std::sync::Arc::new(history.clone()),
                 tools: vec![shell_spec()],
                 ..Default::default()
             },
@@ -233,7 +233,7 @@ async fn assistant_opaque_replays_item_bytes_verbatim() {
         &provider,
         TurnRequest {
             model: "gpt-x".to_string(),
-            messages: vec![
+            messages: std::sync::Arc::new(vec![
                 Message {
                     role: Role::User,
                     text: "go".to_string(),
@@ -244,7 +244,7 @@ async fn assistant_opaque_replays_item_bytes_verbatim() {
                     opaque: first.opaque.clone(),
                     ..Default::default()
                 },
-            ],
+            ]),
             ..Default::default()
         },
     )
@@ -342,10 +342,10 @@ async fn corrupt_replay_payload_is_rejected_before_sending() {
         &adapter(&fake, "k"),
         TurnRequest {
             model: "gpt-x".to_string(),
-            messages: vec![Message {
+            messages: std::sync::Arc::new(vec![Message {
                 role: Role::Assistant,
                 ..Default::default()
-            }],
+            }]),
             ..Default::default()
         },
     )
@@ -373,11 +373,11 @@ async fn a_tool_schema_that_is_not_an_object_is_rejected() {
         &adapter(&fake, "k"),
         TurnRequest {
             model: "gpt-x".to_string(),
-            messages: vec![Message {
+            messages: std::sync::Arc::new(vec![Message {
                 role: Role::User,
                 text: "hi".to_string(),
                 ..Default::default()
-            }],
+            }]),
             tools: vec![spec],
             ..Default::default()
         },

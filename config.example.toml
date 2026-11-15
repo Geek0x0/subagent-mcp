@@ -56,6 +56,18 @@ models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
 # model = "jev-latest"
 # base_url = "https://api.typesafe.ai"   # optional; same System One protocol only
 # timeout_seconds = 20                    # optional; 0 means the default
+# Descriptions shown to the decision model. The key is a model id or the suffix
+# of a prefixed id; these override the built-in table for gateway model names.
+# [auto.descriptions]
+# "acme-fast" = "cheap model for small edits"
+
+# Optional: cap what one `start` call may request, so an orchestrator cannot
+# grant itself more access than the operator intended. Every key is optional.
+# [server]
+# max_sandbox = "workspace-write"        # read-only | workspace-write | danger-full-access
+# max_approval_policy = "on-request"     # untrusted | on-request | on-failure | never
+# allowed_cwd_roots = ["/srv/work"]      # when set, cwd must live under one of these
+# scrub_env = ["GITHUB_TOKEN", "AWS_*"]  # extra names (or PREFIX_*) hidden from children
 
 # Alternative [auto] backend: Cloudflare Clef (use this block instead of the above).
 # [auto]

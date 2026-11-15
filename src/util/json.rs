@@ -112,6 +112,19 @@ pub fn truncate_runes(s: &str, max: usize) -> String {
     out
 }
 
+/// Go `json.Unmarshal` treats an explicit `null` for a non-pointer field as the
+/// zero value (`""`, `0`, nil map) and produces no error. serde's
+/// `#[serde(default)]` only covers a *missing* field, so route fields that a
+/// model may send as `null` through this helper; keep `#[serde(default)]` for
+/// the absent case.
+pub(crate) fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de> + Default,
+{
+    Ok(<Option<T> as serde::Deserialize>::deserialize(deserializer)?.unwrap_or_default())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

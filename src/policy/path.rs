@@ -15,13 +15,18 @@ use std::path::{Component, Path, PathBuf};
 
 use super::lexer::analyze_shell;
 use super::{ApprovalPolicy, Decision, PolicyError, PolicyRequest, Sandbox, ToolKind};
-use crate::util::fs::eval_symlinks;
+use crate::util::fs::{eval_symlinks, lexical_clean};
 use crate::util::json::go_quote;
 
 /// A target checked beneath a bound root, ready for the caller to open.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundPath {
+    /// The resolved absolute target path under the bound root.
     pub path: PathBuf,
+    /// `target` relative to the root. Callers that must re-base the path onto
+    /// a held directory (`/proc/self/fd/<fd>`) join this instead of
+    /// `strip_prefix`, which fails whenever the root is not lexically clean.
+    pub relative: PathBuf,
 }
 
 /// Go `Evaluate`: combine the sandbox and approval rules for one request.
@@ -148,7 +153,8 @@ pub fn bound_path(root: &Path, target: &Path) -> Result<BoundPath, PolicyError> 
     }
     let relative = inside_relative(root, target)?;
     Ok(BoundPath {
-        path: lexical_clean(&root.join(relative)),
+        path: lexical_clean(&root.join(&relative)),
+        relative,
     })
 }
 
@@ -269,28 +275,6 @@ fn go_abs(path: &Path) -> io::Result<PathBuf> {
         std::env::current_dir()?.join(path)
     };
     Ok(lexical_clean(&absolute))
-}
-
-/// Go `filepath.Clean`: remove `.` components and resolve `..` lexically.
-fn lexical_clean(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Prefix(prefix) => out.push(prefix.as_os_str()),
-            Component::RootDir => out.push(Path::new(std::path::MAIN_SEPARATOR_STR)),
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if !out.pop() && !path.is_absolute() {
-                    out.push("..");
-                }
-            }
-            Component::Normal(part) => out.push(part),
-        }
-    }
-    if out.as_os_str().is_empty() {
-        out.push(".");
-    }
-    out
 }
 
 /// Walk up from `target` until an existing component is found, collecting the

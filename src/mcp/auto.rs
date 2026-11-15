@@ -14,7 +14,6 @@ use std::path::Path;
 
 use serde_json::{Map, Value, json};
 
-use crate::agent::SessionManager;
 use crate::config::Config;
 use crate::decision::{Candidate, DecisionClient};
 use crate::mcp::server::ToolError;
@@ -67,13 +66,9 @@ impl AutoSelection {
 
 /// Choose a configured provider/model with the decision model and return its
 /// metadata. A failed decision is an error, never a fallback.
-///
-/// `manager` is accepted for interface parity with the Go server; selection
-/// itself never creates a session.
 pub async fn resolve_auto(
     ctx: &RunContext,
     config: &Config,
-    _manager: &SessionManager,
     task: &str,
     cwd: &Path,
 ) -> Result<AutoSelection, ToolError> {
@@ -186,7 +181,11 @@ fn auto_candidates(config: &Config) -> (Vec<Candidate>, Vec<String>) {
                 provider: name.clone(),
                 model: model.id.clone(),
                 api: provider.api.as_str().to_string(),
-                description: model_description(&model.id, &model.description),
+                description: model_description(
+                    &model.id,
+                    &model.description,
+                    config.auto.as_ref().map(|auto| &auto.descriptions),
+                ),
             });
         }
     }
@@ -203,23 +202,34 @@ fn auto_api_key(config: &Config) -> Result<String, ToolError> {
         .auto
         .as_ref()
         .ok_or_else(|| ToolError::internal("auto model selection is not configured"))?;
-    if let Some(key) = auto.key.as_deref().filter(|key| !key.is_empty()) {
-        return Ok(key.to_string());
-    }
     let name = auto.env_key.as_deref().unwrap_or("");
-    match std::env::var(name) {
-        Ok(value) if !value.is_empty() => Ok(value),
-        _ => Err(ToolError::internal(format!(
+    crate::config::api_key(auto.key.as_deref(), auto.env_key.as_deref()).ok_or_else(|| {
+        ToolError::internal(format!(
             "auto model selection: environment variable {name} (auto.env_key) must be set to the decision model API key"
-        ))),
-    }
+        ))
+    })
 }
 
-/// Go `decision.Description`: the configured description, a known default, a
-/// default for the suffix of a prefixed model id, or empty.
-fn model_description(model: &str, configured: &str) -> String {
+/// Go `decision.Description`: the provider's configured description, an
+/// `[auto.descriptions]` override, a known default, a default for the suffix of
+/// a prefixed model id, or empty.
+fn model_description(
+    model: &str,
+    configured: &str,
+    overrides: Option<&std::collections::BTreeMap<String, String>>,
+) -> String {
     if !configured.is_empty() {
         return configured.to_string();
+    }
+    if let Some(map) = overrides {
+        if let Some(description) = map.get(model) {
+            return description.clone();
+        }
+        if let Some((_, suffix)) = model.rsplit_once('/')
+            && let Some(description) = map.get(suffix)
+        {
+            return description.clone();
+        }
     }
     if let Some(description) = default_description(model) {
         return description.to_string();

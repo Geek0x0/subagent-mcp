@@ -71,6 +71,12 @@ enum Reply {
     },
     /// A non-2xx response body for the stream endpoint.
     Status { status: u16, body: Vec<u8> },
+    /// A non-2xx response with extra headers (for Retry-After hints).
+    StatusWithHeaders {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
     /// A non-2xx response whose body never terminates: the head promises more
     /// bytes than are sent, then the socket is held open.
     StatusHoldOpen { status: u16, body: Vec<u8> },
@@ -106,6 +112,21 @@ impl Reply {
     fn status(status: u16, body: impl Into<Vec<u8>>) -> Self {
         Reply::Status {
             status,
+            body: body.into(),
+        }
+    }
+
+    fn status_with_headers(
+        status: u16,
+        headers: &[(&str, &str)],
+        body: impl Into<Vec<u8>>,
+    ) -> Self {
+        Reply::StatusWithHeaders {
+            status,
+            headers: headers
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
             body: body.into(),
         }
     }
@@ -228,6 +249,9 @@ async fn serve_connection(
 fn reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        301 => "Moved Permanently",
+        307 => "Temporary Redirect",
+        308 => "Permanent Redirect",
         400 => "Bad Request",
         401 => "Unauthorized",
         429 => "Too Many Requests",
@@ -266,6 +290,24 @@ async fn write_reply(socket: &mut TcpStream, reply: &Reply) -> bool {
                 reason(*status),
                 body.len()
             );
+            let _ = socket.write_all(head.as_bytes()).await;
+            let _ = socket.write_all(body).await;
+            false
+        }
+        Reply::StatusWithHeaders {
+            status,
+            headers,
+            body,
+        } => {
+            let mut head = format!(
+                "HTTP/1.1 {status} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
+                reason(*status),
+                body.len()
+            );
+            for (name, value) in headers {
+                head.push_str(&format!("{name}: {value}\r\n"));
+            }
+            head.push_str("\r\n");
             let _ = socket.write_all(head.as_bytes()).await;
             let _ = socket.write_all(body).await;
             false
@@ -481,7 +523,7 @@ async fn adapter_text_turn_puts_the_expected_request_on_the_wire() {
     let mut req = turn_request("m");
     req.effort = Some("high".to_string());
     req.system = "sys".to_string();
-    req.messages = vec![user("hi")];
+    req.messages = std::sync::Arc::new(vec![user("hi")]);
     req.tools = vec![shell_spec()];
 
     let (result, deltas) = run_turn_with_deltas(&adapter, req).await;
@@ -550,7 +592,7 @@ async fn adapter_replays_reasoning_and_tool_results() {
     let adapter = adapter(&fake.base);
 
     let mut first_req = turn_request("m");
-    first_req.messages = vec![user("go")];
+    first_req.messages = std::sync::Arc::new(vec![user("go")]);
     first_req.tools = vec![shell_spec()];
     let first = run_turn(&adapter, first_req).await.unwrap();
 
@@ -582,7 +624,7 @@ async fn adapter_replays_reasoning_and_tool_results() {
     });
 
     let mut second_req = turn_request("m");
-    second_req.messages = history;
+    second_req.messages = std::sync::Arc::new(history);
     second_req.tools = vec![shell_spec()];
     run_turn(&adapter, second_req).await.unwrap();
 
@@ -622,7 +664,7 @@ async fn adapter_replays_reasoning_content_from_opaque() {
     let adapter = adapter(&fake.base);
 
     let mut req = turn_request("m");
-    req.messages = vec![user("hi")];
+    req.messages = std::sync::Arc::new(vec![user("hi")]);
     let first = run_turn(&adapter, req).await.unwrap();
     assert_eq!(first.reasoning.as_deref(), Some("think first"));
     assert_eq!(first.text, "answer");
@@ -642,7 +684,7 @@ async fn adapter_replays_reasoning_content_from_opaque() {
         opaque: Some(opaque),
     });
     let mut second_req = turn_request("m");
-    second_req.messages = history;
+    second_req.messages = std::sync::Arc::new(history);
     run_turn(&adapter, second_req).await.unwrap();
 
     let body = fake.request(1).json();
@@ -697,7 +739,7 @@ async fn turn_sends_configured_max_output_tokens_and_omits_an_unset_one() {
         let adapter = ChatCompletions::new("deepseek", &cfg).unwrap();
 
         let mut req = turn_request("m");
-        req.messages = vec![user("hi")];
+        req.messages = std::sync::Arc::new(vec![user("hi")]);
         run_turn(&adapter, req).await.unwrap();
 
         let body = fake.request(0).json();
@@ -723,7 +765,7 @@ async fn reasoning_models_reject_max_tokens_before_sending() {
         let adapter = ChatCompletions::new("deepseek", &cfg).unwrap();
 
         let mut req = turn_request(model);
-        req.messages = vec![user("hi")];
+        req.messages = std::sync::Arc::new(vec![user("hi")]);
         let err = run_turn(&adapter, req)
             .await
             .expect_err("a reasoning model must reject max_tokens");
@@ -750,7 +792,7 @@ async fn reasoning_guard_leaves_other_models_and_an_unset_limit_alone() {
         let adapter = ChatCompletions::new("deepseek", &cfg).unwrap();
 
         let mut req = turn_request(model);
-        req.messages = vec![user("hi")];
+        req.messages = std::sync::Arc::new(vec![user("hi")]);
         run_turn(&adapter, req)
             .await
             .unwrap_or_else(|e| panic!("{model}: {e}"));
@@ -764,7 +806,7 @@ async fn turn_rejects_a_tool_schema_that_is_not_an_object_without_sending() {
     let adapter = adapter(&fake.base);
 
     let mut req = turn_request("m");
-    req.messages = vec![user("hi")];
+    req.messages = std::sync::Arc::new(vec![user("hi")]);
     req.tools = vec![ToolSpec {
         name: "shell".to_string(),
         description: String::new(),
@@ -790,7 +832,7 @@ async fn turn_sends_an_object_for_an_absent_tool_schema() {
     let adapter = adapter(&fake.base);
 
     let mut req = turn_request("m");
-    req.messages = vec![user("hi")];
+    req.messages = std::sync::Arc::new(vec![user("hi")]);
     req.tools = vec![ToolSpec {
         name: "ping".to_string(),
         description: String::new(),
@@ -815,7 +857,7 @@ async fn turn_sends_the_callers_raw_tool_schema_bytes() {
     let adapter = adapter(&fake.base);
 
     let mut req = turn_request("m");
-    req.messages = vec![user("hi")];
+    req.messages = std::sync::Arc::new(vec![user("hi")]);
     req.tools = vec![ToolSpec {
         name: "count".to_string(),
         description: "count".to_string(),
@@ -1213,7 +1255,7 @@ async fn chat_turn_returns_when_the_server_keeps_the_stream_open_after_done() {
 }
 
 // ---------------------------------------------------------------------------
-// Framing: line-based, no blank-line requirement, [DONE], no scanner limit
+// Framing: line-based, no blank-line requirement, [DONE], 32 MiB line cap
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1232,6 +1274,25 @@ async fn framing_two_data_lines_without_a_blank_line_yield_two_events() {
     assert_eq!(result.text, "ab");
     assert_eq!(deltas, vec!["a".to_string(), "b".to_string()]);
     assert_eq!(result.usage.as_ref().map(|u| u.total), Some(3));
+}
+
+#[tokio::test]
+async fn framing_line_longer_than_32_mib_fails() {
+    // A single unbounded line must fail instead of buffering until OOM, the
+    // same cap the Messages and Responses readers enforce.
+    const CAP: usize = 32 * 1024 * 1024;
+    let mut body = b"data: ".to_vec();
+    body.extend(std::iter::repeat_n(b'x', CAP + 1));
+    body.extend_from_slice(b"\n\n");
+    let fake = spawn_fake(vec![Reply::sse(body)], Reply::models_ok(&[])).await;
+    let error = run_turn(&adapter(&fake.base), turn_request("m"))
+        .await
+        .expect_err("a line over the 32 MiB cap must fail");
+    assert!(
+        error.message.contains("token too long"),
+        "want a scanner cap error, got {:?}",
+        error.message
+    );
 }
 
 #[tokio::test]
@@ -1458,6 +1519,29 @@ async fn chat_turn_retries_retryable_statuses_then_succeeds() {
 }
 
 #[tokio::test]
+async fn chat_turn_honors_a_server_retry_after_header() {
+    let fake = spawn_fake(
+        vec![
+            Reply::status_with_headers(429, &[("Retry-After-Ms", "300")], "slow down"),
+            Reply::sse(sse_text("ok")),
+        ],
+        Reply::models_ok(&[]),
+    )
+    .await;
+    // The exponential seam is zero, so any observed wait comes from the header.
+    let adapter = adapter_with_backoff(&fake.base, Duration::ZERO);
+    let started = Instant::now();
+    let result = run_turn(&adapter, turn_request("m")).await.unwrap();
+    assert_eq!(result.text, "ok");
+    assert_eq!(fake.request_count(), 2);
+    assert!(
+        started.elapsed() >= Duration::from_millis(250),
+        "the 300ms Retry-After-Ms hint must delay the retry, waited {:?}",
+        started.elapsed()
+    );
+}
+
+#[tokio::test]
 async fn chat_turn_returns_an_error_after_retries_are_exhausted() {
     let fake = spawn_fake(
         vec![
@@ -1500,6 +1584,76 @@ async fn chat_turn_does_not_retry_a_non_retryable_status() {
         err.message
     );
     assert_eq!(fake.request_count(), 1);
+}
+
+#[tokio::test]
+async fn chat_turn_treats_a_redirect_as_an_http_error() {
+    // The shared client never follows a redirect, so a gateway 307 arrives
+    // here with a redirect body. Reading that body as an SSE stream would
+    // report a truncated stream; the turn must fail with the status and the
+    // `Location` instead, and must not retry.
+    let fake = spawn_fake(
+        vec![Reply::status_with_headers(
+            307,
+            &[("Location", "https://gateway.example/v1/chat/completions")],
+            sse_text("moved"),
+        )],
+        Reply::models_ok(&[]),
+    )
+    .await;
+    let adapter = adapter_with_backoff(&fake.base, Duration::ZERO);
+
+    let err = run_turn(&adapter, turn_request("m"))
+        .await
+        .expect_err("a 307 must fail the turn");
+    assert!(
+        err.message.contains("HTTP 307"),
+        "unexpected error: {}",
+        err.message
+    );
+    assert!(
+        err.message
+            .contains("https://gateway.example/v1/chat/completions"),
+        "the error must name the Location: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("redirects are not followed"),
+        "the error must say redirects are not followed: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("stream ended without a finish reason"),
+        "a redirect must not read as a truncated stream: {}",
+        err.message
+    );
+    assert_eq!(fake.request_count(), 1, "a 307 must not be retried");
+}
+
+#[tokio::test]
+async fn chat_turn_reports_a_redirect_without_a_location() {
+    let fake = spawn_fake(vec![Reply::status(301, "moved")], Reply::models_ok(&[])).await;
+    let adapter = adapter_with_backoff(&fake.base, Duration::ZERO);
+
+    let err = run_turn(&adapter, turn_request("m"))
+        .await
+        .expect_err("a 301 must fail the turn");
+    assert!(
+        err.message.contains("HTTP 301"),
+        "unexpected error: {}",
+        err.message
+    );
+    assert!(
+        err.message.contains("no Location header"),
+        "a redirect without a Location must still be explained: {}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("stream ended without a finish reason"),
+        "a redirect must not read as a truncated stream: {}",
+        err.message
+    );
+    assert_eq!(fake.request_count(), 1, "a 301 must not be retried");
 }
 
 #[tokio::test]
@@ -1816,7 +1970,7 @@ async fn concurrent_sessions_keep_their_own_keys_on_the_shared_pool() {
             )
             .unwrap();
             let mut req = turn_request(&format!("model-{index}"));
-            req.messages = vec![user("hi")];
+            req.messages = std::sync::Arc::new(vec![user("hi")]);
             let result = run_turn(&adapter, req).await;
             (index, key, result.map(|result| result.text))
         }));
@@ -1992,7 +2146,7 @@ async fn chat_completions_env_credentials_never_reach_the_wire() {
         ChatCompletions::new("deepseek", &config_with_key(&fake.base, "cfg-key-0123")).unwrap();
 
     let mut req = turn_request("m");
-    req.messages = vec![user("hi")];
+    req.messages = std::sync::Arc::new(vec![user("hi")]);
     let result = run_turn(&adapter, req).await.unwrap();
     assert_eq!(result.text, "hello");
     let ids = adapter.list_models().await.unwrap();

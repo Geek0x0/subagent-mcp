@@ -25,6 +25,9 @@ use crate::provider::{
 };
 use crate::util::run::RunContext;
 
+/// How long a capability probe (`model/list`, `account/read`) may take.
+pub const CAPABILITY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Delegates whole threads to a shared Codex app-server child.
 pub struct CodexAdapter {
     name: String,
@@ -60,9 +63,11 @@ impl CodexAdapter {
 
     /// A context for capability calls that have no caller-supplied run context.
     fn capability_ctx() -> RunContext {
+        // Capability probes have no caller deadline, but they must still give
+        // up instead of waiting forever on a wedged app-server.
         RunContext {
             cancel: CancellationToken::new(),
-            deadline: None,
+            deadline: Some(tokio::time::Instant::now() + CAPABILITY_TIMEOUT),
         }
     }
 }
@@ -186,4 +191,19 @@ fn register_shutdown() {
     ONCE.call_once(|| {
         crate::provider::factory::register_shutdown(Some(Arc::new(pool::shutdown)));
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_calls_have_a_bounded_deadline() {
+        assert_eq!(CAPABILITY_TIMEOUT, std::time::Duration::from_secs(30));
+        let ctx = CodexAdapter::capability_ctx();
+        let deadline = ctx.deadline.expect("capability calls must be bounded");
+        let remaining = deadline - tokio::time::Instant::now();
+        assert!(remaining > std::time::Duration::ZERO);
+        assert!(remaining <= CAPABILITY_TIMEOUT);
+    }
 }

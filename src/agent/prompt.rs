@@ -88,7 +88,7 @@ pub fn load_agents_md(cwd: &Path) -> Result<String, PromptError> {
         eval_symlinks(cwd).map_err(|e| prompt_error(format!("resolve cwd for AGENTS.md: {e}")))?;
 
     // Go `repo.Root(dir)`, else `root = dir`.
-    let root = repo_root(&dir).unwrap_or_else(|| dir.clone());
+    let root = crate::repo::root(&dir).unwrap_or_else(|| dir.clone());
 
     // dirs = [cwd, ..., root] (cwd first, root last).
     let mut dirs: Vec<PathBuf> = Vec::new();
@@ -113,7 +113,20 @@ pub fn load_agents_md(cwd: &Path) -> Result<String, PromptError> {
             break;
         }
         let path = d.join("AGENTS.md");
-        let data = match std::fs::read(&path) {
+        // Refuse a symlink that escapes the repository root: otherwise a repo
+        // could point AGENTS.md at an arbitrary readable file (e.g. a private
+        // key) and have its contents sent to the model provider.
+        if let Ok(resolved) = std::fs::canonicalize(&path) {
+            let root = std::fs::canonicalize(&root).unwrap_or_else(|_| root.clone());
+            if !resolved.starts_with(&root) {
+                return Err(prompt_error(format!(
+                    "read {}: resolves outside the repository root {}",
+                    path.display(),
+                    root.display()
+                )));
+            }
+        }
+        let data = match read_agents_md(&path, remaining) {
             Ok(data) => data,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => {
@@ -164,23 +177,34 @@ pub fn load_agents_md(cwd: &Path) -> Result<String, PromptError> {
     Ok(out)
 }
 
-/// Go `repo.Root`: nearest ancestor (inclusive) containing a `.git` entry.
-/// `symlink_metadata` is Go `os.Lstat`, so a `.git` symlink counts too.
-fn repo_root(dir: &Path) -> Option<PathBuf> {
-    let mut current = dir.to_path_buf();
-    loop {
-        if std::fs::symlink_metadata(current.join(".git")).is_ok() {
-            return Some(current);
-        }
-        match current.parent() {
-            Some(parent) if parent != current && !parent.as_os_str().is_empty() => {
-                current = parent.to_path_buf();
-            }
-            _ => return None,
-        }
+/// Read at most `limit + 1` bytes of an `AGENTS.md` file, and only when it is
+/// a regular file. The extra byte is how truncation is detected; the cap keeps
+/// a huge (or `/dev/zero`-style) `AGENTS.md` from being read into memory.
+fn read_agents_md(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let metadata = std::fs::metadata(path)?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
     }
+    let file = std::fs::File::open(path)?;
+    // Re-check the opened descriptor: the path may have been swapped between
+    // the stat above and the open.
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let mut data = Vec::with_capacity(limit.min(metadata.len() as usize).saturating_add(1));
+    file.take(limit as u64 + 1).read_to_end(&mut data)?;
+    Ok(data)
 }
 
+/// Go `repo.Root`: nearest ancestor (inclusive) containing a `.git` entry.
+/// `symlink_metadata` is Go `os.Lstat`, so a `.git` symlink counts too.
 fn is_continuation(b: u8) -> bool {
     b & 0xC0 == 0x80
 }

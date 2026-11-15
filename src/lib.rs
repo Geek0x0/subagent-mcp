@@ -1,12 +1,12 @@
 /// System-prompt construction, in-memory session management, and the agent
-/// rollout payload builders (Task 22 / Go `internal/agent`).
+/// rollout payload builders (Go `internal/agent`).
 pub mod agent;
 pub mod check;
 pub mod cli;
 pub mod config;
 pub mod decision;
 /// MCP stdio server, the `subagent`/`subagent-reply` tool handlers, and auto
-/// model selection (Tasks 5–7, 24).
+/// model selection.
 pub mod mcp;
 pub mod patch;
 pub mod policy;
@@ -20,4 +20,4 @@ pub mod sandbox;
 pub mod tools;
 pub mod util;
 
-pub const VERSION: &str = "0.14.0";
+pub const VERSION: &str = "0.14.1";

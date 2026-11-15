@@ -21,9 +21,10 @@ use std::ffi::{OsStr, OsString};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use subagent_mcp::policy::lexer::analyze_shell;
 use subagent_mcp::tools::process::CommandSpec;
 use subagent_mcp::tools::shell::{
     DEFAULT_SHELL_TIMEOUT, MAX_OUTPUT_BYTES, MAX_SHELL_TIMEOUT, SHELL_SCRIPT, SandboxLauncher,
@@ -79,7 +80,7 @@ __subagent_mcp_safe_git() {
         "alias.$subcommand=" core.fsmonitor=false core.fsmonitorHookPath= diff.external=
         core.pager=cat core.sshCommand= credential.helper= core.hooksPath=/dev/null
         log.showSignature=false status.submoduleSummary=false submodule.recurse=false
-        diff.submodule=short interactive.diffFilter=
+        diff.submodule=short interactive.diffFilter= protocol.allow=never protocol.ext.allow=never
         gpg.program=/bin/false gpg.openpgp.program=/bin/false gpg.x509.program=/bin/false
         gpg.ssh.program=/bin/false
     )
@@ -112,12 +113,16 @@ __subagent_mcp_safe_git() {
         done <<< "$drivers"
     fi
     case "$subcommand" in
+    status|diff) set -- --ignore-submodules=dirty "$@" ;;
+    esac
+    case "$subcommand" in
     diff|show|log|blame) set -- --no-ext-diff --no-textconv "$@" ;;
     esac
     (
         local i
         export GIT_CONFIG_COUNT=${#keys[@]} GIT_CONFIG_PARAMETERS= GIT_OPTIONAL_LOCKS=0 \
-            GIT_EXTERNAL_DIFF= GIT_PAGER=cat PAGER=cat GIT_SSH= GIT_SSH_COMMAND= GIT_ASKPASS=
+            GIT_NO_LAZY_FETCH=1 GIT_EXTERNAL_DIFF= GIT_PAGER=cat PAGER=cat GIT_SSH= \
+            GIT_SSH_COMMAND= GIT_ASKPASS=
         for ((i = 0; i < ${#keys[@]}; i++)); do
             export "GIT_CONFIG_KEY_$i=${keys[i]}" "GIT_CONFIG_VALUE_$i=${vals[i]}"
         done
@@ -163,6 +168,28 @@ async fn run(cwd: &Path, command: &str, timeout: Duration) -> ShellResult {
 fn chmod_exec(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn git_available() -> bool {
+    Command::new("git")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// Change only the timestamps: the index entry becomes stat-dirty while the
+/// content still matches, so git content-compares (and therefore runs the clean
+/// filter) when it visits the submodule's worktree. Every call picks a distinct
+/// mtime so an index refresh from an earlier probe cannot mask the next one.
+fn touch_old(path: &Path) {
+    static GENERATION: AtomicU64 = AtomicU64::new(0);
+    let generation = GENERATION.fetch_add(1, Ordering::SeqCst);
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    let then = std::time::UNIX_EPOCH + Duration::from_secs(1_500_000_000 + generation);
+    file.set_times(fs::FileTimes::new().set_accessed(then).set_modified(then))
+        .unwrap();
 }
 
 /// Snapshot and restore process-global env vars (serialized by `SERIAL`).
@@ -246,7 +273,7 @@ fn wait_for_process_exit(pid: i32, timeout: Duration) -> bool {
 async fn shell_script_is_byte_exact() {
     let _g = SERIAL.lock().await;
     assert_eq!(SHELL_SCRIPT, EXPECTED_SCRIPT);
-    assert_eq!(SHELL_SCRIPT.len(), 3516);
+    assert_eq!(SHELL_SCRIPT.len(), 3689);
     // A few structural anchors, including the safe-git wrapper.
     assert!(SHELL_SCRIPT.starts_with("exact_count=$1\n"));
     assert!(SHELL_SCRIPT.ends_with("builtin eval \"$__subagent_mcp_command\""));
@@ -259,6 +286,9 @@ async fn shell_script_is_byte_exact() {
     assert!(SHELL_SCRIPT.contains(
         "'^(filter\\..*\\.(clean|smudge|process|required)|diff\\..*\\.(textconv|command))$'"
     ));
+    assert!(SHELL_SCRIPT.contains("protocol.allow=never protocol.ext.allow=never"));
+    assert!(SHELL_SCRIPT.contains("GIT_NO_LAZY_FETCH=1"));
+    assert!(SHELL_SCRIPT.contains("status|diff) set -- --ignore-submodules=dirty \"$@\" ;;"));
     assert!(SHELL_SCRIPT.contains("builtin eval \"$__subagent_mcp_command\""));
 }
 
@@ -865,6 +895,202 @@ async fn safe_git_neutralizes_repository_diff_external() {
         !marker.exists(),
         "wrapper ran the repository-configured program: {:?}",
         r.output
+    );
+}
+
+/// A submodule whose own `.git/config` defines a clean filter must never be
+/// entered by the wrapped `git status`/`git diff`: the wrapper forces
+/// `--ignore-submodules=dirty`, which keeps pointer changes visible without
+/// reading the submodule worktree. Every form that overrides that flag is
+/// rejected by the lexer.
+#[tokio::test]
+async fn safe_git_does_not_run_submodule_clean_filters() {
+    let _g = SERIAL.lock().await;
+    if !git_available() {
+        eprintln!("skipping safe_git_does_not_run_submodule_clean_filters: git not found");
+        return;
+    }
+    let _env = EnvRestore::capture(GIT_ENV_KEYS);
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("home");
+    let repo = dir.path().join("repo");
+    let sub = repo.join("sub");
+    let marker = dir.path().join("marker");
+    let clean = dir.path().join("clean.sh");
+    clean_git_env(&home);
+
+    // Build the submodule in place, then record it as a gitlink. No clone and
+    // no network are involved, and `sub` is a real repository with its own
+    // `.git/config` for the filter.
+    fs::create_dir_all(&sub).unwrap();
+    git_ok(&sub, &["init", "-q"]);
+    git_ok(&sub, &["config", "user.email", "test@example.com"]);
+    git_ok(&sub, &["config", "user.name", "Test"]);
+    fs::write(sub.join("f.txt"), "one\n").unwrap();
+    fs::write(sub.join(".gitattributes"), "f.txt filter=x\n").unwrap();
+    git_ok(&sub, &["add", "f.txt", ".gitattributes"]);
+    git_ok(&sub, &["commit", "-qm", "sub initial"]);
+    let first_head = String::from_utf8(git_cmd(&sub, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+
+    git_ok(&repo, &["init", "-q"]);
+    git_ok(&repo, &["config", "user.email", "test@example.com"]);
+    git_ok(&repo, &["config", "user.name", "Test"]);
+    fs::write(
+        repo.join(".gitmodules"),
+        "[submodule \"sub\"]\n\tpath = sub\n\turl = ./sub\n",
+    )
+    .unwrap();
+    let cache_info = format!("160000,{first_head},sub");
+    git_ok(
+        &repo,
+        &["update-index", "--add", "--cacheinfo", &cache_info],
+    );
+    git_ok(&repo, &["add", ".gitmodules"]);
+    git_ok(&repo, &["commit", "-qm", "add submodule"]);
+
+    fs::write(
+        &clean,
+        format!(
+            "#!/bin/sh\nprintf 'ran\\n' >> '{}'\ncat\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    chmod_exec(&clean);
+    let clean = clean.to_str().unwrap();
+    git_ok(&sub, &["config", "--local", "filter.x.clean", clean]);
+
+    // Every bypass form named in the hardening unit is rejected before the
+    // wrapper gets to run.
+    for command in [
+        "git status --ignore-submodules=none",
+        "git status --ignore-submodules=untracked",
+        "git status --ignore-s=none",
+        "git status --no-ignore-submodules",
+        "git diff --ignore-submodules=none",
+        "git diff HEAD --ignore-submodules=none",
+        "git ls-files --rec",
+        "git ls-files --recu",
+        "git ls-files --recur",
+        "git ls-files --recurs",
+        "git branch --rec",
+    ] {
+        let analysis = analyze_shell(command).expect("bypass form should lex");
+        assert!(!analysis.allowed, "lexer allowed {command:?}");
+    }
+
+    // Positive control: with submodule recursion enabled, git enters the
+    // submodule and its clean filter writes the marker.
+    touch_old(&sub.join("f.txt"));
+    let _ = fs::remove_file(&marker);
+    let plain = git_cmd(&repo, &["status", "--ignore-submodules=none"]);
+    assert!(
+        plain.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(
+        marker.exists(),
+        "positive control: plain git did not run the submodule clean filter"
+    );
+
+    // `untracked` and `git diff` recurse into the worktree as well.
+    touch_old(&sub.join("f.txt"));
+    let _ = fs::remove_file(&marker);
+    let untracked = git_cmd(&repo, &["status", "--ignore-submodules=untracked"]);
+    assert!(
+        untracked.status.success(),
+        "{}",
+        String::from_utf8_lossy(&untracked.stderr)
+    );
+    assert!(
+        marker.exists(),
+        "untracked unexpectedly skipped the submodule clean filter"
+    );
+
+    touch_old(&sub.join("f.txt"));
+    let _ = fs::remove_file(&marker);
+    let plain_diff = git_cmd(&repo, &["diff", "--ignore-submodules=none"]);
+    assert!(
+        plain_diff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&plain_diff.stderr)
+    );
+    assert!(
+        marker.exists(),
+        "positive control: git diff did not run the submodule clean filter"
+    );
+
+    // `dirty` ignores the worktree change (no filter) while still noticing
+    // pointer changes.
+    touch_old(&sub.join("f.txt"));
+    let _ = fs::remove_file(&marker);
+    let dirty = git_cmd(&repo, &["status", "--ignore-submodules=dirty"]);
+    assert!(
+        dirty.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dirty.stderr)
+    );
+    assert!(
+        !marker.exists(),
+        "dirty unexpectedly ran the submodule clean filter"
+    );
+
+    // The wrapper forces `dirty`, so neither permitted invocation may enter the
+    // submodule worktree.
+    for command in ["git status", "git diff"] {
+        touch_old(&sub.join("f.txt"));
+        let _ = fs::remove_file(&marker);
+        let r = run(&repo, command, Duration::from_secs(10)).await;
+        assert!(!r.is_error, "{command}: err {:?}", r.output);
+        assert_eq!(r.exit_code, 0, "{command}: output {:?}", r.output);
+        assert!(
+            !marker.exists(),
+            "{command} ran the submodule clean filter: {:?}",
+            r.output
+        );
+    }
+
+    // A new submodule commit moves the gitlink; `dirty` still reports it.
+    git_ok(&sub, &["commit", "--allow-empty", "-qm", "sub second"]);
+    let second_head = String::from_utf8(git_cmd(&sub, &["rev-parse", "HEAD"]).stdout)
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_ne!(first_head, second_head);
+
+    touch_old(&sub.join("f.txt"));
+    let _ = fs::remove_file(&marker);
+    let status = run(&repo, "git status", Duration::from_secs(10)).await;
+    assert!(!status.is_error, "err: {:?}", status.output);
+    assert_eq!(status.exit_code, 0, "output = {:?}", status.output);
+    assert!(
+        status.output.contains("new commits"),
+        "status hid the submodule pointer change: {:?}",
+        status.output
+    );
+    assert!(
+        !marker.exists(),
+        "git status ran the submodule clean filter: {:?}",
+        status.output
+    );
+
+    touch_old(&sub.join("f.txt"));
+    let diff = run(&repo, "git diff", Duration::from_secs(10)).await;
+    assert!(!diff.is_error, "err: {:?}", diff.output);
+    assert_eq!(diff.exit_code, 0, "output = {:?}", diff.output);
+    assert!(
+        diff.output.contains(&first_head) && diff.output.contains(&second_head),
+        "diff hid the submodule pointer change: {:?}",
+        diff.output
+    );
+    assert!(
+        !marker.exists(),
+        "git diff ran the submodule clean filter: {:?}",
+        diff.output
     );
 }
 

@@ -9,19 +9,14 @@ use serde::Deserialize;
 use serde_json::value::RawValue;
 use serde_json::{Map, Value, json};
 
+use crate::util::json::null_default;
+
 /// Go `json.Unmarshal` treats an explicit `null` for a non-pointer struct field
 /// as the zero value, while serde's `#[serde(default)]` only covers a *missing*
-/// field. Route non-optional fields through this helper so `null` collapses to
-/// `T::default()` and a notification the app-server padded with nulls is not
-/// dropped.
-fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de> + Default,
-{
-    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
-}
-
+/// field. Non-optional fields use the shared
+/// [`crate::util::json::null_default`] so `null` collapses to `T::default()` and
+/// a notification the app-server padded with nulls is not dropped.
+///
 /// The subset of notification params the thread and event mapper consume.
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]

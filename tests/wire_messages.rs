@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use subagent_mcp::provider::messages::{
     MAX_PAUSE_CONTINUATIONS, MAX_RETRIES, Messages, RetryDelay,
 };
+use subagent_mcp::provider::transport::MAX_SERVER_RETRY_DELAY;
 use subagent_mcp::provider::{
     ModelLister, Provider, ProviderError, Role, ToolCall, ToolSpec, TurnRequest, TurnResult, Usage,
 };
@@ -1038,14 +1039,17 @@ async fn base_url_path_prefix_is_kept_on_the_wire() {
 }
 
 #[tokio::test]
-async fn invalid_retry_after_headers_clamp_to_zero_like_go() {
-    for (name, value) in [
-        ("Retry-After-Ms", "-1"),
-        ("Retry-After-Ms", "NaN"),
-        ("Retry-After-Ms", "1e13"),
-        ("Retry-After", "inf"),
-        ("Retry-After", "1e10"),
-        ("Retry-After", "1e300"),
+async fn invalid_retry_after_headers_are_bounded() {
+    // Negative and NaN mean "retry now" (Go's time.Duration conversion); huge
+    // and infinite values saturate at the shared server-delay cap instead of
+    // overflowing to an immediate retry.
+    for (name, value, expected) in [
+        ("Retry-After-Ms", "-1", Duration::ZERO),
+        ("Retry-After-Ms", "NaN", Duration::ZERO),
+        ("Retry-After-Ms", "1e13", MAX_SERVER_RETRY_DELAY),
+        ("Retry-After", "inf", MAX_SERVER_RETRY_DELAY),
+        ("Retry-After", "1e10", MAX_SERVER_RETRY_DELAY),
+        ("Retry-After", "1e300", MAX_SERVER_RETRY_DELAY),
     ] {
         let mock = Mock::start(vec![
             ScriptMessage::http_error(429)
@@ -1072,8 +1076,8 @@ async fn invalid_retry_after_headers_clamp_to_zero_like_go() {
         assert_eq!(mock.request_count(), 2, "{name}: {value}");
         assert_eq!(
             *recorded.lock().unwrap(),
-            vec![(0, Some(Duration::ZERO))],
-            "{name}: {value} must clamp to an immediate retry like Go"
+            vec![(0, Some(expected))],
+            "{name}: {value} must clamp to {expected:?}"
         );
     }
 }

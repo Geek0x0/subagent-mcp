@@ -125,15 +125,7 @@ fn run_with_rollout(
     let _codex_home = EnvGuard::set("CODEX_HOME", home.path());
 
     let thread_id = uuid::Uuid::new_v4().to_string();
-    let recorder = RolloutRecorder::create(
-        &thread_id,
-        cwd.path(),
-        DEFAULT_SYSTEM_PROMPT,
-        "mock",
-        "mock-model",
-        "high",
-    )
-    .expect("rollout file creates");
+    let recorder = RolloutRecorder::create(&thread_id).expect("rollout file creates");
 
     let provider = Arc::new(
         subagent_mcp::provider::ChatCompletions::new("mock", &provider_config(&mock.url()))

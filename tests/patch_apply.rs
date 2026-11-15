@@ -13,8 +13,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use subagent_mcp::patch::{
-    Change, ChangeKind, Chunk, FS, Hunk, OS, Patch, PatchError, commit_fs, parse_patch, plan_fs,
-    summary,
+    Change, ChangeKind, Chunk, FS, Hunk, MAX_PATCH_READ_BYTES, OS, Patch, PatchError, commit_fs,
+    parse_patch, plan_fs, summary,
 };
 
 fn bytes(s: &str) -> Vec<u8> {
@@ -873,6 +873,252 @@ fn plan_failure_writes_nothing() {
             "{name}: a.txt modified"
         );
     }
+}
+
+#[test]
+fn update_of_an_oversized_file_is_rejected() {
+    // The planner must not read an arbitrarily large file into memory: a
+    // stat-size check rejects it before the read, like the file tools do.
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big.txt");
+    let file = fs::File::create(&big).unwrap();
+    file.set_len(MAX_PATCH_READ_BYTES + 1).unwrap();
+    let patch = parse_in(
+        dir.path(),
+        &patch_text(&["*** Update File: big.txt", "@@", "-old", "+new"]),
+    );
+    let error = plan_fs(&OS, &patch).expect_err("oversized read must fail");
+    assert!(
+        error.to_string().contains("too large"),
+        "want a size error, got {error}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Write destinations. `check_target` validates a target with `lstat` and
+// deliberately lets symlinks through, so the `Move to` destination must also
+// be checked with a symlink-following `stat` (exactly like the plain Add /
+// Update paths) before anything is written.
+// ---------------------------------------------------------------------------
+
+/// Run `f` on a worker thread, failing the test instead of blocking forever.
+/// A commit that opens a FIFO for writing blocks until a reader appears, so a
+/// regression has to surface as a timeout, never as a wedged test binary.
+#[cfg(unix)]
+fn with_timeout<T: Send + 'static>(seconds: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(seconds))
+        .unwrap_or_else(|_| panic!("operation blocked for more than {seconds}s"))
+}
+
+#[cfg(unix)]
+fn make_fifo(path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn move_onto_a_symlink_to_a_fifo_is_rejected_without_blocking() {
+    use std::os::unix::fs::symlink;
+    let dir = tempfile::tempdir().unwrap();
+    let source = dir.path().join("a.txt");
+    write_file(&source, b"one\n");
+    let fifo = dir.path().join("pipe");
+    make_fifo(&fifo);
+    symlink(&fifo, dir.path().join("link")).unwrap();
+
+    // Without the destination check the commit follows `link` and opens the
+    // FIFO for writing, which blocks until a reader appears.
+    let cwd = dir.path().to_path_buf();
+    let (result, source_after) = with_timeout(10, move || {
+        let patch = parse_in(
+            &cwd,
+            &patch_text(&[
+                "*** Update File: a.txt",
+                "*** Move to: link",
+                "-one",
+                "+ONE",
+            ]),
+        );
+        let result = plan_fs(&OS, &patch).and_then(|changes| commit_fs(&OS, &changes));
+        (result, fs::read(cwd.join("a.txt")).unwrap())
+    });
+    let error = result.expect_err("a move onto a FIFO must be rejected");
+    assert!(
+        error.to_string().contains("non-regular file"),
+        "want a non-regular file rejection, got {error}"
+    );
+    assert_eq!(source_after, bytes("one\n"), "the source must be untouched");
+    assert_eq!(
+        fs::read_link(dir.path().join("link")).unwrap(),
+        fifo,
+        "the link must still be in place"
+    );
+    assert_eq!(
+        fs::symlink_metadata(&fifo).unwrap().len(),
+        0,
+        "nothing may be written through the FIFO"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn move_onto_a_symlink_to_a_device_is_rejected() {
+    use std::os::unix::fs::symlink;
+    // `/dev/null` stands in for the exploit target: a `Move to` naming a link
+    // to a character device used to commit, writing the patch bytes into the
+    // device (`/proc/self/fd/1` would forge JSON-RPC frames onto stdout).
+    if !Path::new("/dev/null").exists() {
+        eprintln!("skip: /dev/null is missing");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    write_file(&dir.path().join("a.txt"), b"one\n");
+    symlink("/dev/null", dir.path().join("link")).unwrap();
+    let patch = parse_in(
+        dir.path(),
+        &patch_text(&[
+            "*** Update File: a.txt",
+            "*** Move to: link",
+            "-one",
+            "+ONE",
+        ]),
+    );
+    let error = plan_fs(&OS, &patch).expect_err("a move onto a device must be rejected");
+    assert!(
+        error.to_string().contains("non-regular file"),
+        "want a non-regular file rejection, got {error}"
+    );
+    assert_eq!(
+        read_file(&dir.path().join("a.txt")),
+        bytes("one\n"),
+        "the source must be untouched"
+    );
+    assert_eq!(
+        fs::read_link(dir.path().join("link")).unwrap(),
+        Path::new("/dev/null"),
+        "the link must be untouched"
+    );
+}
+
+#[test]
+fn an_ordinary_move_still_works() {
+    let dir = tempfile::tempdir().unwrap();
+    write_file(&dir.path().join("a.txt"), b"one\n");
+    let changes = apply_text(
+        dir.path(),
+        &patch_text(&[
+            "*** Update File: a.txt",
+            "*** Move to: moved/b.txt",
+            "-one",
+            "+ONE",
+        ]),
+    )
+    .unwrap();
+    assert!(!dir.path().join("a.txt").exists(), "the source is gone");
+    assert_eq!(
+        read_file(&dir.path().join("moved").join("b.txt")),
+        bytes("ONE\n")
+    );
+    assert_eq!(
+        changes[0].move_to,
+        Some(dir.path().join("moved").join("b.txt"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn move_onto_a_symlink_to_a_regular_file_writes_through_the_link() {
+    use std::os::unix::fs::symlink;
+    // Consistency with the plain paths: `check_write_target` follows symlinks
+    // and accepts a link that resolves to a regular file, so an in-place
+    // Update writes through such a link. A `Move to` naming the same link must
+    // behave identically.
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("target.txt");
+    let link = dir.path().join("link");
+    write_file(&target, b"old\n");
+    symlink("target.txt", &link).unwrap();
+
+    apply_text(
+        dir.path(),
+        &patch_text(&["*** Update File: link", "-old", "+updated"]),
+    )
+    .unwrap();
+    assert_eq!(
+        read_file(&target),
+        bytes("updated\n"),
+        "an update writes through the link"
+    );
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "an update keeps the link"
+    );
+
+    write_file(&dir.path().join("b.txt"), b"two\n");
+    let changes = apply_text(
+        dir.path(),
+        &patch_text(&[
+            "*** Update File: b.txt",
+            "*** Move to: link",
+            "-two",
+            "+TWO",
+        ]),
+    )
+    .unwrap();
+    assert_eq!(
+        read_file(&target),
+        bytes("TWO\n"),
+        "a move writes through the link"
+    );
+    assert!(
+        fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink(),
+        "a move keeps the link"
+    );
+    assert!(!dir.path().join("b.txt").exists(), "the source is gone");
+    assert_eq!(changes[0].move_to, Some(link));
+}
+
+#[test]
+fn move_onto_an_oversized_file_is_rejected() {
+    // The destination is snapshotted before it is overwritten, so it must fit
+    // the same read limit an Update source obeys; otherwise the plan would
+    // pass and the commit would fail partway through the patch.
+    let dir = tempfile::tempdir().unwrap();
+    write_file(&dir.path().join("a.txt"), b"one\n");
+    let big = dir.path().join("big.txt");
+    let file = fs::File::create(&big).unwrap();
+    file.set_len(MAX_PATCH_READ_BYTES + 1).unwrap();
+    let patch = parse_in(
+        dir.path(),
+        &patch_text(&[
+            "*** Update File: a.txt",
+            "*** Move to: big.txt",
+            "-one",
+            "+ONE",
+        ]),
+    );
+    let error = plan_fs(&OS, &patch).expect_err("an oversized destination must be rejected");
+    assert!(
+        error.to_string().contains("too large"),
+        "want a size error, got {error}"
+    );
+    assert_eq!(
+        read_file(&dir.path().join("a.txt")),
+        bytes("one\n"),
+        "the source must be untouched"
+    );
 }
 
 // ---------------------------------------------------------------------------

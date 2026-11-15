@@ -8,7 +8,9 @@ pub struct ApprovalRequest {
     pub thread_id: String,
     pub tool: String,
     pub command: Option<String>,
-    pub path: Option<String>,
+    /// Every path the operation touches, in order. Rendered one per line so a
+    /// long list cannot be truncated into an unreadable single value.
+    pub paths: Vec<String>,
     pub reason: String,
 }
 
@@ -41,7 +43,7 @@ mod tests {
             thread_id: "thread-1".into(),
             tool: "shell".into(),
             command: Some("ls".into()),
-            path: None,
+            paths: Vec::new(),
             reason: "needs access".into(),
         };
         assert!(Always(true).approve(&ctx, req).await);
@@ -49,7 +51,7 @@ mod tests {
             thread_id: "thread-1".into(),
             tool: "write_file".into(),
             command: None,
-            path: Some("a.txt".into()),
+            paths: vec!["a.txt".into()],
             reason: "write".into(),
         };
         assert!(!Always(false).approve(&ctx, req2).await);

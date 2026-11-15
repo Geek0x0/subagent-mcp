@@ -63,7 +63,7 @@ fn ensure_test_factory() {
     ONCE.get_or_init(|| {
         factory::register(
             Api::ChatCompletions.as_str(),
-            Arc::new(|_name, cfg, _key| {
+            Arc::new(|_name, cfg| {
                 STUBS
                     .lock()
                     .unwrap()
@@ -233,6 +233,7 @@ fn test_config(providers: Vec<(&str, Arc<dyn Provider>)>) -> Config {
         path: PathBuf::from("/test/config.toml"),
         providers: map,
         auto: None,
+        limits: Default::default(),
     }
 }
 
@@ -647,6 +648,7 @@ fn model_union_across_providers_deduplicates_and_marks_defaults() {
         path: PathBuf::from("/test/config.toml"),
         providers: BTreeMap::from([("a".to_string(), a), ("b".to_string(), b)]),
         auto: None,
+        limits: Default::default(),
     };
     let tools = tools(config);
     let schema = tools.definitions()[0].input_schema.to_string();
@@ -828,6 +830,46 @@ async fn rejects_invalid_config_reasoning_effort() {
             );
         }
     }
+}
+
+#[tokio::test]
+async fn dirty_cwd_is_normalized_before_the_session_starts() {
+    // A cwd carrying `.`/`..` must be cleaned up front: the policy layer
+    // compares it lexically with tool targets, and a dirty root makes every
+    // confinement check fall through.
+    let _env = env_guard();
+    let dir = cwd();
+    std::fs::create_dir(dir.join("sub")).unwrap();
+    let provider = Arc::new(StubProvider::with_turns(
+        "deepseek",
+        vec![
+            tool_turn(vec![subagent_mcp::provider::ToolCall {
+                id: "c1".into(),
+                name: "write_file".into(),
+                arguments: json!({"path": "out.txt", "content": "ok"}).to_string(),
+            }]),
+            text_turn("done"),
+        ],
+    ));
+    let tools = tools(test_config(vec![("deepseek", provider)]));
+    let result = call(
+        &tools,
+        "subagent",
+        json!({
+            "prompt": "hi",
+            "cwd": dir.join("sub/.././"),
+            "sandbox": "workspace-write",
+            "approval-policy": "never",
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error(&result), "{}", text(&result));
+    assert_eq!(
+        std::fs::read(dir.join("out.txt")).unwrap(),
+        b"ok",
+        "a relative write must land in the real cwd"
+    );
 }
 
 #[tokio::test]
@@ -1354,6 +1396,7 @@ fn codex_config(command: &str) -> Config {
         path: PathBuf::from("/test/config.toml"),
         providers: BTreeMap::from([("codex".to_string(), codex_provider_config(command))]),
         auto: None,
+        limits: Default::default(),
     }
 }
 
@@ -1591,7 +1634,7 @@ async fn codex_auth_and_list_are_reachable_through_the_factory() {
     let _tools = tools(config.clone());
 
     let adapter =
-        factory::new("codex", &config.providers["codex"], "").expect("registered Codex adapter");
+        factory::new("codex", &config.providers["codex"]).expect("registered Codex adapter");
     let codex = (adapter.as_ref() as &dyn std::any::Any)
         .downcast_ref::<CodexAdapter>()
         .expect("factory returns a CodexAdapter");
@@ -1617,7 +1660,7 @@ async fn codex_auth_reports_logged_out() {
     );
     let config = codex_config(&peer.command);
     let _tools = tools(config.clone());
-    let adapter = factory::new("codex", &config.providers["codex"], "").unwrap();
+    let adapter = factory::new("codex", &config.providers["codex"]).unwrap();
     let codex = (adapter.as_ref() as &dyn std::any::Any)
         .downcast_ref::<CodexAdapter>()
         .unwrap();
@@ -1645,7 +1688,7 @@ fn factory_new_works_for_responses() {
         max_nudges: None,
         extra_body: None,
     };
-    assert!(factory::new("responses", &cfg, "test-key").is_ok());
+    assert!(factory::new("responses", &cfg).is_ok());
     assert!(factory::lookup(Api::Responses.as_str()).is_some());
 }
 
@@ -2356,4 +2399,242 @@ fn annotations_match_go_defaults() {
     for definition in tools.definitions() {
         assert_eq!(definition.annotations.as_ref(), Some(&annotations()));
     }
+}
+
+#[tokio::test]
+async fn server_limits_clamp_a_start_request() {
+    // An orchestrator that was tricked into asking for more access must be
+    // clamped to the operator's ceiling, and the clamp must be visible.
+    let _env = env_guard();
+    let dir = cwd();
+    let provider = Arc::new(StubProvider::with_turns("deepseek", vec![text_turn("ok")]));
+    let mut config = test_config(vec![("deepseek", provider)]);
+    config.limits.max_sandbox = Some(subagent_mcp::policy::Sandbox::ReadOnly);
+    config.limits.max_approval_policy = Some(subagent_mcp::policy::ApprovalPolicy::OnRequest);
+    let tools = tools(config);
+    let result = call(
+        &tools,
+        "subagent",
+        json!({
+            "prompt": "hi",
+            "cwd": dir,
+            "sandbox": "danger-full-access",
+            "approval-policy": "never",
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error(&result), "{}", text(&result));
+    let output = text(&result);
+    assert!(
+        output.contains("sandbox clamped from danger-full-access to read-only"),
+        "{output}"
+    );
+    assert!(
+        output.contains("approval-policy clamped from never to on-request"),
+        "{output}"
+    );
+    assert!(output.contains("ok"), "{output}");
+}
+
+#[tokio::test]
+async fn server_allowed_cwd_roots_rejects_outside_cwd() {
+    let _env = env_guard();
+    let allowed = cwd();
+    let outside = cwd();
+    let provider = Arc::new(StubProvider::with_turns("deepseek", vec![text_turn("ok")]));
+    let mut config = test_config(vec![("deepseek", provider)]);
+    config.limits.allowed_cwd_roots = vec![allowed.clone()];
+    let tools = tools(config);
+
+    let rejected = call(&tools, "subagent", json!({"prompt": "hi", "cwd": outside}))
+        .await
+        .unwrap();
+    assert!(is_error(&rejected));
+    assert!(
+        text(&rejected).contains("outside server.allowed_cwd_roots"),
+        "{}",
+        text(&rejected)
+    );
+
+    let accepted = call(&tools, "subagent", json!({"prompt": "hi", "cwd": allowed}))
+        .await
+        .unwrap();
+    assert!(!is_error(&accepted), "{}", text(&accepted));
+}
+
+#[tokio::test]
+async fn server_allowed_cwd_roots_rejects_sibling_prefix_directory() {
+    // A lexical `starts_with` accepts `/srv/work2` for the root `/srv/work`.
+    // The containment check must compare path components instead.
+    let _env = env_guard();
+    let base = tempfile::tempdir().unwrap();
+    let root = base.path().join("work");
+    let sibling = base.path().join("work2");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::create_dir(&sibling).unwrap();
+    let provider = Arc::new(StubProvider::with_turns("deepseek", vec![text_turn("ok")]));
+    let mut config = test_config(vec![("deepseek", provider)]);
+    config.limits.allowed_cwd_roots = vec![root.clone()];
+    let tools = tools(config);
+
+    let rejected = call(&tools, "subagent", json!({"prompt": "hi", "cwd": sibling}))
+        .await
+        .unwrap();
+    assert!(is_error(&rejected), "{}", text(&rejected));
+    assert!(
+        text(&rejected).contains("outside server.allowed_cwd_roots"),
+        "{}",
+        text(&rejected)
+    );
+
+    let accepted = call(&tools, "subagent", json!({"prompt": "hi", "cwd": root}))
+        .await
+        .unwrap();
+    assert!(!is_error(&accepted), "{}", text(&accepted));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn server_allowed_cwd_roots_rejects_symlink_escape() {
+    // A workspace-write session can create a link inside an allowed root; a
+    // lexical check would then bind the new session to the link target.
+    let _env = env_guard();
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let escape = root.path().join("escape");
+    std::os::unix::fs::symlink(outside.path(), &escape).unwrap();
+    let provider = Arc::new(StubProvider::with_turns("deepseek", vec![text_turn("ok")]));
+    let mut config = test_config(vec![("deepseek", provider)]);
+    config.limits.allowed_cwd_roots = vec![root.path().to_path_buf()];
+    let tools = tools(config);
+
+    let rejected = call(&tools, "subagent", json!({"prompt": "hi", "cwd": escape}))
+        .await
+        .unwrap();
+    assert!(is_error(&rejected), "{}", text(&rejected));
+    assert!(
+        text(&rejected).contains("outside server.allowed_cwd_roots"),
+        "{}",
+        text(&rejected)
+    );
+
+    // A link that stays inside the root is still a legitimate cwd.
+    let inner = root.path().join("inner");
+    std::fs::create_dir(&inner).unwrap();
+    let inner_link = root.path().join("inner-link");
+    std::os::unix::fs::symlink(&inner, &inner_link).unwrap();
+    let accepted = call(
+        &tools,
+        "subagent",
+        json!({"prompt": "hi", "cwd": inner_link}),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error(&accepted), "{}", text(&accepted));
+}
+
+#[tokio::test]
+async fn writable_roots_are_bounded_by_allowed_cwd_roots() {
+    // `writable_roots` widens what the shell may write under workspace-write,
+    // so with an allowlist configured it must not reach outside it: otherwise
+    // `writable_roots: ["/"]` hands back the write access the operator denied.
+    let _env = env_guard();
+    let root = tempfile::tempdir().unwrap();
+    let inside = root.path().join("scratch");
+    std::fs::create_dir(&inside).unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let provider = Arc::new(StubProvider::with_turns(
+        "deepseek",
+        vec![text_turn("ok"), text_turn("ok"), text_turn("ok")],
+    ));
+    let mut config = test_config(vec![("deepseek", provider)]);
+    config.limits.allowed_cwd_roots = vec![root.path().to_path_buf()];
+    let bounded = tools(config);
+
+    let rejected = call(
+        &bounded,
+        "subagent",
+        json!({
+            "prompt": "hi",
+            "cwd": root.path(),
+            "sandbox": "workspace-write",
+            "config": {"writable_roots": [outside.path()]}
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(is_error(&rejected), "{}", text(&rejected));
+    assert!(
+        text(&rejected).contains("outside server.allowed_cwd_roots"),
+        "{}",
+        text(&rejected)
+    );
+
+    // A root that resolves inside the allowlist is accepted.
+    let accepted = call(
+        &bounded,
+        "subagent",
+        json!({
+            "prompt": "hi",
+            "cwd": root.path(),
+            "sandbox": "workspace-write",
+            "config": {"writable_roots": [inside]}
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error(&accepted), "{}", text(&accepted));
+
+    // Without the allowlist the requested roots are taken as given.
+    let unbounded = tools(test_config(vec![(
+        "deepseek",
+        Arc::new(StubProvider::with_turns("deepseek", vec![text_turn("ok")])),
+    )]));
+    let accepted = call(
+        &unbounded,
+        "subagent",
+        json!({
+            "prompt": "hi",
+            "cwd": root.path(),
+            "sandbox": "workspace-write",
+            "config": {"writable_roots": [outside.path()]}
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(!is_error(&accepted), "{}", text(&accepted));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn writable_roots_reject_a_symlink_out_of_an_allowed_root() {
+    let _env = env_guard();
+    let root = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let escape = root.path().join("escape");
+    std::os::unix::fs::symlink(outside.path(), &escape).unwrap();
+    let provider = Arc::new(StubProvider::new("deepseek"));
+    let mut config = test_config(vec![("deepseek", provider)]);
+    config.limits.allowed_cwd_roots = vec![root.path().to_path_buf()];
+    let tools = tools(config);
+
+    let rejected = call(
+        &tools,
+        "subagent",
+        json!({
+            "prompt": "hi",
+            "cwd": root.path(),
+            "sandbox": "workspace-write",
+            "config": {"writable_roots": [escape]}
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(is_error(&rejected), "{}", text(&rejected));
+    assert!(
+        text(&rejected).contains("outside server.allowed_cwd_roots"),
+        "{}",
+        text(&rejected)
+    );
 }

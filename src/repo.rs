@@ -6,7 +6,13 @@
 //! Unknown values are `None` (Go's empty strings); every read/parse failure
 //! yields empty fields.
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
+
+/// Upper bound on any single `.git` metadata file we read. `packed-refs` in a
+/// large repository is the biggest legitimate case (a few MiB); anything past
+/// this is treated as unreadable rather than allocated without bound.
+const MAX_GIT_METADATA_BYTES: u64 = 8 * 1024 * 1024;
 
 /// The checked-out branch and commit for the repository containing `cwd`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,8 +50,9 @@ pub fn git_info(cwd: &Path) -> GitInfo {
 
 /// Nearest ancestor of `dir` (inclusive) containing a `.git` entry, matching
 /// Go `repo.Root`. `symlink_metadata` is Go `os.Lstat`, so a `.git` symlink
-/// counts too.
-fn root(dir: &Path) -> Option<PathBuf> {
+/// counts too. The prompt loader and the server's `session_meta` use this same
+/// function instead of keeping their own copies.
+pub fn root(dir: &Path) -> Option<PathBuf> {
     let mut current = dir.to_path_buf();
     loop {
         if std::fs::symlink_metadata(current.join(".git")).is_ok() {
@@ -59,6 +66,27 @@ fn root(dir: &Path) -> Option<PathBuf> {
     }
 }
 
+/// Read a small `.git` metadata file. Returns `None` for missing entries,
+/// directories, FIFOs/devices, and files past [`MAX_GIT_METADATA_BYTES`] so a
+/// hostile repository layout cannot block or exhaust the process.
+fn read_metadata(path: &Path) -> Option<Vec<u8>> {
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut data = Vec::new();
+    file.take(MAX_GIT_METADATA_BYTES + 1)
+        .read_to_end(&mut data)
+        .ok()?;
+    if data.len() as u64 > MAX_GIT_METADATA_BYTES {
+        return None;
+    }
+    Some(data)
+}
+
 /// Read branch and commit from the repository rooted at `root`, matching Go
 /// `repo.Head`.
 fn head(root: &Path) -> GitInfo {
@@ -66,16 +94,16 @@ fn head(root: &Path) -> GitInfo {
     let mut git_dir = git_dot.clone();
 
     // A `.git` file (worktree / submodule) holds `gitdir: <target>`.
-    if let Ok(data) = std::fs::read(&git_dot) {
+    if let Some(data) = read_metadata(&git_dot) {
         let raw = String::from_utf8_lossy(&data).into_owned();
         let target = raw.strip_prefix("gitdir:").unwrap_or(&raw).trim();
         let p = PathBuf::from(target);
         git_dir = if p.is_absolute() { p } else { root.join(p) };
     }
 
-    let head_bytes = match std::fs::read(git_dir.join("HEAD")) {
-        Ok(b) => b,
-        Err(_) => return GitInfo::empty(),
+    let head_bytes = match read_metadata(&git_dir.join("HEAD")) {
+        Some(b) => b,
+        None => return GitInfo::empty(),
     };
     let head_text = String::from_utf8_lossy(&head_bytes).into_owned();
     let head_trimmed = head_text.trim();
@@ -94,7 +122,7 @@ fn head(root: &Path) -> GitInfo {
 
     // `commondir` redirects shared refs to the main repository (worktrees).
     let mut common_dir = git_dir.clone();
-    if let Ok(data) = std::fs::read(git_dir.join("commondir")) {
+    if let Some(data) = read_metadata(&git_dir.join("commondir")) {
         let text = String::from_utf8_lossy(&data).into_owned();
         let c = text.trim();
         let p = PathBuf::from(c);
@@ -103,7 +131,7 @@ fn head(root: &Path) -> GitInfo {
 
     // Loose refs live under either git_dir or common_dir.
     for dir in [git_dir.as_path(), common_dir.as_path()] {
-        if let Ok(data) = std::fs::read(dir.join(ref_path)) {
+        if let Some(data) = read_metadata(&dir.join(ref_path)) {
             let hash = String::from_utf8_lossy(&data);
             return GitInfo {
                 branch: opt(branch),
@@ -113,7 +141,7 @@ fn head(root: &Path) -> GitInfo {
     }
 
     // Fall back to packed-refs in the common dir.
-    if let Ok(data) = std::fs::read(common_dir.join("packed-refs")) {
+    if let Some(data) = read_metadata(&common_dir.join("packed-refs")) {
         let text = String::from_utf8_lossy(&data);
         for line in text.split('\n') {
             let line = line.trim();
@@ -267,6 +295,35 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join(".git")).unwrap();
         assert_eq!(git_info(root.path()), empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_head_is_ignored_without_blocking() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        let path = root.path().join(".git/HEAD");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        // Would hang if the FIFO were opened; metadata says it is not a file.
+        assert_eq!(git_info(root.path()), empty());
+    }
+
+    #[test]
+    fn oversized_packed_refs_is_ignored() {
+        let root = tempfile::tempdir().unwrap();
+        write(&root.path().join(".git/HEAD"), "ref: refs/heads/dev\n");
+        let mut packed = String::from("def456 refs/heads/dev\n");
+        packed.push_str(&"x".repeat(MAX_GIT_METADATA_BYTES as usize + 1));
+        write(&root.path().join(".git/packed-refs"), &packed);
+        assert_eq!(
+            git_info(root.path()),
+            GitInfo {
+                branch: Some("dev".into()),
+                commit: None,
+            }
+        );
     }
 
     #[test]
