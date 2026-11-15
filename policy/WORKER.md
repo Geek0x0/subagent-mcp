@@ -63,14 +63,24 @@ In mcp mode:
 
 In sonnet mode:
 
-- The worker is a general-purpose subagent started with the built-in `Agent`
-  tool with its model set to sonnet; the continuation tool is `SendMessage`
-  to that same subagent, and a "thread" is that subagent.
+- The worker is the plugin's own `worker-sonnet` agent, started with the
+  built-in `Agent` tool with `subagent_type` set to `subagent:worker-sonnet`
+  (a plugin agent's type is scope-qualified as `<plugin>:<agent>`); the
+  continuation tool is `SendMessage` to that same subagent, and a "thread" is
+  that subagent. Do not pass `model`: the definition pins sonnet, and a
+  per-call `model` would override it.
+- That agent definition, `agents/worker-sonnet.md`, carries the standing
+  constraints and is authoritative for them; do not repeat them in the
+  dispatch prompt.
+- Fallback: if the `Agent` tool reports that this agent type does not exist
+  (an older plugin install), start a general-purpose subagent with its model
+  set to sonnet and put the constraints listed under "The dispatch" at the
+  top of the dispatch prompt instead, and say so to the user.
 - It has no working-directory, sandbox, approval, provider or effort
   parameters, so those parts of the Dispatch reference do not apply; name the
   target directory in the prompt.
-- There is no `developer-instructions` field: the constraints listed under
-  "The dispatch" go at the top of the dispatch prompt instead.
+- There is no `developer-instructions` field, so any constraint the dispatch
+  does carry goes at the top of the dispatch prompt.
 
 ## Division of labor
 
@@ -97,7 +107,8 @@ In sonnet mode:
   to change is direction; dictating every character is not. The one exception
   is wording the user dictated verbatim.
 - Every initial dispatch sets `developer-instructions` with the constraints
-  below. In sonnet mode they go at the top of the dispatch prompt. They live
+  below. In sonnet mode the agent definition above holds them, and only the
+  fallback subagent gets them at the top of the dispatch prompt. They live
   there rather than in the per-unit prompt so that prompt concision cannot
   strip them: honor any AGENTS.md loaded in the worker's own cwd; preserve
   pre-existing user changes; prefer `rg` over `grep` and read only the needed

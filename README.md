@@ -455,4 +455,4 @@ The rollout records the prompt, the composed system prompt, tool arguments, tool
 - Image input, provider server-side tools (web search, code execution), and context compaction.
 - Network or read sandboxing, and sandboxing on non-Linux platforms.
 - Persistent or restart-resumable sessions, and backward compatibility with the pre-0.6.0 names, environment variables, or file-based credential handling.
-- MCP resources or prompts. The Claude Code plugin also deliberately omits agents, hooks, and background broker scripts.
+- MCP resources or prompts. The Claude Code plugin also deliberately omits background broker scripts.

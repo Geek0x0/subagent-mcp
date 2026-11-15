@@ -62,7 +62,7 @@ test('adds sonnet mode context only when on and sonnet', async ($, on) => {
   await $.prompt.submit({ text: 'first' })
   files.set(mode, 'sonnet')
   expect((await $.prompt.submit({ text: 'sonnet' })).context).toEqual([
-    "Worker mode is sonnet: dispatch write work with the Agent tool to a general-purpose subagent with model: 'sonnet', put the constraints listed under 'The dispatch' in the worker policy at the top of the dispatch prompt, continue the same subagent with SendMessage, do not use the MCP worker tools; a later turn without this note means mode is mcp.",
+    "Worker mode is sonnet: dispatch write work with the Agent tool with subagent_type 'subagent:worker-sonnet', the plugin's worker-sonnet agent, and no model parameter (the definition pins sonnet), the agent definition carrying the standing constraints so they are not repeated in the prompt; if the Agent tool reports that the agent type does not exist, use a general-purpose subagent with model 'sonnet' and the constraints listed under 'The dispatch' in the worker policy at the top of the dispatch prompt instead, and say so to the user; continue the same subagent with SendMessage, do not use the MCP worker tools; a later turn without this note means mode is mcp.",
   ])
   files.set(state, 'off')
   expect((await $.prompt.submit({ text: 'off' })).context).toEqual([
@@ -91,6 +91,7 @@ test('denies only worker tools when off', async ($, on) => {
   const sonnet = await $.tool.check({ tool: 'mcp__worker__subagent', input: {} })
   expect(sonnet.decision).toBe('deny')
   expect(sonnet.reason).toContain('/worker mode mcp')
+  expect(sonnet.reason).toContain('subagent:worker-sonnet')
   files.set(mode, 'mcp')
   expect((await $.tool.check({ tool: 'mcp__worker__subagent', input: {} })).decision).toBe('allow')
   expect((await $.tool.check({ tool: 'mcp__subagent__subagent', input: {} })).decision).toBe('allow')
