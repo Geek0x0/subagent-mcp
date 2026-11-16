@@ -781,10 +781,13 @@ fn a_task_dropped_before_its_first_poll_releases_the_session() {
     assert!(calls[1].last().unwrap().contains("written"));
 }
 
-/// Best effort: the window between a worker finding nothing to do and ending is
-/// a few instructions wide, so this cannot prove the absence of the race, only
-/// catch a regression that widens it. The structure (`running` is cleared in the
-/// critical section that sees no work) is what guards it.
+/// A smoke test for latest-wins, NOT a test of the stranding race: all five
+/// `schedule` calls of a round finish long before the worker's first write ends,
+/// and the next round starts only after `drain` returns, so no `schedule` can
+/// land in the few-instruction window where a worker has found nothing to do and
+/// is ending. That property rests on the structure (`running` is cleared in the
+/// critical section that sees no work) and on review; only a test hook or loom
+/// could exercise it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn the_last_snapshot_is_always_written() {
     let _serial = SERIAL.lock().await;
