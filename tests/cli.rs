@@ -1630,5 +1630,11 @@ fn check_config_reports_rollout_format() {
     );
     assert!(missing.contains("  bin    not found"), "{missing}");
     #[cfg(unix)]
-    assert!(missing.contains("not found\n"), "{missing}");
+    assert!(
+        missing.contains(&format!(
+            "  db     {}   not found\n",
+            dir.path().join("missing.db").display()
+        )),
+        "{missing}"
+    );
 }
