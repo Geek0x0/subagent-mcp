@@ -1,65 +1,50 @@
 # subagent-mcp
 
-subagent-mcp is one MCP server binary that exposes a coding agent — real shell and file-tool execution, a Landlock write sandbox, approvals, rollout files, cancellation, and progress notifications — driven by any of three model API families, or delegates whole sessions to Codex through its app-server. The MCP caller selects which configured provider a session uses via the `provider` argument, or lets a decision model choose with `model: "auto"` (see [Auto model selection](#auto-model-selection)).
+An MCP server that runs coding-agent sessions with shell and file tools. Choose a configured provider/model, let a decision model choose once per session, or delegate the session to Codex app-server.
 
-| `api` value | Wire protocol | Example providers |
+| `api` | Protocol | Example providers |
 |---|---|---|
-| `chat-completions` | OpenAI Chat Completions, streaming SSE | DeepSeek, any OpenAI-compatible endpoint |
-| `responses` | OpenAI Responses API, streaming SSE | OpenAI |
-| `messages` | Anthropic Messages API, streaming SSE | Anthropic |
-| `codex-app-server` | Codex app-server, JSON-RPC over stdio | Local Codex CLI (experimental) |
+| `chat-completions` | OpenAI Chat Completions | DeepSeek, OpenAI-compatible endpoints |
+| `responses` | OpenAI Responses API | OpenAI |
+| `messages` | Anthropic Messages API | Anthropic |
+| `codex-app-server` | Codex app-server over stdio | Local Codex CLI (experimental) |
+
+Native providers use the built-in tools, approvals, Linux Landlock write sandbox, progress notifications, and session recording. Codex uses its own tools, sandbox, and login.
 
 ## Install
 
-1. Install the binary:
+### Claude Code plugin
 
-   Download a prebuilt binary for Linux, macOS, or Windows (amd64/arm64) from a [GitHub release](https://github.com/Geek0x0/subagent-mcp/releases). The archive contains `subagent-mcp`, `README.md`, and `config.example.toml`. Put `subagent-mcp` on `PATH`. On Windows, the shell tool needs `bash` on `PATH` (e.g. Git Bash); the Landlock sandbox is Linux-only.
+On Linux or macOS, install the plugin:
 
-   Or build from source with Rust 1.94.1:
+```bash
+claude plugin marketplace add Geek0x0/subagent-mcp
+claude plugin install subagent@subagent-mcp
+```
 
-   ```bash
-   cargo build --release --locked
-   ```
+For a local checkout, replace `Geek0x0/subagent-mcp` with `/path/to/subagent-mcp` in the marketplace command.
 
-   The binary is `target/release/subagent-mcp`. The release archives are built with `scripts/package-rust-release.sh`; `go install` is no longer supported after 0.14.0.
+The launcher downloads the matching release binary on first start, verifies it against `scripts/release.lock`, and caches it in the plugin's data directory. Set `SUBAGENT_MCP_BIN` to use an existing binary instead.
 
-   Linux is the supported platform. The kernel sandbox needs Landlock (Linux 5.13 or newer); on macOS or an older kernel the server still starts and the native `read_file`, `write_file`, and `apply_patch` tools work, but every auto-allowed `shell` call exits with code 126 rather than run unsandboxed (see [Kernel sandbox for shell calls](#kernel-sandbox-for-shell-calls)). `--check-config` prints a `sandbox  Landlock` line that says which case applies.
+Create the config below, supply its API key in the environment that launches the MCP server, then restart or reconnect the server and run `/subagent:setup`.
 
-   If you only use the Claude Code plugin (steps 2 and 3) on Linux or macOS, you can skip this step: the plugin's launcher downloads the matching release binary on first start, verifies it against the checksums committed in `scripts/release.lock`, and stores it under the plugin's data directory. Set `SUBAGENT_MCP_BIN` to the path of a binary to use that instead of the download. Windows, and servers registered directly rather than through the plugin, still need the binary installed as described above.
+### Manual installation
 
-   Maintainers: after publishing a release, run `scripts/update-release-lock.sh <version>` and commit `scripts/release.lock` so the plugin picks up the new binary.
+For Windows or direct MCP registration, download a [release](https://github.com/Geek0x0/subagent-mcp/releases) for Linux, macOS, or Windows (amd64/arm64), and put `subagent-mcp` on `PATH`. Archives include this README and `config.example.toml`. Windows requires `bash` on `PATH`, for example Git Bash.
 
-2. Add this repository as a Claude Code plugin marketplace:
+To build from source with Rust 1.94.1:
 
-   ```bash
-   claude plugin marketplace add Geek0x0/subagent-mcp
-   ```
+```bash
+cargo build --release --locked
+```
 
-   Alternatively, if you already have the repository checked out locally, run:
+The binary is `target/release/subagent-mcp`. See [development and releases](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/development.md) for tests and packaging.
 
-   ```bash
-   claude plugin marketplace add /path/to/subagent-mcp
-   ```
-
-3. Install the plugin:
-
-   ```bash
-   claude plugin install subagent@subagent-mcp
-   ```
-
-4. Create the config file and provide each provider's key you plan to use in the environment that launches the MCP server (for Codex, use `codex login` instead):
-
-   ```bash
-   mkdir -p ~/.config/subagent-mcp
-   cp config.example.toml ~/.config/subagent-mcp/config.toml
-   export DEEPSEEK_API_KEY=...   # the variable named by that provider's env_key
-   ```
-
-   Restart or reconnect the MCP server after changing the config, then run `/subagent:setup` to verify the binary, the config file, and the key.
+**Platform support:** Linux is the supported platform. Auto-allowed shell calls in `read-only` or `workspace-write` require Landlock (Linux 5.13+); on macOS, Windows, or an unavailable Landlock kernel they fail closed with exit code 126. Native file tools still work. `--check-config` reports Landlock availability. See [sandbox limitations](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/sandbox.md).
 
 ## Configuration
 
-The TOML file is loaded once at startup from `$SUBAGENT_MCP_CONFIG`, or from `~/.config/subagent-mcp/config.toml` when that variable is unset. A missing file fails startup with a message naming the path and pointing at `config.example.toml`; the repository's `config.example.toml` has a ready-to-edit deepseek/openai/anthropic setup. Decoding is strict, so a typo is an error rather than a silently ignored key, and every validation error names the offending field path (for example `providers.openai.default_model`).
+Create `~/.config/subagent-mcp/config.toml` with one provider to get started:
 
 ```toml
 [providers.deepseek]
@@ -67,420 +52,110 @@ api = "chat-completions"
 base_url = "https://api.deepseek.com"
 env_key = "DEEPSEEK_API_KEY"
 default_model = "deepseek-flash"
-models = [
-  { id = "deepseek-flash",  description = "fast, cheap" },
-  { id = "deepseek-v4-pro", description = "strongest" },
-]
-effort_map = { medium = "high", xhigh = "max" }
-
-[providers.openai]
-api = "responses"
-env_key = "OPENAI_API_KEY"
-default_model = "gpt-5.5"
-models = [{ id = "gpt-5.5" }]
-
-[providers.anthropic]
-api = "messages"
-env_key = "ANTHROPIC_API_KEY"
-default_model = "claude-sonnet-5"
-max_output_tokens = 64000
-models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
-
-# Optional: let `start` choose a provider/model with TypeSafe's Jev (or Clef below).
-[auto]
-env_key = "TYPESAFE_API_KEY"
-model = "jev-latest"
-# base_url = "https://api.typesafe.ai"
-# timeout_seconds = 20
+models = [{ id = "deepseek-flash" }]
 ```
 
-### Fields
+Set `DEEPSEEK_API_KEY` in the MCP server's launching environment, such as the client's `env` block. Agent shell commands have configured key variables removed, including values re-exported by login profiles.
 
-| Field | Level | Required | Rules |
-|---|---|---|---|
-| `api` | provider | yes | One of `chat-completions`, `responses`, `messages`, `codex-app-server`. |
-| `base_url` | provider | no | Defaults per api: `https://api.openai.com/v1` for `chat-completions` and `responses`, `https://api.anthropic.com` for `messages`. Rejected when non-empty for `codex-app-server`, which has no URL default. |
-| `env_key` | provider | one of `env_key`, `key`; except Codex | Name of the environment variable holding the key. Its value is read when a session is created for that provider (via the `provider` argument, or the sole configured provider); a missing value fails that call naming the variable and `providers.<name>.env_key`. Rejected when non-empty for `codex-app-server`: authentication goes through `codex login`. |
-| `key` | provider | one of `env_key`, `key`; except Codex | The API key itself, instead of `env_key`; setting both is an error. A config file that holds a key must be mode `600` (see [API keys](#api-keys)). Rejected when non-empty for `codex-app-server`. |
-| `command` | provider | no | Executable name or path for `codex-app-server`; defaults to `codex` on `PATH`. The server adds the `app-server` argument; this is not a shell command or argument list. Rejected when non-empty for every other api. |
-| `default_model` | provider | yes | Must be one of `models[].id`. Used when a caller omits `model`. |
-| `models` | provider | yes | Non-empty list of `{ id, description? }` tables; ids must be unique and are advertised in config order. |
-| `effort_map` | provider | no | Maps a caller effort value to the value sent to the API: `effort_map[value]` if present, else the caller's value. Keys and values must be in the effort set below. |
-| `max_output_tokens` | provider | no | Positive integer output limit. `messages` always sends one as `max_tokens` and defaults to `64000`, because that API requires the field. `responses` sends it as `max_output_tokens` and `chat-completions` as `max_tokens` when the config sets it; leaving it unset omits the field, so the provider's own default applies. OpenAI's reasoning models reject `max_tokens`, so leave this unset for one on the `chat-completions` api and set `extra_body.max_completion_tokens` instead, or use the `responses` api, which takes `max_output_tokens`. Rejected for `codex-app-server`, which applies its own limits. |
-| `extra_body` | provider | no | Table merged into the JSON body of every `chat-completions` request, for fields the SDK has no place for. Its main use is choosing the upstream behind an OpenRouter-style gateway, for example `[providers.x.extra_body.provider]` with `ignore = ["relace"]` or `only = ["streamlake"]`. Rejected for other `api` values; `model`, `messages`, `stream`, `stream_options`, `tools`, `tool_choice` and `max_tokens` cannot be set (the last one is what `max_output_tokens` sends). `max_completion_tokens` stays available, for a model that requires it. See [Choosing the upstream behind a gateway](#choosing-the-upstream-behind-a-gateway). |
-| `max_nudges` | provider | no | Integer from 0 to 10; defaults to `0` (off). See [Models that stop to narrate](#models-that-stop-to-narrate). Ignored by `codex-app-server`. |
+For multiple providers, OpenAI, Anthropic, Codex, and optional auto selection, copy and edit [config.example.toml](https://github.com/Geek0x0/subagent-mcp/blob/main/config.example.toml). The config is loaded once at startup; restart or reconnect after changes. `SUBAGENT_MCP_CONFIG` overrides its path. Missing files, unknown keys, and invalid fields fail with a path or field name.
 
-The optional `[auto]` table configures the decision model used by `model: "auto"`:
+A provider may use `key` instead of `env_key`, but never both. A config containing a key must have mode `600` (not checked on Windows). Shell tools can still read keys stored in files; see [API key handling](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/configuration.md#api-keys).
 
-| Field | Required | Rules |
-|---|---|---|
-| `env_key` | one of `env_key`, `key` | Name of the environment variable holding the decision model API key. A missing value fails only calls that need a decision, naming the variable and `auto.env_key`. |
-| `key` | one of `env_key`, `key` | The decision model API key itself, instead of `env_key`; setting both is an error. Same file-mode rule as a provider `key`. |
-| `model` | yes | Decision model name or alias, for example `jev-latest`, `clef`, or `clef-flash`. |
-| `base_url` | no | Defaults to `https://api.typesafe.ai`. The System One path `/v1/systemone` is appended. A same-protocol proxy can be used by pointing here. Mutually exclusive with `url`. |
-| `url` | no | Full decision endpoint used verbatim; mutually exclusive with `base_url`. |
-| `timeout_seconds` | no | Bound on one decision request; `0` (or omitted) uses the default `20`, otherwise valid values are 1 to 600. The caller's own deadline still wins when shorter. |
-
-`auto` is a reserved pseudo-model id: a `providers.*.models[].id` equal to `auto` is a config error, whether or not `[auto]` is configured. Without `[auto]`, `model: "auto"` is a tool error naming the missing section.
-
-### Choosing the upstream behind a gateway
-
-Gateways such as OpenRouter (Cline Pass uses one) serve one model from many upstream channels and may pick a different one for each call. An upstream that fails to stream a tool call produces replies that arrive empty or end after a sentence of narration, even though the model generated tokens. Set `extra_body` on the provider to steer routing:
-
-```toml
-[providers.cline-glm-flash.extra_body.provider]
-ignore = ["relace"]          # never use this upstream
-# only = ["streamlake"]      # or: use only these
-# order = ["streamlake", "deepinfra"]
-```
-
-Names are the gateway's lowercase slugs. An unknown name in `only` is refused with an error that lists the valid ones; asking for a model with `only = ["__probe__"]` is a quick way to see that list. A 200 response does not prove a preference was applied, so check which upstream served a call: when the API names it (the `provider` field of OpenRouter-style streams), the `provider_request` event carries it as `upstream`. Gateways that route through Vercel AI Gateway ignore `provider` and read `providerOptions.gateway.only` instead; both can be set in the same table.
-
-### Models that stop to narrate
-
-The agent loop treats a model reply without a tool call as the final answer. Some small models end a turn that way while work remains ("Now step 2: write the failing test"), so the call returns that sentence as its result. With `max_nudges` above zero, such a reply is answered with a "continue" prompt (an `agent_nudge` event is emitted) and the loop goes on: a model that was really finished repeats its summary, and a second reply without a tool call right after the prompt is accepted as final. Each stretch without tool calls is nudged at most once, and at most `max_nudges` times per run. Empty replies count as replies without a tool call, are not replayed to the API, and (being never a final answer) can be nudged again until the budget is spent, with a prompt that says the last reply was empty and asks for a smaller tool call (an API can drop a tool call it fails to stream, and the same call tends to be lost the same way again). The cost of the option is one extra model call at the end of a run that finishes normally. Prompting alone did not fix it in testing, so this is a code-level guard; set it on the providers that need it, for example `max_nudges = 3`.
-
-### Reasoning effort
-
-Accepted caller values are `none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, and `ultra`; the default is `high`. The value sent to the provider is `effort_map[value]` when the selected provider defines that mapping, otherwise the caller's value. The server validates against the eight values above and does not otherwise check provider-specific support, so an unsupported value surfaces as the provider's API error. `ultra` is the level Codex describes as maximum reasoning with automatic task delegation; the three model API families have no equivalent, so leave it unset for them or map it with `effort_map`. `config.model_reasoning_effort` in the `config` object works like `reasoning-effort`, and the top-level argument wins.
-
-### API keys
-
-A provider names its key in one of two ways: `env_key`, the name of an environment variable, or `key`, the key itself in the config file.
-
-With `key`, every provider's settings live in the one file and nothing has to be exported into the environment that launches the server. The file then holds a secret, so the server refuses to start unless its mode is `600` (`chmod 600 ~/.config/subagent-mcp/config.toml`; not checked on Windows), and neither `--check-config` nor any error message prints the value. Be aware of what this does not protect: the agent's `read_file` tool refuses the config file, but its `shell` tool can read any file the server's user can, so a command such as `cat` on the config path returns the keys to the model and into the rollout file. The same is true of a key kept in an MCP client's `env` block on disk. Prefer `env_key` with a variable that exists only in the launching process when that matters.
-
-With `env_key`, for the three model API families, when a session is created, the server reads the selected provider's `env_key` variable from its own environment; every provider's `env_key` variable is also removed from shell commands run by the agent (see [Environment](#environment)). `auto.env_key` is scrubbed the same way. Keep the variable in the environment that launches the MCP server, for example in an MCP client's `env` block. Do not rely on a shell profile to provide the key to the agent: login profiles are loaded for shell commands, but configured keys are removed again before the command runs. Codex uses its own login instead.
-Requests to a provider's `base_url` carry only that provider's configured key and the SDK's standard protocol headers: the SDKs' own credential environments (`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_CUSTOM_HEADERS`, `OPENAI_ORG_ID`, `OPENAI_PROJECT_ID`, `OPENAI_CUSTOM_HEADERS`, and the `*_BASE_URL`/`*_API_KEY` variables) are ignored, so gateway tokens and headers from the server's environment are never forwarded to a configured endpoint.
-
-### Server-side limits
-
-A `[server]` section caps what one `start` call may ask for, so a compromised or confused orchestrator cannot hand itself more access than the operator intended. Every key is optional.
-
-```toml
-[server]
-max_sandbox = "workspace-write"          # read-only | workspace-write | danger-full-access
-max_approval_policy = "on-request"       # untrusted | on-request | on-failure | never
-allowed_cwd_roots = ["/srv/work"]        # absolute paths; when set, cwd must be under one
-scrub_env = ["GITHUB_TOKEN", "AWS_*"]    # extra names/prefixes hidden from shell and Codex children
-```
-
-A requested `sandbox` or `approval-policy` that is more permissive than the ceiling is clamped to it, and the start result carries a `warning:` line saying so. `allowed_cwd_roots` is an allowlist: both the `cwd` and every `config.writable_roots` entry are resolved through symlinks and must land under one of the roots, and a `cwd` outside every root is a tool error before a session is created. `scrub_env` entries ending in `*` are prefixes and must keep a non-empty prefix, so a bare `*` is a config error instead of hiding the whole environment; `SUBAGENT_MCP_*` and every provider `env_key` are always removed.
-
-### Selecting a provider
-
-Pass `provider` when starting a session to choose which configured provider it uses; the tool schema's `enum` lists every name defined under `[providers]`. Omitting `provider` works only when the config defines exactly one provider — with two or more, omitting it is a tool error listing the available names. The chosen provider is fixed for the session's lifetime: `subagent-reply` always continues with the same one, and each call's `model` must come from that provider's list.
-
-### Auto model selection
-
-With an `[auto]` section configured, pass `model: "auto"` and omit `provider` to let the server choose the provider/model for that session. The server sends the task prompt and validated `cwd` to the configured decision model (TypeSafe Jev by default, using `POST /v1/systemone`) with one `choice` question whose criteria are every reachable configured provider/model pair and its configured `description`. Providers whose API key is not set are omitted; `codex-app-server` providers are included without a login preflight. The highest-probability choice is dispatched, and the start result reports it.
-
-- Well-known model IDs get a built-in default description when none is configured; a configured description overrides it. An `[auto.descriptions]` table maps a model id (or the suffix of a prefixed id) to a one-line description, which is the supported way to keep the built-in table from going stale for a gateway's model names.
-- A single reachable candidate skips the decision model entirely and does not require `auto.env_key`.
-- A decision model error, malformed answer, or unknown choice is a tool error. There is no fallback model and no retry; retry the call or pass an explicit `provider`/`model`.
-- `auto.confidence` is informational. A low-confidence choice is still dispatched, because it is the decision model's highest-probability answer.
-- One decision happens at session creation. `subagent-reply` keeps the chosen provider/model for the session's lifetime.
-- Auto mode sends the prompt to the configured endpoint (TypeSafe by default). The long-context header is TypeSafe-specific and allows long prompts billed by input tokens; Clef has its own 64K context window and truncates long state.
-- The decision is a label, not generated text: the task prompt can bias which model is chosen, but it cannot make the decision model execute tools or return free-form instructions.
-
-Cloudflare Clef is also supported as a Jev-compatible backend. Replace the default `[auto]` block with:
-
-```toml
-[auto]
-url = "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare/clef"
-env_key = "CLOUDFLARE_API_TOKEN"
-model = "clef" # or "clef-flash"
-```
-
-### Codex app-server provider
-
-`codex-app-server` is **experimental**, tested with **codex-cli 0.156.1**; its `auth` and `model/list` calls also work against 0.131.0 and 0.164.0. Install Codex, run `codex login` as the user launching the MCP server, and enable the commented `[providers.codex]` block in `config.example.toml`. Set `command` only if the executable is not `codex` on `PATH`; omit `env_key` and `base_url`.
-
-The model ids a provider block lists are whatever the installed Codex reports, and they change between Codex versions: 0.131.0 lists only `gpt-5.x`, while 0.164.0 lists the `gpt-6.x` family and no `gpt-5.5`, so a block written against one version will not validate against the other. If more than one Codex is installed, point `command` at the one whose models you listed, since an older install earlier on `PATH` wins the plain `codex` lookup. `--check-config` reports the version and model count it found and warns about every configured id that is not in that list.
-
-The session inherits the user's whole Codex environment — auth, config, plugins, hooks, skills, MCP servers, and AGENTS.md — and uses **Codex's own tools and sandbox**, not subagent-mcp's native four-tool runner or Landlock policy. The app-server child still receives an environment scrubbed of configured `env_key` variables and `SUBAGENT_MCP_*` variables. The native tool, prompt-loading, sandbox, and rollout details elsewhere in this README apply to the three model API families; Codex differs as follows:
-
-- `config.max_turns` is ignored; Codex manages the agent loop.
-- AGENTS.md is loaded by Codex, not assembled into the prompt by subagent-mcp.
-- `base-instructions` replaces Codex's base prompt only when given a non-empty value; omitting it leaves Codex's own base prompt intact. `developer-instructions` is forwarded separately.
-- Codex owns the non-ephemeral thread and its rollout under `~/.codex/sessions` (or the user's configured Codex home). It appears in Codex history; subagent-mcp does not write a second rollout, and `SUBAGENT_MCP_ROLLOUT=off` does not disable Codex's rollout.
-- `sandbox` is forwarded to Codex; `approval-policy` is forwarded with `on-failure` mapped to `on-request`. Command and file-change approvals are relayed to the MCP client. `config.writable_roots` is forwarded only for `workspace-write`.
-- The relayed approval's target is the shell command, the touched paths for a file change, or — for a network approval — the requested host. Every other request Codex sends to the server (an MCP server's elicitation, a tool user-input request, a permission request, a dynamic tool call, or anything else) is answered automatically with the error `-32601 not supported by subagent-mcp`, so Codex's MCP servers and tools cannot prompt through subagent-mcp; those requests fail inside Codex instead of reaching your MCP client.
-- A pending approval wait ends when the call is cancelled or the five-minute approval timeout expires (denial), and also when the Codex child process dies or the thread closes, so a pending approval never outlives either.
-- Codex sends `item/started` before it asks for approval, so a declined file change still emits `exec_command_begin` and `exec_command_end`; see [Events](#events).
-
-## Validating the config
-
-`--check-config` loads and validates the config file, reports whether the Landlock kernel sandbox is usable on this machine (a `WARN` there does not change the exit code), reports each model API provider's `env_key` name and whether it is set (or Codex's `auth` status), and asks each reachable provider for its model list so authentication and reachability errors fail loudly and unlisted model ids are warned about:
+### Validating the config
 
 ```bash
-subagent-mcp --check-config [path]
-subagent-mcp --check-config --live [path]
+subagent-mcp --check-config
+subagent-mcp --check-config /path/to/config.toml
 ```
 
-The optional `path` defaults to `$SUBAGENT_MCP_CONFIG` or `~/.config/subagent-mcp/config.toml`. Flags must come before the path. The process exits 0 unless a provider check actually failed or no provider has a key set or passes Codex auth. A missing config, unknown TOML key, or invalid field is reported naming the path or field. A missing API key is skipped, but a Codex auth failure counts as failed. Output looks like:
+This validates the config, reports sandbox availability, and checks authentication and model lists for reachable providers. `PASS` means at least one provider was checked and none failed. Missing model IDs or unavailable Landlock produce warnings; provider check failures or no usable provider produce a nonzero exit code. No key values are printed.
 
-```
-config   /home/you/.config/subagent-mcp/config.toml   OK
-provider anthropic (messages)
-  key    ANTHROPIC_API_KEY   not set, skipped
-provider deepseek (chat-completions)
-  key    DEEPSEEK_API_KEY   set
-  api    https://api.deepseek.com   OK (2 models listed)
-  model  deepseek-flash     OK
-  model  deepseek-v4-pro     WARN: not in the provider's current model list
-auto     decision model (jev-latest)
-  api    https://api.typesafe.ai
-  key    TYPESAFE_API_KEY   set
-result   PASS (1 checked, 1 skipped, 0 failed)
-```
-
-When `[auto]` exists, `--check-config` adds the `auto` block shown above and reports whether its key is set; it does not call the decision model. A missing auto key warns (`not set, decision model selection calls will fail`); it only affects auto calls with multiple reachable candidates, because a single reachable candidate skips the decision model. The warning does not change the exit code.
-
-If no configured provider has a key set or passes Codex auth, and none failed, the result line instead reads `result   FAIL (0 checked, N skipped, 0 failed) — no configured provider has its key set`.
-
-For a Codex-only config, an illustrative `--check-config` result is:
-
-```text
-config   /home/you/.config/subagent-mcp/config.toml   OK
-provider codex (codex-app-server)
-  auth   chatgpt (plus)   OK
-  api    codex-cli 0.164.0   OK (8 models listed)
-  model  gpt-6.1-sol     OK
-  model  gpt-6-astra     OK
-  model  gpt-6.1-terra     OK
-result   PASS (1 checked, 0 skipped, 0 failed)
-```
-
-The `auth` line replaces `key`: the server starts Codex app-server and calls `account/read`, then `model/list` for the `api` and `model` lines. Account type, plan, version, and model count depend on the installation. A missing login prints `  auth   FAIL: not logged in; run codex login`; a process-start error also prints `  auth   FAIL: <error>`. A model-list failure prints `  api    FAIL: <error>`. Passing auth counts as checked; an auth or API failure counts as failed.
-
-With `[rollout] format = "opencode"` the report also prints a `rollout  opencode   mode <mode>, fallback <fallback>` line followed by `bin` and `db` lines saying whether the `opencode` binary and its database were found; this never counts towards the result. Nothing is printed for the default format.
-
-`model ... WARN` means a configured model id is not in the provider's current list; it does not affect the exit code. `--live` is opt-in and makes one real, billed tool-call round trip per reachable model API provider using `default_model` and effort `low`. For Codex it instead runs one ephemeral, read-only thread with approval policy `never`, asking for the sum of two numbers — the total never appears in the prompt — and checking that the final answer contains that total, so a reply that merely quotes the prompt fails. Its line is `  live   <default_model>   OK (turn succeeded, <duration>)` or `  live   <default_model>   FAIL: <error>`. Both paths print the billed-call warning first; use `--live` deliberately, not in CI. Neither mode ever prints a key value.
-
-## Environment
-
-| Variable | Description |
-|---|---|
-| `SUBAGENT_MCP_CONFIG` | Config file path; defaults to `~/.config/subagent-mcp/config.toml`. |
-| `SUBAGENT_MCP_TOOL_NAME` | Base name for the two MCP tools; defaults to `subagent`, exposing `subagent` and `subagent-reply`. `codex` registers `codex` and `codex-reply`. The value must match `^[A-Za-z0-9_-]{1,64}$` and must not end with `-reply`; an invalid value fails startup naming `SUBAGENT_MCP_TOOL_NAME`. |
-| `SUBAGENT_MCP_ROLLOUT` | Set to `off` to disable rollout files. |
-| `SUBAGENT_MCP_ROLLOUT_FORMAT` | `codex` (default) or `opencode`: which rollout format a session is recorded in; overrides `[rollout] format`. See [OpenCode format](#opencode-format). |
-| `SUBAGENT_MCP_DEBUG_STREAM` | Directory (created `0700`) that receives the raw response of every model API request, one `0600` file per request named `<UTC time>-<api>-<n>.sse`: a `#` header with the method, URL without query, status and content type, then the body exactly as received. For diagnosing what a server really streamed (for example a reply the parsed result shows as empty). Request headers and bodies are never written, so neither the key nor the prompt reaches the files, but the model's output does; unset it when done. Not applied to `codex-app-server`. |
-
-Before running any shell command, the server removes from the command environment every variable named by any provider's `env_key` and every variable whose name starts with `SUBAGENT_MCP_`, including values a login profile tries to re-export. The command still runs through `bash -lc`, so profile-provided settings such as `PATH` work; cleanup happens after the profile is loaded. On Linux, the server also starts non-dumpable, preventing a same-user shell child from reading the server's environment through `/proc`. `read_file` additionally refuses to read the loaded config file, resolved through symlinks, and the server's own `/proc/<pid>` entries (`environ`, `mem`, `cmdline`, ...), to keep provider topology and keys out of model context. Reads are otherwise unrestricted. In particular the server being non-dumpable protects only its own `/proc/<pid>/environ`: a shell command can still read the environment of an ancestor process such as the MCP client that launched the server (`cat /proc/$PPID/environ`), and any key stored in a file. Deliver keys through the MCP client's `env` block or a file with restricted access, not by exporting them in a shell that also starts the client. Allowlisted `git` reads run with the repository's filters, diff drivers, hooks, and signing programs disabled; this needs Git 2.31 or newer (older Git makes those shell calls exit 126), and the user's own global Git config still applies.
+`subagent-mcp --check-config --live` additionally makes a real, billed test call per reachable provider. Use it deliberately. See [validation details](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/configuration.md#validating-the-config) for output examples and Codex checks.
 
 ## Tools
 
-### `subagent`
+The server exposes `subagent` to start a session and `subagent-reply` to continue it. Claude Code displays these as `mcp__subagent__subagent` and `mcp__subagent__subagent-reply` under the default server name.
 
-Starts a new coding-agent thread.
-
-| Parameter | Required | Default | Description |
-|---|---:|---|---|
-| `prompt` | Yes | — | String task prompt for the new thread. |
-| `provider` | No (required when 2+ providers are configured and `model` is explicit) | The sole configured provider | Name of a provider defined under `[providers]`; the tool schema's `enum` lists them. Required at call time when the config defines more than one provider and `model` is not `auto`, otherwise optional. Fixed for the session's lifetime. |
-| `model` | No | Selected provider's `default_model` | A model id from the selected provider's `models` list; the tool schema's `enum` is the union of every configured provider's models, described grouped by provider. When `[auto]` is configured, `auto` is also accepted: it lets the decision model choose the provider/model, so `provider` must be omitted. An unknown value is a tool error listing the selected provider's available ids. |
-| `reasoning-effort` | No | `high` | One of the eight effort values; mapped through the provider's `effort_map` before it is sent. This argument wins over `config.model_reasoning_effort`, and an invalid value from either source is an error. |
-| `cwd` | No | Server process working directory | Absolute path to an existing directory. |
-| `sandbox` | No | `read-only` | `read-only`, `workspace-write`, or `danger-full-access`. |
-| `approval-policy` | No | `on-request` | `untrusted`, `on-request`, `on-failure`, or `never`. |
-| `base-instructions` | No | Built-in instructions | Complete replacement for the built-in base system instructions. An empty or omitted value uses the built-in default. |
-| `developer-instructions` | No | None | Additional system instructions appended after the `AGENTS.md` blocks. An empty or omitted value appends nothing. |
-| `config` | No | `{}` | Loose object. Recognized keys: `max_turns` (number from 1 to 100000, default 50, out-of-range or wrong-typed values are silently ignored), `model_reasoning_effort` (same values as `reasoning-effort`; the top-level argument wins), `max_nudges` (integer 0 to 10; overrides the provider's `max_nudges` for this session, other values are ignored), `writable_roots` (array of absolute paths to existing directories that the shell may also write under `workspace-write`), and the three budgets below. Invalid `model_reasoning_effort`, `writable_roots`, or budget values are errors; other unknown keys are silently ignored. |
-
-The three budgets bound what one thread may spend. Each is checked before every model call, so a thread that has spent its budget is stopped rather than allowed one more turn:
-
-| Key | Default | Meaning |
-|---|---|---|
-| `max_history_bytes` | `67108864` (64 MiB) | Ceiling on the history a thread replays. Every turn re-sends the whole history, so this bounds both resident memory and the prompt that grows with each turn. The default is far above any working thread — a 64k-token reply is roughly 256 KiB — and exists to stop runaway growth rather than to bound normal use. `0` disables it. |
-| `max_total_tokens` | `0` (off) | Ceiling on the tokens the thread has reported across all its turns, taken from the providers' own usage counts. This is the cost ceiling: once the reported total reaches the budget, the next turn is refused. `0` disables it. Providers that run whole threads report usage through their streamed token events, so `codex-app-server` is covered too. |
-| `run_deadline_seconds` | `0` (off) | Wall-clock ceiling on a single `subagent` or `subagent-reply` call. The one deadline covers every way a run blocks — a model request, an approval elicitation, a shell command — and the error names the deadline when it fires. `0` disables it. |
-
-A run stopped by a budget returns an error naming the limit it reached and stays resumable: raise the limit on a new thread, or continue the existing one when only the deadline fired. The history and token ceilings are cumulative for the thread's life, so a thread that reaches one is stopped on every later reply as well.
-
-When dispatched units run `go test` under `workspace-write`, include the absolute path of the Go build cache in `config.writable_roots` (for example `/home/<user>/.cache/go-build`).
-
-The response includes `structuredContent.threadId`. Retain it to continue the session. Once a session is created, execution errors also return its `threadId`, so the session remains resumable. It also includes `provider` and `model`, the pair the session actually uses. When the model was selected by auto mode, `auto` carries `judge_model`, `confidence`, `probabilities` (keyed by provider/model, when available), `input_tokens`, and `output_tokens` for a decision model request. When only one candidate is available, `auto` instead carries `skipped: true` and omits the decision model fields. When providers are omitted, `auto` also carries their reasons in `omitted`. The `subagent-reply` output includes `threadId`, `content`, `provider`, and `model`, without `auto` selection details.
-
-The system prompt is assembled as base instructions, then `AGENTS.md` blocks, then developer instructions. At session creation the server resolves `cwd` (after symlink evaluation), walks up to the nearest ancestor containing a `.git` entry, and collects `AGENTS.md` from that root down to `cwd`; without a repository root only `cwd` is read. Each file is wrapped in an `<agents_md path="...">` block, and the combined content is capped at 32 KiB with a truncation marker. A missing file is skipped, but any other read error fails the call: an `AGENTS.md` that is not a regular file, or a symlink that resolves outside the repository root, fails the `start` call instead of being read, so a repository cannot point it at a private key.
-
-Across turns the server replays each provider's reasoning state exactly as that API requires (DeepSeek `reasoning_content`, OpenAI encrypted reasoning items, Anthropic signed thinking blocks); rollout files never record those payloads.
-
-### `subagent-reply`
-
-Continues an existing coding-agent thread. Session settings cannot be changed on a reply.
-
-| Parameter | Required | Description |
-|---|---:|---|
-| `threadId` | Yes | String thread ID returned by an earlier `subagent` or `subagent-reply` call. |
-| `prompt` | Yes | String follow-up prompt for the existing thread. |
-
-Only one call can process a thread at a time. A concurrent reply returns a `busy` error with the same `threadId`. An unknown ID returns `unknown threadId`; check the ID or create a new session if the server has restarted.
-
-### Agent tools
-
-The agent runs inside the thread with four built-in tools:
-
-Their JSON parameter schemas are sent to the model as written: every keyword is forwarded, so a schema with `additionalProperties`, `$defs`, `oneOf` or `title` reaches the provider intact. A schema that is not a JSON object fails the turn naming the tool, rather than the model being handed a tool with no parameters.
-
-| Tool | Arguments | Description |
-|---|---|---|
-| `shell` | `command`, optional `timeout_seconds`, optional `justification` | Run a bash command in `cwd`. The default timeout is 60 seconds and requests are clamped to 600 seconds. Combined stdout and stderr is capped at 16 KiB: the start is kept, the end is dropped, and `[output truncated: N bytes total]` is appended. When the call returns, its process group is killed, so work the command backgrounded does not outlive the call: a `&` job is for parallelism inside one command, not for starting something that keeps running. |
-| `read_file` | `path`, optional `offset`, optional `limit`, optional `justification` | Read a file; relative paths resolve against `cwd`. `offset` is a 1-based start line and `limit` caps the number of lines. Output is capped at 16 KiB of whole lines; truncation appends `[content truncated: N bytes total; continue with offset=K]`, a line limit appends `[more lines follow; continue with offset=K]`, and an offset past the end returns `[offset K is past the end of the file (N lines)]`. A path that is not a regular file — a FIFO, device, socket, or directory — is refused instead of read. |
-| `write_file` | `path`, `content`, optional `justification` | Create or overwrite a whole file, creating parent directories. An existing target that is not a regular file (a FIFO, device, socket, or directory) is refused. |
-| `apply_patch` | `patch`, optional `justification` | Edit files with a Codex-format patch. |
-
-`apply_patch` accepts a patch from `*** Begin Patch` to `*** End Patch` containing one or more `*** Add File: <path>` (with `+` content lines), `*** Delete File: <path>`, or `*** Update File: <path>` sections, an optional `*** Move to: <path>` after an update header, `@@` chunk headers, and `' '` context, `-` removed, and `+` added lines. `*** End of File` anchors a chunk at the end of the file. Leading and trailing whitespace around the whole patch, a `<<'EOF'` heredoc wrapper, and CRLF line endings are tolerated. The whole patch is parsed and matched in memory first: if any chunk fails to match, or an Add targets an existing file, nothing is written. An existing file the patch reads or overwrites must be a regular file no larger than 64 MiB: a device, FIFO, socket, directory, or a bigger file is refused before anything is written. Sections for the same file apply in order, each seeing the edits of the earlier ones (an impossible combination, such as an update after a delete, is rejected up front), and a failure while writing restores every file already touched. Context matching tries exact lines, then ignores trailing whitespace, then ignores surrounding whitespace. The tool result starts with `Success. Updated the following files:` followed by `A`, `M`, or `D` plus the path of each change.
-
-### Codex-compatible tool names
-
-Claude Code names MCP tools `mcp__<server name>__<tool name>`. Register the server under the name `codex` and set `SUBAGENT_MCP_TOOL_NAME=codex`, and instructions written for Codex keep working: the tools are exposed as `mcp__codex__codex` and `mcp__codex__codex-reply`.
+Start a read-only session with a JSON tool argument object:
 
 ```json
 {
-  "mcpServers": {
-    "codex": {
-      "type": "stdio",
-      "command": "subagent-mcp",
-      "env": {"SUBAGENT_MCP_TOOL_NAME": "codex", "DEEPSEEK_API_KEY": "..."}
-    }
-  }
+  "prompt": "Read this repository and summarize its main components.",
+  "provider": "deepseek",
+  "cwd": "/absolute/path/to/project"
 }
 ```
 
-With the default `SUBAGENT_MCP_TOOL_NAME=subagent`, the tools are `subagent` and `subagent-reply` (as `mcp__subagent__subagent` and `mcp__subagent__subagent-reply`).
+| Argument | Default | Common use |
+|---|---|---|
+| `prompt` | Required | Task for the agent. |
+| `provider` | Sole configured provider | Required with multiple providers and an explicit model. |
+| `model` | Provider's `default_model` | A configured model ID, or `auto` with no `provider`. |
+| `cwd` | Server working directory | Absolute path to an existing directory. |
+| `sandbox` | `read-only` | Use `workspace-write` for edits; `danger-full-access` removes shell confinement. |
+| `approval-policy` | `on-request` | Operations outside policy require client approval. |
+| `reasoning-effort` | `high` | Mapped through the provider's optional `effort_map`. |
+
+Retain `structuredContent.threadId` from the result and pass it to `subagent-reply`:
+
+```json
+{
+  "threadId": "<threadId from the start result>",
+  "prompt": "Explain the main entry point in more detail."
+}
+```
+
+The response identifies the actual `provider` and `model`. Session settings stay fixed, and only one call may run per thread; another returns `busy`. Sessions live in memory and cannot be recovered after a server restart. Idle sessions expire after 24 hours; the server also evicts idle sessions when more than 256 exist.
+
+Native sessions have four tools: `shell`, `read_file`, `write_file`, and `apply_patch`. See the [tool reference](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/tools.md) for all arguments, budgets, output limits, and Codex-compatible MCP tool names.
+
+### Auto model selection
+
+Configure `[auto]`, then pass `model: "auto"` and omit `provider`. The decision model selects one reachable provider/model at session creation; replies keep that choice. A single candidate skips the decision call. Decision errors fail the call without a fallback.
+
+Auto mode sends the task prompt and validated working directory to the configured decision endpoint (TypeSafe by default). See [auto configuration and Clef support](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/configuration.md#auto-model-selection).
+
+### Codex app-server provider
+
+Enable the Codex block in `config.example.toml`, install Codex, and run `codex login` as the user launching the server. Model IDs must match that Codex installation; `--check-config` reports missing IDs. This provider is experimental and inherits the user's Codex config, plugins, hooks, skills, MCP servers, and AGENTS.md.
+
+Codex owns its tools, sandbox, and rollout. Shell, file-change, and network approvals are relayed; other interactive requests are unsupported. See [Codex setup and differences](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/configuration.md#codex-app-server-provider).
 
 ## Worker policy
 
-The plugin delivers a delegation policy (`policy/WORKER.md`) to each conversation through a hooks module (`hooks/register.ts`). `/worker on|off` switches delegation, and `/worker mode mcp|sonnet` picks the worker: the subagent-mcp tools or a Sonnet subagent. State lives in `~/.claude/worker-policy.state` and `~/.claude/worker-policy.mode`. When delegation is off, or the mode is `sonnet`, the plugin refuses calls to its MCP worker tools. The refusal matches tools by MCP server name (`subagent`, the plugin's own server, or `worker`), so a server registered under another name is not covered.
-
-The hooks module needs a Claude Code build that supports plugin hooks modules. `claude plugin test .` runs its tests.
-
-## Provider notes
-
-Each attempt waits at most ten minutes for the response headers of a model API call. That bound is per attempt, so a turn that exhausts its retries can wait up to four times as long on chat-completions and three times on responses/messages; it exists so that an endpoint which accepts the connection and then never answers fails the attempt instead of leaving it — and the thread lock behind it — waiting until the caller cancels. A response body that stops producing data for five minutes is failed with an idle timeout, while an actively streaming body has no overall limit. Connections are pooled per provider endpoint, so sessions against one `base_url` reuse TLS and TCP connections rather than handshaking per session, and TCP keepalive (30 seconds) detects a peer that silently disappeared. Redirects are never followed, so a 3xx reply is an HTTP error rather than a followed location (chat-completions adds the `Location` the server offered), and the key and the prompt cannot be redirected to another host.
-
-### `chat-completions`
-
-Streams OpenAI Chat Completions with `include_usage` and reassembles tool-call fragments into the calls the server sent, keyed by index when the server provides one and by id when it omits indices; a call that ends the stream without an id or name fails the turn instead of being sent onward with an empty `tool_call_id`. A `finish_reason` of `length` or `content_filter`, and a stream that ends without any finish reason fail the turn; other finish reasons (including compatible servers' `eos` and unrecognised ones, which are logged) count as finished rather than return truncated or filtered content. Only stream setup is retried, with jittered backoff and at most four attempts, and only for failures worth retrying: a 429 or 5xx status (or a response with no usable status), or a connection that never reached a server. A server `Retry-After` header is honored, capped at 60 seconds, so a broken server cannot park a turn for hours. A cancelled or expired context is never retried. A mid-stream failure fails the turn, and the thread stays resumable. `reasoning_effort` carries the mapped effort. Assistant `reasoning_content` is stored as the replay payload and sent back on later turns, which DeepSeek thinking mode requires when tools are used. Usage maps prompt, completion, and total tokens plus cached prompt tokens and reasoning completion tokens; as with every adapter, input is the full prompt including cached tokens and total is input plus output. Default `base_url`: `https://api.openai.com/v1`; DeepSeek needs `https://api.deepseek.com`.
-
-### `responses`
-
-Streams `POST /responses` with `store: false` and `include: ["reasoning.encrypted_content"]`; the system prompt goes in `instructions`, tools are declared as function tools, and `reasoning` is `{effort, summary: "auto"}`. The replay payload is the turn's full output-item array (reasoning with encrypted content, message, function calls), replayed verbatim, with each tool result sent as a `function_call_output`. Text deltas stream from `response.output_text.delta`, the final state is taken from `response.completed`, and an `incomplete` or `failed` status fails the turn with the reason; a completed response whose message part is a `refusal` fails the turn with the refusal text instead of an empty answer. Rollout reasoning text is the concatenated reasoning summary. Usage maps input (the full prompt, cached tokens included), cache reads to cached as a subset of input, output, reasoning output to reasoning, and total, which is the server's `total_tokens` when it sends one (0 otherwise) rather than a locally computed sum. A failed request is retried at most twice (three attempts): a 408, 409, 429, or 5xx status, any status whose `x-should-retry` header says `true` (`false` suppresses it), or a connection error; a server `Retry-After`/`Retry-After-Ms` header is honored, capped at 8 seconds. Default `base_url`: `https://api.openai.com/v1`.
-
-### `messages`
-
-Streams `POST /v1/messages` with adaptive summarized thinking, `output_config.effort` set to the mapped effort, `max_tokens` from `max_output_tokens`, top-level ephemeral `cache_control` for automatic prompt caching, the system prompt in `system`, and tools declared with `eager_input_streaming`. The replay payload is the assistant turn's full content-block array (signed thinking, text, tool_use), replayed verbatim; all tool results of one turn go into one user message with one `tool_result` block per call and `is_error: true` when execution failed or was denied. A truncated or invalid tool input JSON yields an `is_error` result without running the tool. Stop reasons: `refusal` fails the turn including the category, `max_tokens` fails it suggesting a larger `max_output_tokens`, `model_context_window_exceeded` fails it suggesting a shorter conversation or a model with a larger context window, `pause_turn` replays the assistant content and continues within the same turn (at most 5 continuations), and `tool_use` and `end_turn` are normal. A stream that ends before its terminal stop signal fails the turn, carrying the partial text it had streamed; nothing is stored for replay. An empty `end_turn` reply (`content: []`) is accepted as an empty answer but is never replayed, so the session stays usable. Rollout reasoning text is the concatenated summarized thinking. Usage maps input tokens plus cache creation and cache reads to input, cache reads to cached as a subset of input, output tokens to output, and thinking tokens to reasoning; total is input plus output. A failed request is retried at most twice (three attempts): a 408, 409, 429, or 5xx status, any status whose `x-should-retry` header says `true` (`false` suppresses it), or a connection error; a server `Retry-After` header is honored, capped at 60 seconds. Default `base_url`: `https://api.anthropic.com`.
-
-## Cancellation and concurrency
-
-The server honors the standard MCP `notifications/cancelled` message for in-flight `subagent` and `subagent-reply` calls. Cancelling a call stops the model request, kills any running shell command, and releases the thread lock; the call returns an error containing `context canceled`, and the thread stays resumable with `subagent-reply`. For `codex-app-server` sessions the lock is released only once the pending turn interrupt finishes, which can take up to 30 seconds after the cancellation, so a `subagent-reply` sent in that window gets a `busy` error instead of continuing the thread. A cancellation that arrives before a queued call starts is ignored.
-
-A client that goes away is treated the same way. When the server's stdin read fails — the client closed the pipe or crashed, which is how end-of-input arrives — every in-flight call is cancelled at once instead of running to completion against a client that can no longer receive the result, and calls still queued at that point are cancelled as they start. The thread lock is released the way a cancellation releases it, but the sessions go away with the server, so there is nothing left to resume.
-
-The stdio server processes up to 32 tool calls concurrently (mcp-go's default is 5). A call that arrives while the worker queue is full is executed inline on the stdin read loop rather than queued, so the client's next message is not read until that call finishes; with the 32 workers and a 100-slot queue, that takes 132 overlapping calls, and a burst past that can make the server briefly unresponsive to new input.
-
-### Shutdown
-
-On `SIGINT`, `SIGTERM`, or the client closing its end of the pipe, the server stops within ten seconds: in-flight calls are cancelled the same way `notifications/cancelled` cancels them, each session's bound directories are released and its provider thread closed (which interrupts a pending Codex turn), and every pooled Codex app-server child is then terminated. A run that ignores cancellation is abandoned rather than waited for, so shutdown always terminates; a second `SIGINT` or `SIGTERM` exits immediately with code 130.
+The Claude Code plugin provides `/worker on|off` and `/worker mode mcp|sonnet`. When delegation is off or Sonnet mode is selected, the plugin refuses calls to its MCP worker tools. This needs a Claude Code build supporting plugin hooks modules. See [worker policy details](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/runtime.md#worker-policy).
 
 ## Sandbox and approvals
 
-The sandbox classifies operations as inside or outside its boundary. The approval policy then decides whether the operation runs, asks the MCP client for approval, or is denied.
+For native providers, the sandbox sets the operation boundary and the approval policy decides whether to allow, ask, or deny. In `workspace-write`, auto-allowed shell writes are confined to `cwd`, temporary directories, and configured writable roots. Native file writes are limited to `cwd`. Server-side limits can cap requested access and allowed directories.
 
-| Sandbox | `untrusted` | `on-request` | `on-failure` | `never` |
-|---|---|---|---|---|
-| `read-only` | Allow `read_file` and allowlisted shell; ask for everything else | Allow `read_file` and allowlisted shell; ask for everything else | Same as `on-request` | Allow `read_file` and allowlisted shell; deny everything else |
-| `workspace-write` | Allow `read_file` and allowlisted shell; ask for other shell and all `write_file` calls | Allow `read_file`, all shell, and `write_file` inside `cwd`; ask for `write_file` outside `cwd` | Same as `on-request` | Allow `read_file`, all shell, and `write_file` inside `cwd`; deny `write_file` outside `cwd` |
-| `danger-full-access` | Allow `read_file` and allowlisted shell; ask for all other operations | Allow all operations | Same as `on-request` | Allow all operations |
+**Reads and network access are unrestricted.** Human-approved shell calls and `danger-full-access` shell calls run without Landlock. Kernel-version restrictions, reachable local sockets, and deliberately detached processes limit confinement; use stronger operating-system isolation where required. See the [approval matrix and full sandbox limitations](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/sandbox.md).
 
-The shell allowlist covers `ls`, `cat`, `head`, `tail`, `rg`, `grep`, `find`, `pwd`, `wc`, `stat`, `which`, and `echo`, plus the Git subcommands `status`, `diff`, `log`, `show`, `branch`, `blame`, `rev-parse`, and `ls-files`. It parses shell words before making the decision, including single/double quotes, backslashes, adjacent quoted pieces, and separators outside quotes, so the decision is based on the argv that the shell will execute rather than on raw command text. Commands with unquoted variable or command expansion (`$` or backticks), process substitution, redirection or heredocs, unquoted brace/pathname expansion, a leading tilde expansion, assignments, unknown segments, or selected dangerous flags fall outside the allowlist. Auto-allowed Git commands also run with repository-configured external diffs, textconv and content filters, fsmonitor, pagers, signature verification, submodule recursion, and relevant environment/config overrides disabled. The flags it rejects for an allowlisted `git` subcommand include `-h` and `--help` (which exec the configured man viewer) and any abbreviation Git accepts of `--recurse-submodules` (from `--rec` up), `--ignore-submodules`, or `--no-ignore-submodules`; `git status` and `git diff` always run with `--ignore-submodules=dirty`, so a submodule pointer change still shows without entering the submodule's worktree. That hardening is applied by wrapping the command word `git` itself, so it reaches exactly the spellings the allowlist admits; a command that reaches `git` another way (`command git …`, an absolute path, `env git …`) needs approval and then runs without it, as written. The approval prompt says when approving a shell command means running it outside the kernel sandbox, and it shows the command in full: a command over 8 KiB is refused with a tool error before any prompt is sent, so a human is never asked to approve a tail they cannot see. Approval elicitation failure or an unanswered request after five minutes is treated as denial.
-
-`apply_patch` is evaluated like `write_file` once per touched path (including `*** Move to:` targets). Any denied path denies the whole patch, so a single patch cannot write inside `cwd` and outside it at the same time; every path that needs approval is listed in one combined approval request, one `target:` line each, and that approval covers the whole patch.
-
-### Kernel sandbox for shell calls
-
-Shell calls that the policy auto-allows run under a Landlock ruleset: the server re-executes its own binary as `subagent-mcp __sandbox-exec --cwd-fd <fd> --rw-fd <fd>... -- bash -lc <command>`. The server opens the cwd and writable roots when the session is created and passes those directory handles to the helper. The helper enters the held cwd and grants write access to those same directory inodes, so renaming a root or replacing its old path cannot grant access to a different directory. The existing `--rw <path>` helper form remains available for path-based callers. The ruleset permits read and execute everywhere and writes only beneath the held roots. The login profile is loaded before the command environment cleanup described above, so profile-provided `PATH` entries remain usable without re-exported secrets reaching the command. The restriction is inherited by every descendant process, so writes are blocked by the kernel rather than by command-string inspection.
-
-| Sandbox | Writable roots for auto-allowed shell calls |
-|---|---|
-| `read-only` | None |
-| `workspace-write` | `cwd`, `/tmp`, `$TMPDIR` when set and different and an existing directory, plus `config.writable_roots` |
-| `danger-full-access` | Unrestricted; the command runs without the helper |
-
-In both wrapped modes the device files `/dev/null`, `/dev/zero`, `/dev/full`, `/dev/random`, `/dev/urandom`, and `/dev/tty` are also writable; the rest of `/dev`, including `/dev/shm`, is read-only. On Landlock ABI v2+ kernels (Linux 5.19+), files can be renamed or hard-linked between directories inside the writable roots.
-
-For auto-allowed `write_file` and `apply_patch` calls, the in-process path check uses the session's bound cwd. If the original cwd path no longer names that directory, the write fails closed; a replacement symlink cannot redirect it. Shell calls that a human approved through elicitation run without the kernel sandbox, matching Codex escalation semantics. The sandbox fails closed: on a kernel without Landlock (Linux below 5.13) or on a non-Linux platform, a wrapped shell call exits with code 126 and `subagent-mcp: landlock unavailable: ...` instead of running unsandboxed.
-
-**Safety: the application-layer policy prevents accidental misuse, and the Landlock wrapper confines auto-allowed shell writes to the roots above. Reads and network access are still unrestricted, and `write_file` and `apply_patch` writes are limited to `cwd` by a path check plus, on Linux, an `openat2(RESOLVE_BENEATH)` access relative to the held directory, so a symlink swapped in after the check cannot lead the write out of `cwd`; on other platforms only the path check applies. On Landlock ABI v1 kernels (Linux 5.13–5.18), renaming or hard-linking a file into a different directory always fails with `EXDEV` (tools such as `git mv` break, while `mv` falls back to copying). Truncation is only restricted from Landlock ABI v3 (Linux 6.2): on older kernels, truncating existing files outside the writable roots is not restricted. Human-approved and `danger-full-access` shell calls are not sandboxed at all. On Landlock ABI 6 and newer (Linux 6.12+) the ruleset also scopes two channels: abstract Unix sockets and signals, so a sandboxed command can neither reach an abstract-namespace socket nor signal a process outside the sandbox, closing the local-IPC route to having an unsandboxed process do the write; on older kernels both stay open. Sockets that live at a filesystem path — a user systemd socket, `docker.sock`, tmux, ssh-agent — are not covered by those scopes and remain reachable. A command that creates its own session with `setsid` (or a daemon that reparents itself) can outlive the process-group kill, so the "work does not outlive the call" guarantee covers ordinary children, not deliberately detached daemons. Use stronger operating-system isolation when the trust boundary requires it.**
-
-## Events
-
-During a running call, the server emits `subagent/event` notifications with `threadId` and a `msg` object. The possible `msg.type` values are:
-
-| Type | Meaning and fields |
-|---|---|
-| `task_started` | Processing began. |
-| `agent_message_delta` | Streamed assistant text in `delta`. Consecutive deltas are merged into one event (at most every 50 ms or 8 KiB, with the tail flushed when the turn ends), so append `delta` to a buffer rather than assuming one event per token — a busy client would otherwise overflow its notification channel and lose most of the stream. |
-| `token_count` | Model-turn usage in `prompt_tokens` (the full prompt, cached tokens included), `completion_tokens`, and `total_tokens` (their sum). |
-| `exec_command_begin` | Tool execution began; includes `call_id`, `tool`, and `command` for shell, `paths` (array) for `apply_patch`, or `path` for `read_file` and `write_file`. |
-| `exec_command_end` | Tool execution ended; includes `call_id`, `tool`, `exit_code` for shell, `paths` for `apply_patch`, and `error` when execution failed. |
-| `provider_request` | One model API call finished: `provider`, `model`, `duration_ms`, `ttft_ms` (only when text streamed), `upstream` (when the API names the serving channel) and `error` (only on failure). |
-| `agent_nudge` | A reply without a tool call was answered with a continue prompt (see `max_nudges`); the prompt is in `message`. |
-| `agent_message` | Final assistant text in `message`. |
-| `task_complete` | The call completed successfully. |
-| `error` | The call failed; `message` contains the error. |
-
-Operations stopped by policy or denied approval do not begin execution and therefore do not emit `exec_command_begin` or `exec_command_end`. For `codex-app-server` sessions Codex reports `item/started` before it requests approval, so a file change that is then declined has already emitted `exec_command_begin` and still emits `exec_command_end`; those events show what Codex reported, not whether the approval was granted.
-
-When a `tools/call` carries `_meta.progressToken`, the server additionally sends standard `notifications/progress` notifications for that call alongside the unchanged `subagent/event` notifications. The `progress` value increases from 1, and `message` carries a short summary: `started`, `shell: <cmd>`, `apply_patch: <paths>`, `<tool>: <path>`, `agent: <first line>`, `completed`, or `error: <msg>`, each at most 200 characters.
+Calls support MCP cancellation; ordinary shell children are killed, and the thread remains usable. Client disconnection cancels calls and shuts down the server. See [cancellation, concurrency, and shutdown](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/runtime.md#cancellation-and-concurrency).
 
 ## Rollout files
 
-Every session writes a Codex-compatible rollout as JSONL under `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-<YYYY-MM-DDTHH-MM-SS>-<threadId>.jsonl`, using UTC and `~/.codex` when `CODEX_HOME` is unset. Directories are created `0700` and the file is `0600`. Each line is `{"timestamp": ..., "type": ..., "payload": {...}}` with the Codex line types `session_meta`, `turn_context`, `response_item`, and `event_msg`. Codex ecosystem tools can read these files for usage reporting, session viewing, and audit; `originator` is `subagent-mcp`, `model_provider` is the selected provider's config name, `turn_context` records both the caller's `effort` and the mapped `effort_sent`, and `reasoning` items come from the provider's human-readable reasoning text and are omitted when empty. `session_meta` records the working directory, the full composed system prompt, and the Git branch and commit when `cwd` is in a repository. Replay payloads are never written. Because the files are written but never read back, these sessions are visible to `codex resume` but cannot actually be resumed by Codex.
+Native sessions record Codex-compatible JSONL under `$CODEX_HOME/sessions` (default `~/.codex/sessions`). Set `SUBAGENT_MCP_ROLLOUT=off` to disable recording, or configure `[rollout] format = "opencode"` to record in OpenCode instead. Codex-provider sessions use Codex's own recording; this switch does not disable it.
 
-Set `SUBAGENT_MCP_ROLLOUT=off` to disable rollout writing. A rollout write or open failure logs one line to stderr and disables the rollout for that session; it never fails an agent run.
+**Transcripts can contain secrets, file contents, and command output.** OpenCode API recording exposes the transcript temporarily in process arguments; database mode writes another application's database, and each run replaces its session copy. Read the [rollout and OpenCode reference](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/rollouts.md) before enabling that integration. Native rollout files are write-only and cannot restore sessions through `codex resume`.
 
-The rollout records the prompt, the composed system prompt, tool arguments, tool results, and command output, so it can contain secrets and file contents. Treat the rollout directory with the same care as the session transcript.
+## Reference
 
-### OpenCode format
-
-By default a session is recorded as a Codex rollout (above). Set `[rollout] format = "opencode"` (or `SUBAGENT_MCP_ROLLOUT_FORMAT=opencode`) to record it in [OpenCode](https://opencode.ai)'s session list instead, so the subagent sessions can be browsed in OpenCode. The two formats are mutually exclusive: one process writes one format. `SUBAGENT_MCP_ROLLOUT=off` disables both. It applies to the native providers (chat completions, responses, messages); the Codex provider keeps writing its own rollout.
-
-```toml
-[rollout]
-format = "opencode"          # default "codex"
-
-[rollout.opencode]
-mode = "api"                 # "api" (default) or "db"
-fallback = "db"              # "db" (default) or "none"; only used when mode = "api"
-# bin = "/path/to/opencode"  # default: `opencode` on PATH
-# db_path = "/path/to/opencode.db"  # default: $OPENCODE_DB, then $XDG_DATA_HOME/opencode/opencode.db, then ~/.local/share/opencode/opencode.db
-```
-
-How it works:
-
-- After every run, the session's transcript (prompts, answers, reasoning, tool calls and their results) is written **in the background**; a run never waits for OpenCode and never fails because of it. The session appears under the OpenCode project that matches its working directory: the git root, else the nearest ancestor directory OpenCode knows as a project. OpenCode's global project is never used; with no matching project the write is skipped and a warning says so.
-- `mode = "api"` uses the official import endpoint through `opencode api`, so OpenCode handles authentication and this server never sees a credential. That endpoint is **experimental** in OpenCode; the format was verified against OpenCode 2.3.x. A different version produces a warning, and the API is still tried. The transcript is passed to `opencode` as **one command-line argument**, so local users can see it in `ps` while the call runs (up to about 100 KB, including prompts and command output), unlike the 0600 Codex rollout; on a shared host use `mode = "db"`. A transcript larger than about 100,000 bytes cannot be passed on a command line and counts as an API failure. Real sessions often exceed that, so with the default `fallback = "db"` many sessions are written through the database, with a warning in the next reply; an API answer of 400/422-style (the server judged the transcript invalid) is never retried through the database; with `fallback = "none"` such a session stays at its last copy under 100 KB and the recorder is disabled after the first failure. The child process runs with the same scrubbed environment as the shell tool (no provider keys, no `SUBAGENT_MCP_*`) and in `/`. Linux and macOS are supported; Windows is unverified (its command-line limit is much lower, so the limit there is 12,000 bytes). On the API path `opencode session delete` also deletes any child sessions of the replaced session.
-- `fallback = "db"` writes OpenCode's SQLite database directly when the API path fails (for example when `opencode` is not installed). `mode = "db"` uses only the database and never runs `opencode`; the OpenCode version is then taken from the newest session already stored in the database (not from the installed binary), so a database with no sessions yet fails with "OpenCode version unknown". With `fallback = "none"` and no `opencode` binary, nothing is recorded: you only get the warning.
-- **The database is owned by another program** (and also holds its account credentials), so this path is deliberately narrow: Linux and macOS only; only OpenCode 2.3.x is accepted (anything else is refused); the file must already exist; one transaction per write that touches only the session, message and sequence tables; no migration, no table creation, foreign keys off so nothing cascades, and no checkpointing. The write-ahead log (`opencode.db-wal`) therefore keeps growing, by the size of the transcript on every run, until OpenCode's next commit checkpoints it (this can happen while OpenCode is idle too), and a backup of `opencode.db` alone would miss the unchecked writes. Only an OpenCode database whose latest migration is exactly the verified one is written. Prefer the API.
-- **Each run replaces the whole session in OpenCode** (the import endpoint cannot append): the previous copy is deleted and the full transcript imported again. Anything you did to that session inside OpenCode, such as continuing it or renaming it, is overwritten by the next run.
-- A failure is reported once per cause, on stderr and as a `warning:` line at the top of that session's next reply; a failure of a session's last run has no later reply to carry it, so it reaches stderr only. When every allowed path has failed, writing stops for that session. At shutdown the server waits for pending writes within the shutdown grace period; a write still running when the process ends, or a forced kill, loses the last run, and one that is cut between the delete and the import loses the session.
-- The transcript, including command output and file contents, lives in OpenCode's database afterwards and is subject to OpenCode's own features such as sharing (this server never shares a session). Treat it like the Codex rollout.
-
-## Notes
-
-- This repository's `.mcp.json` exposes `subagent` as a project-level MCP server when Claude Code is opened inside the repository, which is useful for self-testing.
-- Sessions are stored in memory only. They are lost when the server restarts; there is no persistence or cross-process resume, and rollout files are write-only. Sessions idle for more than 24 hours are evicted, and when more than 256 sessions exist the least recently used idle ones are evicted; busy sessions are never evicted. An evicted `threadId` returns `unknown threadId` like a server restart.
-- Run `go test ./... -race` to execute the test suite with the race detector.
+| Document | Contents |
+|---|---|
+| [Configuration](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/configuration.md) | All fields, keys, effort, gateways, nudges, server limits, validation, and environment variables. |
+| [Tools](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/tools.md) | Start/reply contracts, budgets, prompt loading, native tools, and MCP naming. |
+| [Runtime](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/runtime.md) | Worker policy, provider protocols, retries, cancellation, concurrency, and shutdown. |
+| [Sandbox](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/sandbox.md) | Approval matrix, allowlist, Landlock behavior, and security boundaries. |
+| [Events](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/events.md) | `subagent/event` fields and standard MCP progress notifications. |
+| [Rollouts](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/rollouts.md) | Codex JSONL and OpenCode recording, failure handling, and privacy. |
+| [Development](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/development.md) | Build, tests, packaging, and plugin release pins. |
 
 ## Non-goals
 
-- Switching provider mid-thread or per call.
-- Auto mode selecting a model per turn; it selects once per session.
+- Switching provider mid-thread or selecting a new model on every auto-mode turn.
 - Third-party hosting of Anthropic or OpenAI models (Bedrock, Vertex, Foundry, Azure OpenAI).
-- Image input, provider server-side tools (web search, code execution), and context compaction.
-- Network or read sandboxing, and sandboxing on non-Linux platforms.
-- Persistent or restart-resumable sessions, and backward compatibility with the pre-0.6.0 names, environment variables, or file-based credential handling.
-- MCP resources or prompts. The Claude Code plugin also deliberately omits background broker scripts.
+- Image input, provider server-side tools (web search, code execution), or context compaction.
+- Network or read sandboxing, or native shell sandboxing on non-Linux platforms.
+- Persistent or restart-resumable sessions; compatibility with pre-0.6.0 names, variables, or file-based credential handling.
+- MCP resources or prompts; background broker scripts in the Claude Code plugin.
