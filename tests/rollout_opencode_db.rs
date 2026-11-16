@@ -40,12 +40,25 @@ CREATE TABLE blob (hash TEXT PRIMARY KEY, data BLOB NOT NULL);
 INSERT INTO blob VALUES ('h', x'00ff');
 INSERT INTO project (id, worktree, vcs) VALUES ('prj_1', '/work/repo', 'git');
 INSERT INTO project (id, worktree) VALUES ('global', '/');
+CREATE TABLE blob_ref (session_id TEXT NOT NULL REFERENCES session_v2(id) ON DELETE CASCADE,
+    message_id TEXT NOT NULL, hash TEXT NOT NULL, seq INTEGER NOT NULL,
+    PRIMARY KEY (session_id, message_id, hash));
+CREATE TABLE instruction_state (session_id TEXT PRIMARY KEY REFERENCES session_v2(id) ON DELETE CASCADE,
+    state TEXT NOT NULL);
+CREATE TABLE event (id TEXT PRIMARY KEY,
+    aggregate_id TEXT NOT NULL REFERENCES event_sequence(aggregate_id) ON DELETE CASCADE,
+    seq INTEGER NOT NULL, type TEXT NOT NULL, data TEXT NOT NULL);
 ";
 
 fn fixture() -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("opencode.db");
     let conn = Connection::open(&path).unwrap();
+    // The real OpenCode database runs in WAL mode.
+    let mode: String = conn
+        .query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
     conn.execute_batch(SCHEMA).unwrap();
     (dir, path)
 }
@@ -160,7 +173,10 @@ fn open_refuses_a_read_only_database() {
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
     // A root user can still write; only assert the refusal when the file really is read-only.
     if std::fs::OpenOptions::new().write(true).open(&path).is_err() {
-        assert!(DbWriter::open(&path, "2.3.0").is_err());
+        assert!(matches!(
+            DbWriter::open(&path, "2.3.0"),
+            Err(OpenCodeError::Other(_))
+        ));
     }
 }
 
@@ -355,16 +371,21 @@ fn lock_contention_fails_fast_without_partial_writes() {
 #[test]
 fn a_failing_insert_rolls_the_whole_session_back() {
     let (_d, path) = fixture();
+    // An old copy that is distinguishable from every failure state.
     writer(&path)
-        .replace_session(&body("ses_x", &["a"]))
+        .replace_session(&body("ses_x", &["old-user", "old-a", "old-b"]))
         .unwrap();
-    // Two messages with the same id break the primary key mid-transaction.
-    let mut bad = body("ses_x", &["a", "b"]);
+    // The replacement fails at its second message: a duplicate primary key,
+    // after the DELETEs and the session row already ran in the transaction.
+    let mut bad = body("ses_x", &["new-user", "new-a"]);
     bad["messages"][1]["id"] = bad["messages"][0]["id"].clone();
+    bad["info"]["title"] = json!("NEW TITLE");
+    bad["info"]["tokens"]["input"] = json!(99);
     assert!(matches!(
         writer(&path).replace_session(&bad),
         Err(OpenCodeError::Other(_))
     ));
+
     let conn = Connection::open(&path).unwrap();
     let n: i64 = conn
         .query_row(
@@ -373,7 +394,34 @@ fn a_failing_insert_rolls_the_whole_session_back() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(n, 1, "the previous copy must survive a failed replacement");
+    assert_eq!(n, 3, "all three old messages must survive");
+    let text: String = conn
+        .query_row(
+            "SELECT data FROM session_message WHERE session_id = 'ses_x' AND seq = 2",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&text).unwrap()["content"][0]["text"],
+        "old-a"
+    );
+    let (title, tokens): (String, i64) = conn
+        .query_row(
+            "SELECT title, tokens_input FROM session_v2 WHERE id = 'ses_x'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((title.as_str(), tokens), ("subagent-mcp: t", 10));
+    let seq: i64 = conn
+        .query_row(
+            "SELECT seq FROM event_sequence WHERE aggregate_id = 'ses_x'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(seq, 3);
 }
 
 #[test]
@@ -394,4 +442,110 @@ fn list_projects_reads_the_project_table() {
             },
         ]
     );
+}
+
+#[test]
+fn replace_session_does_not_cascade_into_other_tables() {
+    let (_d, path) = fixture();
+    let w = writer(&path);
+    w.replace_session(&body("ses_x", &["a", "b"])).unwrap();
+    // Rows OpenCode itself owns, hanging off the session by ON DELETE CASCADE keys.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "INSERT INTO blob_ref VALUES ('ses_x', 'm1', 'h1', 1);
+         INSERT INTO instruction_state VALUES ('ses_x', 'state');
+         INSERT INTO event VALUES ('e1', 'ses_x', 1, 't', 'd');",
+    )
+    .unwrap();
+    w.replace_session(&body("ses_x", &["only"])).unwrap();
+    for table in ["blob_ref", "instruction_state", "event"] {
+        assert_eq!(count(&conn, table), 1, "{table} must survive a replacement");
+    }
+}
+
+#[test]
+fn the_journal_mode_stays_wal() {
+    let (_d, path) = fixture();
+    writer(&path)
+        .replace_session(&body("ses_x", &["a", "b"]))
+        .unwrap();
+    let mode: String = Connection::open(&path)
+        .unwrap()
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(mode, "wal");
+}
+
+#[test]
+fn open_refuses_versions_outside_the_tested_range() {
+    let (_d, path) = fixture();
+    for version in ["9.9.9", "2.4.0", "1.0.0", ""] {
+        assert!(
+            matches!(
+                DbWriter::open(&path, version),
+                Err(OpenCodeError::Schema(_))
+            ),
+            "{version:?} must be refused"
+        );
+    }
+    for version in ["2.3.0", "v2.3.5", " 2.3.1 "] {
+        assert!(
+            DbWriter::open(&path, version).is_ok(),
+            "{version:?} is in range"
+        );
+    }
+}
+
+#[test]
+fn a_body_without_required_values_is_refused_and_writes_nothing() {
+    let (_d, path) = fixture();
+    let w = writer(&path);
+    for mutate in [
+        (|b: &mut Value| {
+            b["info"].as_object_mut().unwrap().remove("time");
+        }) as fn(&mut Value),
+        |b| b["messages"][0]["time"] = json!({}),
+        |b| b["info"]["time"]["created"] = json!(1000.5),
+        |b| {
+            b["info"].as_object_mut().unwrap().remove("location");
+        },
+    ] {
+        let mut bad = body("ses_x", &["a", "b"]);
+        mutate(&mut bad);
+        assert!(matches!(
+            w.replace_session(&bad),
+            Err(OpenCodeError::Other(_))
+        ));
+    }
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(count(&conn, "session_v2"), 0);
+    assert_eq!(count(&conn, "session_message"), 0);
+}
+
+#[test]
+fn a_null_model_is_stored_as_sql_null() {
+    let (_d, path) = fixture();
+    let mut input = body("ses_x", &["a", "b"]);
+    input["info"]["model"] = Value::Null;
+    writer(&path).replace_session(&input).unwrap();
+    let model: Option<String> = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT model FROM session_v2 WHERE id = 'ses_x'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    assert_eq!(model, None);
+}
+
+#[test]
+fn closing_our_connection_leaves_the_wal_for_opencode() {
+    let (_d, path) = fixture();
+    writer(&path)
+        .replace_session(&body("ses_x", &["a", "b"]))
+        .unwrap();
+    // Our connection was the last one; without no-checkpoint-on-close SQLite would
+    // have folded the log into the database and deleted the `-wal` file.
+    let wal = PathBuf::from(format!("{}-wal", path.display()));
+    let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
+    assert!(size > 0, "{} must still hold our commit", wal.display());
 }

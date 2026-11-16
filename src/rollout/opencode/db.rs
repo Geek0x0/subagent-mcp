@@ -3,15 +3,28 @@
 //! This is the fallback when the official API is unavailable, and it writes a
 //! database owned by another, possibly running, program. The rules are strict:
 //! the file must already exist and be writable (it is never created); no
-//! migration is run; the schema is verified before every write and an unknown
-//! shape is refused; only `session_v2`, `session_message` and `event_sequence`
-//! are written and only `project` and `migration` are read; one `BEGIN
-//! IMMEDIATE` transaction per session; the journal mode is never changed.
+//! migration is run; the OpenCode version must be inside the tested range
+//! (`2.3.x`, a leading `v` is tolerated); the schema is verified before every
+//! write and an unknown shape is refused (an additive nullable or defaulted
+//! column is tolerated, a new required column or an older `migration` id is
+//! not); only `session_v2`, `session_message` and `event_sequence` are written
+//! and only `project` and `migration` are read; one `BEGIN IMMEDIATE`
+//! transaction per session; the journal mode is never changed.
+//!
+//! Two SQLite defaults need care. The bundled SQLite has foreign keys ON, and
+//! the real OpenCode database has `ON DELETE CASCADE` children of `session_v2`
+//! (`blob_ref`, `instruction_state`, ...) and of `event_sequence`, so every
+//! connection turns foreign keys OFF right after opening: deleting the rows we
+//! own can then never cascade into a table we do not own. And a closing
+//! connection would checkpoint and delete the `-wal` file OpenCode relies on,
+//! so every connection disables auto-checkpointing and checkpoint-on-close
+//! (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`); we ourselves never issue a checkpoint.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use rusqlite::config::DbConfig;
 use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior, params};
 use serde_json::Value;
 
@@ -22,6 +35,8 @@ use super::project::ProjectRef;
 /// latest migration is older than this is refused.
 const BASELINE_MIGRATION: &str = "20261030054400_job";
 const DEFAULT_BUSY: Duration = Duration::from_secs(3);
+/// The OpenCode release line the row layout was verified against.
+const TESTED_VERSION_PREFIX: &str = "2.3.";
 
 const SESSION_COLUMNS: &[&str] = &[
     "id",
@@ -76,6 +91,12 @@ impl DbWriter {
     /// Check that `path` is an existing, writable OpenCode database of a known
     /// shape. `opencode_version` fills the `version` column of written sessions.
     pub fn open(path: &Path, opencode_version: &str) -> Result<Self, OpenCodeError> {
+        let release = opencode_version.trim().trim_start_matches('v');
+        if !release.starts_with(TESTED_VERSION_PREFIX) {
+            return Err(OpenCodeError::Schema(format!(
+                "OpenCode {opencode_version} is outside the tested range 2.3.x"
+            )));
+        }
         let writer = Self {
             path: path.to_path_buf(),
             version: opencode_version.to_string(),
@@ -124,7 +145,8 @@ impl DbWriter {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_err)?;
-        // Foreign keys are off on a new connection, so children go first.
+        // Foreign keys are off (see `connect`), so nothing cascades; children still
+        // go first so the intermediate states stay consistent.
         for sql in [
             "DELETE FROM session_message WHERE session_id = ?1",
             "DELETE FROM event_sequence WHERE aggregate_id = ?1",
@@ -144,9 +166,7 @@ impl DbWriter {
                 session_id,
                 text(info, "projectID")?,
                 slug(&session_id),
-                info.pointer("/location/directory")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default(),
+                text_at(info, "/location/directory")?,
                 info.get("title").and_then(Value::as_str),
                 self.version,
                 info.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
@@ -155,17 +175,19 @@ impl DbWriter {
                 int(&tokens, "/reasoning"),
                 int(&tokens, "/cache/read"),
                 int(&tokens, "/cache/write"),
-                int(&time, "/created"),
-                int(&time, "/updated"),
+                required_int(&time, "/created")?,
+                required_int(&time, "/updated")?,
                 info.get("agent").and_then(Value::as_str),
-                info.get("model").map(Value::to_string),
+                info.get("model")
+                    .filter(|model| !model.is_null())
+                    .map(Value::to_string),
             ],
         )
         .map_err(map_err)?;
 
         for (index, message) in messages.iter().enumerate() {
             let seq = index as i64 + 1;
-            let created = int(message, "/time/created");
+            let created = required_int(message, "/time/created")?;
             let updated = message
                 .pointer("/time/completed")
                 .and_then(Value::as_i64)
@@ -215,6 +237,23 @@ impl DbWriter {
             return Err(OpenCodeError::Other("database is read-only".to_string()));
         }
         conn.busy_timeout(self.busy).map_err(map_err)?;
+        // Before anything else, and outside any transaction (a no-op inside one):
+        // the bundled SQLite defaults to foreign keys ON.
+        conn.pragma_update(None, "foreign_keys", false)
+            .map_err(map_err)?;
+        let foreign_keys: i64 = conn
+            .query_row("PRAGMA foreign_keys", [], |row| row.get(0))
+            .map_err(map_err)?;
+        if foreign_keys != 0 {
+            return Err(OpenCodeError::Other(
+                "could not turn foreign keys off".to_string(),
+            ));
+        }
+        // Never checkpoint: not automatically, and not when this connection closes.
+        conn.pragma_update(None, "wal_autocheckpoint", 0)
+            .map_err(map_err)?;
+        conn.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+            .map_err(map_err)?;
         check_schema(&conn)?;
         Ok(conn)
     }
@@ -224,7 +263,12 @@ impl DbWriter {
 fn check_schema(conn: &Connection) -> Result<(), OpenCodeError> {
     let latest: Option<String> = conn
         .query_row("SELECT max(id) FROM migration", [], |row| row.get(0))
-        .map_err(|e| OpenCodeError::Schema(format!("no readable migration table: {e}")))?;
+        .map_err(|e| match &e {
+            rusqlite::Error::SqliteFailure(_, Some(msg)) if msg.contains("no such table") => {
+                OpenCodeError::Schema("no migration table".to_string())
+            }
+            _ => map_err(e),
+        })?;
     match latest {
         Some(id) if id.as_str() >= BASELINE_MIGRATION => {}
         other => {
@@ -301,15 +345,32 @@ fn text(value: &Value, key: &str) -> Result<String, OpenCodeError> {
         .ok_or_else(|| OpenCodeError::Other(format!("import body is missing {key}")))
 }
 
+/// An optional count: missing or not an integer means 0.
 fn int(value: &Value, pointer: &str) -> i64 {
     value.pointer(pointer).and_then(Value::as_i64).unwrap_or(0)
+}
+
+/// A required integer (a timestamp): missing, a float or out of `i64` range is
+/// an error rather than a silent 1970.
+fn required_int(value: &Value, pointer: &str) -> Result<i64, OpenCodeError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| OpenCodeError::Other(format!("import body has no integer at {pointer}")))
+}
+
+fn text_at(value: &Value, pointer: &str) -> Result<String, OpenCodeError> {
+    value
+        .pointer(pointer)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| OpenCodeError::Other(format!("import body has no text at {pointer}")))
 }
 
 fn map_err(error: rusqlite::Error) -> OpenCodeError {
     if let rusqlite::Error::SqliteFailure(failure, _) = &error {
         match failure.code {
             ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => return OpenCodeError::Locked,
-            ErrorCode::CannotOpen => return OpenCodeError::NotFound,
             _ => {}
         }
     }
