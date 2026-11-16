@@ -191,6 +191,7 @@ fn test_config(providers: Vec<(&str, Arc<dyn Provider>)>) -> Config {
         providers: map,
         auto: None,
         limits: Default::default(),
+        rollout: Default::default(),
     }
 }
 
@@ -762,6 +763,7 @@ async fn codex_single_candidate_is_skipped_without_a_judge() {
         providers: BTreeMap::new(),
         auto: None,
         limits: Default::default(),
+        rollout: Default::default(),
     };
     config
         .providers

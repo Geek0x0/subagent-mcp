@@ -234,6 +234,7 @@ fn test_config(providers: Vec<(&str, Arc<dyn Provider>)>) -> Config {
         providers: map,
         auto: None,
         limits: Default::default(),
+        rollout: Default::default(),
     }
 }
 
@@ -649,6 +650,7 @@ fn model_union_across_providers_deduplicates_and_marks_defaults() {
         providers: BTreeMap::from([("a".to_string(), a), ("b".to_string(), b)]),
         auto: None,
         limits: Default::default(),
+        rollout: Default::default(),
     };
     let tools = tools(config);
     let schema = tools.definitions()[0].input_schema.to_string();
@@ -1397,6 +1399,7 @@ fn codex_config(command: &str) -> Config {
         providers: BTreeMap::from([("codex".to_string(), codex_provider_config(command))]),
         auto: None,
         limits: Default::default(),
+        rollout: Default::default(),
     }
 }
 

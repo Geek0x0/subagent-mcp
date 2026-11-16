@@ -578,6 +578,7 @@ fn differential_auto_selection_matches_jev_golden() {
             descriptions: std::collections::BTreeMap::new(),
         }),
         limits: Default::default(),
+        rollout: Default::default(),
     };
 
     let cwd = tempfile::tempdir().unwrap();

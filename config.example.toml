@@ -69,6 +69,20 @@ models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
 # allowed_cwd_roots = ["/srv/work"]      # when set, cwd must live under one of these
 # scrub_env = ["GITHUB_TOKEN", "AWS_*"]  # extra names (or PREFIX_*) hidden from children
 
+# Optional: where session transcripts are written.
+# "codex" (the default) writes the Codex rollout file under $CODEX_HOME;
+# "opencode" imports the session into OpenCode instead. Every key is optional,
+# and SUBAGENT_MCP_ROLLOUT_FORMAT overrides `format` from the environment.
+# SUBAGENT_MCP_ROLLOUT=off still disables rollout writing entirely.
+# [rollout]
+# format = "codex"                       # codex | opencode
+#
+# [rollout.opencode]
+# mode = "api"                           # api | db (db writes OpenCode's SQLite database directly)
+# fallback = "db"                        # db | none: what to do when mode = "api" fails
+# bin = "/usr/local/bin/opencode"        # optional; default: search PATH
+# db_path = "/home/me/.local/share/opencode/opencode.db"  # optional; default: $OPENCODE_DB, else $XDG_DATA_HOME/opencode/opencode.db, else ~/.local/share/opencode/opencode.db
+
 # Alternative [auto] backend: Cloudflare Clef (use this block instead of the above).
 # [auto]
 # url = "https://api.cloudflare.com/client/v4/accounts/<ACCOUNT_ID>/ai/run/@cf/cloudflare/clef"

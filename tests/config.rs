@@ -1181,3 +1181,92 @@ fn invalid_server_limits_are_rejected() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// [rollout]
+// ---------------------------------------------------------------------------
+
+// `config::load` reads SUBAGENT_MCP_ROLLOUT_FORMAT, so every test that asserts
+// the chosen format holds the shared environment lock and pins the variable.
+const ROLLOUT_ENV_KEYS: [&str; 1] = ["SUBAGENT_MCP_ROLLOUT_FORMAT"];
+
+#[test]
+fn rollout_defaults_to_codex_api_db() {
+    let _guard = EnvGuard::new(&ROLLOUT_ENV_KEYS);
+    unsafe { std::env::remove_var("SUBAGENT_MCP_ROLLOUT_FORMAT") };
+    let (_dir, path) = write_config(AUTO_PROVIDER_TOML);
+    let rollout = config::load(&path).unwrap().rollout;
+    assert_eq!(rollout.format, config::RolloutFormat::Codex);
+    assert_eq!(rollout.opencode.mode, config::OpenCodeMode::Api);
+    assert_eq!(rollout.opencode.fallback, config::OpenCodeFallback::Db);
+    assert_eq!(rollout.opencode.bin, None);
+    assert_eq!(rollout.opencode.db_path, None);
+}
+
+#[test]
+fn rollout_section_is_parsed() {
+    let _guard = EnvGuard::new(&ROLLOUT_ENV_KEYS);
+    unsafe { std::env::remove_var("SUBAGENT_MCP_ROLLOUT_FORMAT") };
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("opencode");
+    let db_path = dir.path().join("opencode.db");
+    let toml = format!(
+        "{AUTO_PROVIDER_TOML}\n[rollout]\nformat = \"opencode\"\n\n[rollout.opencode]\nmode = \"db\"\nfallback = \"none\"\nbin = {}\ndb_path = {}\n",
+        toml_path(&bin),
+        toml_path(&db_path)
+    );
+    let (_dir, path) = write_config(&toml);
+    let rollout = config::load(&path).unwrap().rollout;
+    assert_eq!(rollout.format, config::RolloutFormat::OpenCode);
+    assert_eq!(rollout.opencode.mode, config::OpenCodeMode::Db);
+    assert_eq!(rollout.opencode.fallback, config::OpenCodeFallback::None);
+    assert_eq!(rollout.opencode.bin, Some(bin));
+    assert_eq!(rollout.opencode.db_path, Some(db_path));
+}
+
+#[test]
+fn rollout_rejects_unknown_format() {
+    let _guard = EnvGuard::new(&ROLLOUT_ENV_KEYS);
+    unsafe { std::env::remove_var("SUBAGENT_MCP_ROLLOUT_FORMAT") };
+    let (_dir, path) = write_config(&format!(
+        "{AUTO_PROVIDER_TOML}\n[rollout]\nformat = \"both\"\n"
+    ));
+    let error = config::load(&path).unwrap_err().to_string();
+    assert_eq!(
+        error.replace(&path.display().to_string(), "<PATH>"),
+        r#"config file <PATH>: rollout.format "both" is invalid; valid values: codex, opencode"#,
+    );
+}
+
+#[test]
+fn rollout_rejects_unknown_mode() {
+    let _guard = EnvGuard::new(&ROLLOUT_ENV_KEYS);
+    unsafe { std::env::remove_var("SUBAGENT_MCP_ROLLOUT_FORMAT") };
+    let (_dir, path) = write_config(&format!(
+        "{AUTO_PROVIDER_TOML}\n[rollout.opencode]\nmode = \"sdk\"\n"
+    ));
+    let error = config::load(&path).unwrap_err().to_string();
+    assert_eq!(
+        error.replace(&path.display().to_string(), "<PATH>"),
+        r#"config file <PATH>: rollout.opencode.mode "sdk" is invalid; valid values: api, db"#,
+    );
+}
+
+#[test]
+fn rollout_env_overrides_file() {
+    let _guard = EnvGuard::new(&ROLLOUT_ENV_KEYS);
+    let (_dir, path) = write_config(&format!(
+        "{AUTO_PROVIDER_TOML}\n[rollout]\nformat = \"opencode\"\n"
+    ));
+    unsafe { std::env::set_var("SUBAGENT_MCP_ROLLOUT_FORMAT", "codex") };
+    assert_eq!(
+        config::load(&path).unwrap().rollout.format,
+        config::RolloutFormat::Codex
+    );
+    // The file wins again once the variable is gone.
+    unsafe { std::env::remove_var("SUBAGENT_MCP_ROLLOUT_FORMAT") };
+    assert_eq!(
+        config::load(&path).unwrap().rollout.format,
+        config::RolloutFormat::OpenCode
+    );
+}

@@ -722,6 +722,7 @@ fn config_with(providers: Vec<(&str, ProviderConfig)>, auto: Option<AutoConfig>)
             .collect(),
         auto,
         limits: Default::default(),
+        rollout: Default::default(),
     }
 }
 

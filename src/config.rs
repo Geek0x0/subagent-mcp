@@ -36,6 +36,10 @@ const DEFAULT_AUTO_BASE_URL: &str = "https://api.typesafe.ai";
 const DEFAULT_AUTO_TIMEOUT_SECONDS: i64 = 20;
 const MAX_AUTO_TIMEOUT_SECONDS: i64 = 600;
 
+/// Overrides `rollout.format` from the environment (design 6.1), the way
+/// `SUBAGENT_MCP_ROLLOUT=off` already overrides rollout writing.
+const ROLLOUT_FORMAT_ENV: &str = "SUBAGENT_MCP_ROLLOUT_FORMAT";
+
 const RESERVED_BODY_FIELDS: [&str; 7] = [
     "model",
     "messages",
@@ -120,6 +124,8 @@ pub struct Config {
     pub auto: Option<AutoConfig>,
     /// Server-side ceilings over what one `start` call may request.
     pub limits: Limits,
+    /// Where session transcripts are written (design 6.1).
+    pub rollout: RolloutConfig,
 }
 
 /// `[server]` in the config file: defence against an orchestrator that asks
@@ -134,6 +140,81 @@ pub struct Limits {
     pub allowed_cwd_roots: Vec<PathBuf>,
     /// Extra environment names (or `PREFIX_*` patterns) to hide from children.
     pub scrub_env: Vec<String>,
+}
+
+/// `[rollout]`: which format session transcripts are written in.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum RolloutFormat {
+    #[default]
+    Codex,
+    OpenCode,
+}
+
+impl RolloutFormat {
+    fn parse(s: &str) -> Option<RolloutFormat> {
+        match s {
+            "codex" => Some(RolloutFormat::Codex),
+            "opencode" => Some(RolloutFormat::OpenCode),
+            _ => None,
+        }
+    }
+}
+
+/// `rollout.opencode.mode`: the supported path (`api`) or direct database
+/// writes (`db`). `api` is the default because the database is owned by a
+/// running OpenCode process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpenCodeMode {
+    #[default]
+    Api,
+    Db,
+}
+
+impl OpenCodeMode {
+    fn parse(s: &str) -> Option<OpenCodeMode> {
+        match s {
+            "api" => Some(OpenCodeMode::Api),
+            "db" => Some(OpenCodeMode::Db),
+            _ => None,
+        }
+    }
+}
+
+/// `rollout.opencode.fallback`: what to do when the API path fails. Only
+/// meaningful for mode `api`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum OpenCodeFallback {
+    #[default]
+    Db,
+    None,
+}
+
+impl OpenCodeFallback {
+    fn parse(s: &str) -> Option<OpenCodeFallback> {
+        match s {
+            "db" => Some(OpenCodeFallback::Db),
+            "none" => Some(OpenCodeFallback::None),
+            _ => None,
+        }
+    }
+}
+
+/// `[rollout.opencode]`. `bin` and `db_path` default to `PATH` lookup and the
+/// resolved OpenCode data directory when `None`; the writers resolve them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpenCodeConfig {
+    pub mode: OpenCodeMode,
+    pub fallback: OpenCodeFallback,
+    pub bin: Option<PathBuf>,
+    pub db_path: Option<PathBuf>,
+}
+
+/// `[rollout]`: the format plus its per-format settings. Defaults to Codex so
+/// an existing config keeps writing exactly the same files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RolloutConfig {
+    pub format: RolloutFormat,
+    pub opencode: OpenCodeConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -157,6 +238,10 @@ fn err(message: impl Into<String>) -> ConfigError {
 
 fn opt_str(s: String) -> Option<String> {
     if s.is_empty() { None } else { Some(s) }
+}
+
+fn opt_path(s: String) -> Option<PathBuf> {
+    opt_str(s).map(PathBuf::from)
 }
 
 /// Go `os.UserHomeDir` reads `%USERPROFILE%` on Windows and `$HOME` on Unix.
@@ -430,8 +515,31 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     }
 
     validate(&raw).map_err(|inner| err(format!("config file {}: {}", path.display(), inner)))?;
+    apply_rollout_format_env(&mut raw.rollout, |key| std::env::var(key).ok())
+        .map_err(|inner| err(format!("config file {}: {}", path.display(), inner)))?;
 
     Ok(build_config(absolute, raw))
+}
+
+/// `SUBAGENT_MCP_ROLLOUT_FORMAT` wins over the file's `rollout.format`, so a
+/// shell can force a format without editing the config. It is applied after
+/// validation (a broken file is still reported) and an unset or empty variable
+/// leaves the file's value alone.
+fn apply_rollout_format_env(
+    rollout: &mut RawRollout,
+    getenv: impl Fn(&str) -> Option<String>,
+) -> Result<(), String> {
+    let Some(value) = getenv(ROLLOUT_FORMAT_ENV).filter(|v| !v.is_empty()) else {
+        return Ok(());
+    };
+    if RolloutFormat::parse(&value).is_none() {
+        return Err(format!(
+            "{ROLLOUT_FORMAT_ENV} {} is invalid; valid values: codex, opencode",
+            go_quote(&value)
+        ));
+    }
+    rollout.format = value;
+    Ok(())
 }
 
 /// 1-based line and column (counting UTF-8 chars for the column) of a byte
@@ -501,6 +609,7 @@ fn collect_unknown(doc: &Document<String>) -> Vec<String> {
             "providers" => walk_providers(item, &prefix, &mut out),
             "auto" => walk_auto(item, &prefix, &mut out),
             "server" => walk_server(item, &prefix, &mut out),
+            "rollout" => walk_rollout(item, &prefix, &mut out),
             _ => report_unknown(key, item, &prefix, &mut out),
         }
     }
@@ -653,6 +762,41 @@ fn walk_auto(item: &Item, prefix: &[String], out: &mut Vec<String>) {
     }
 }
 
+fn walk_rollout(item: &Item, prefix: &[String], out: &mut Vec<String>) {
+    let is_table = matches!(item, Item::Table(_));
+    if let Some(t) = item.as_table_like() {
+        let p = if is_table {
+            with_key(prefix, "rollout")
+        } else {
+            prefix.to_vec()
+        };
+        for (key, ritem) in t.iter() {
+            match key {
+                "format" => {}
+                "opencode" => walk_opencode(ritem, &p, out),
+                _ => report_unknown(key, ritem, &p, out),
+            }
+        }
+    }
+}
+
+fn walk_opencode(item: &Item, prefix: &[String], out: &mut Vec<String>) {
+    let is_table = matches!(item, Item::Table(_));
+    if let Some(t) = item.as_table_like() {
+        let p = if is_table {
+            with_key(prefix, "opencode")
+        } else {
+            prefix.to_vec()
+        };
+        for (key, oitem) in t.iter() {
+            match key {
+                "mode" | "fallback" | "bin" | "db_path" => {}
+                _ => report_unknown(key, oitem, &p, out),
+            }
+        }
+    }
+}
+
 // --- Raw (Go-shaped) decoded config ----------------------------------------
 
 #[derive(Default)]
@@ -687,10 +831,25 @@ struct RawAuto {
     descriptions: BTreeMap<String, String>,
 }
 
+#[derive(Default)]
+struct RawRollout {
+    format: String,
+    opencode: RawOpenCode,
+}
+
+#[derive(Default)]
+struct RawOpenCode {
+    mode: String,
+    fallback: String,
+    bin: String,
+    db_path: String,
+}
+
 struct RawConfig {
     providers: BTreeMap<String, RawProvider>,
     auto: Option<RawAuto>,
     limits: Limits,
+    rollout: RawRollout,
 }
 
 fn extract(doc: &Document<String>, path: &Path, data: &str) -> Result<RawConfig, ConfigError> {
@@ -735,10 +894,46 @@ fn extract(doc: &Document<String>, path: &Path, data: &str) -> Result<RawConfig,
         },
     };
 
+    let rollout = match root.get("rollout") {
+        None => RawRollout::default(),
+        Some(item) if item.is_none() => RawRollout::default(),
+        Some(item) => match item.as_table_like() {
+            Some(table) => extract_rollout(table, path, data)?,
+            None => return Err(item_type_err(path, data, item, "rollout", "table")),
+        },
+    };
+
     Ok(RawConfig {
         providers,
         auto,
         limits,
+        rollout,
+    })
+}
+
+fn extract_rollout(t: &dyn TableLike, path: &Path, data: &str) -> Result<RawRollout, ConfigError> {
+    let format = str_field(t, "format", "rollout.format", path, data)?;
+    let opencode = match t.get("opencode") {
+        None => RawOpenCode::default(),
+        Some(item) if item.is_none() => RawOpenCode::default(),
+        Some(item) => match item.as_table_like() {
+            Some(table) => extract_opencode(table, path, data)?,
+            None => return Err(item_type_err(path, data, item, "rollout.opencode", "table")),
+        },
+    };
+    Ok(RawRollout { format, opencode })
+}
+
+fn extract_opencode(
+    t: &dyn TableLike,
+    path: &Path,
+    data: &str,
+) -> Result<RawOpenCode, ConfigError> {
+    Ok(RawOpenCode {
+        mode: str_field(t, "mode", "rollout.opencode.mode", path, data)?,
+        fallback: str_field(t, "fallback", "rollout.opencode.fallback", path, data)?,
+        bin: str_field(t, "bin", "rollout.opencode.bin", path, data)?,
+        db_path: str_field(t, "db_path", "rollout.opencode.db_path", path, data)?,
     })
 }
 
@@ -1172,6 +1367,32 @@ fn validate(cfg: &RawConfig) -> Result<(), String> {
     if let Some(a) = &cfg.auto {
         validate_auto(a)?;
     }
+    validate_rollout(&cfg.rollout)?;
+    Ok(())
+}
+
+/// An unset key (`""`, the shape of an absent Go string) means "use the
+/// default"; any other value must name a known variant.
+fn validate_rollout(r: &RawRollout) -> Result<(), String> {
+    if !r.format.is_empty() && RolloutFormat::parse(&r.format).is_none() {
+        return Err(format!(
+            "rollout.format {} is invalid; valid values: codex, opencode",
+            go_quote(&r.format)
+        ));
+    }
+    let oc = &r.opencode;
+    if !oc.mode.is_empty() && OpenCodeMode::parse(&oc.mode).is_none() {
+        return Err(format!(
+            "rollout.opencode.mode {} is invalid; valid values: api, db",
+            go_quote(&oc.mode)
+        ));
+    }
+    if !oc.fallback.is_empty() && OpenCodeFallback::parse(&oc.fallback).is_none() {
+        return Err(format!(
+            "rollout.opencode.fallback {} is invalid; valid values: db, none",
+            go_quote(&oc.fallback)
+        ));
+    }
     Ok(())
 }
 
@@ -1514,10 +1735,21 @@ fn build_config(path: PathBuf, raw: RawConfig) -> Config {
         descriptions: a.descriptions,
     });
 
+    let rollout = RolloutConfig {
+        format: RolloutFormat::parse(&raw.rollout.format).unwrap_or_default(),
+        opencode: OpenCodeConfig {
+            mode: OpenCodeMode::parse(&raw.rollout.opencode.mode).unwrap_or_default(),
+            fallback: OpenCodeFallback::parse(&raw.rollout.opencode.fallback).unwrap_or_default(),
+            bin: opt_path(raw.rollout.opencode.bin),
+            db_path: opt_path(raw.rollout.opencode.db_path),
+        },
+    };
+
     Config {
         path,
         providers,
         auto,
         limits: raw.limits,
+        rollout,
     }
 }

@@ -86,6 +86,7 @@ fn config() -> Config {
         )]),
         auto: None,
         limits: Default::default(),
+        rollout: Default::default(),
     }
 }
 
