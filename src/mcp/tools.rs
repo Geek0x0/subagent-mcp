@@ -687,17 +687,25 @@ impl SubagentTools {
             .run_locked(run_ctx, &mut lease, &prompt, &hooks)
             .await;
 
+        // A rollout flush runs in the background after a run, so a failure shows
+        // up here, in the session's next reply, once.
+        let flush_warning = lease.rollout.as_mut().and_then(|r| r.take_warning());
+        let with_warning = |text: &str| match &flush_warning {
+            Some(warning) => format!("{warning}\n{text}"),
+            None => text.to_string(),
+        };
+
         match outcome {
             Ok(text) => Ok(reply_result(
                 &thread_id,
-                &text,
+                &with_warning(&text),
                 &provider_name,
                 &model,
                 false,
             )),
             Err(error) => Ok(reply_result(
                 &thread_id,
-                &format!("error: {}", error.message),
+                &with_warning(&format!("error: {}", error.message)),
                 &provider_name,
                 &model,
                 true,

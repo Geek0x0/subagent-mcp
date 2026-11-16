@@ -2641,3 +2641,95 @@ async fn writable_roots_reject_a_symlink_out_of_an_allowed_root() {
         text(&rejected)
     );
 }
+
+#[cfg(unix)]
+#[path = "support/fake_opencode.rs"]
+mod fake_opencode;
+
+/// A rollout flush runs in the background after a run, so a failure surfaces in
+/// the session's NEXT reply, once.
+#[cfg(unix)]
+#[tokio::test]
+async fn reply_attaches_a_pending_flush_warning_once() {
+    use subagent_mcp::config::{
+        OpenCodeConfig, OpenCodeFallback, OpenCodeMode, RolloutConfig, RolloutFormat,
+    };
+    use subagent_mcp::rollout::opencode::flush::drain;
+
+    let _env = env_guard();
+    unsafe { std::env::set_var("SUBAGENT_MCP_ROLLOUT", "") };
+    // OpenCode knows no project for this directory: every flush warns about it.
+    let fake = fake_opencode::Fake::new()
+        .reply(0, "[]", "", 0)
+        .reply(1, "[]", "", 0);
+    let provider = Arc::new(StubProvider::with_turns(
+        "deepseek",
+        vec![text_turn("hi"), text_turn("continued"), text_turn("again")],
+    ));
+    let mut config = test_config(vec![("deepseek", provider)]);
+    config.rollout = RolloutConfig {
+        format: RolloutFormat::OpenCode,
+        opencode: OpenCodeConfig {
+            mode: OpenCodeMode::Api,
+            fallback: OpenCodeFallback::None,
+            bin: Some(fake.bin.clone()),
+            db_path: None,
+        },
+    };
+    let tools = tools(config);
+
+    let first = call(&tools, "subagent", json!({"prompt": "hello", "cwd": cwd()}))
+        .await
+        .unwrap();
+    assert_eq!(
+        text(&first),
+        "hi",
+        "the start response carries no flush warning"
+    );
+    let id = thread_id(&first).to_string();
+    drain(std::time::Duration::from_secs(10)).await;
+
+    let reply = |prompt: &'static str| {
+        call(
+            &tools,
+            "subagent-reply",
+            json!({"threadId": id.clone(), "prompt": prompt}),
+        )
+    };
+    let second = reply("keep going").await.unwrap();
+    let body = text(&second);
+    assert!(
+        body.starts_with("warning: OpenCode rollout: no OpenCode project for"),
+        "{body}"
+    );
+    assert!(body.ends_with("\ncontinued"), "{body}");
+    assert_eq!(body.matches("warning:").count(), 1, "{body}");
+    drain(std::time::Duration::from_secs(10)).await;
+
+    // The same cause is never warned about twice.
+    let third = reply("once more").await.unwrap();
+    assert_eq!(text(&third), "again");
+}
+
+/// With the default (Codex) format a reply never gains a warning line.
+#[tokio::test]
+async fn reply_without_the_opencode_format_has_no_warning() {
+    let _env = env_guard();
+    let provider = Arc::new(StubProvider::with_turns(
+        "deepseek",
+        vec![text_turn("hi"), text_turn("continued")],
+    ));
+    let tools = tools(test_config(vec![("deepseek", provider)]));
+    let first = call(&tools, "subagent", json!({"prompt": "hello", "cwd": cwd()}))
+        .await
+        .unwrap();
+    let id = thread_id(&first).to_string();
+    let reply = call(
+        &tools,
+        "subagent-reply",
+        json!({"threadId": id, "prompt": "go on"}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(text(&reply), "continued");
+}

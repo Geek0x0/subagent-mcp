@@ -172,6 +172,11 @@ pub async fn serve(config: Config, tool_name: String) -> Result<(), CliError> {
             log_line("shutdown: in-flight calls did not finish in time; releasing sessions anyway");
         }
 
+        // Runs that just ended may still be writing their OpenCode transcript in the
+        // background: give those flushes the rest of the grace period (a flush that
+        // is still running when it ends is lost, which the README documents).
+        crate::rollout::opencode::flush::drain(remaining(deadline)).await;
+
         // Sessions go next: releasing their bound directories and closing their
         // provider threads (which interrupts a pending Codex turn) is what makes
         // the provider pool safe to release.

@@ -254,6 +254,8 @@ result   PASS (1 checked, 0 skipped, 0 failed)
 
 The `auth` line replaces `key`: the server starts Codex app-server and calls `account/read`, then `model/list` for the `api` and `model` lines. Account type, plan, version, and model count depend on the installation. A missing login prints `  auth   FAIL: not logged in; run codex login`; a process-start error also prints `  auth   FAIL: <error>`. A model-list failure prints `  api    FAIL: <error>`. Passing auth counts as checked; an auth or API failure counts as failed.
 
+With `[rollout] format = "opencode"` the report also prints a `rollout  opencode   mode <mode>, fallback <fallback>` line followed by `bin` and `db` lines saying whether the `opencode` binary and its database were found; this never counts towards the result. Nothing is printed for the default format.
+
 `model ... WARN` means a configured model id is not in the provider's current list; it does not affect the exit code. `--live` is opt-in and makes one real, billed tool-call round trip per reachable model API provider using `default_model` and effort `low`. For Codex it instead runs one ephemeral, read-only thread with approval policy `never`, asking for the sum of two numbers — the total never appears in the prompt — and checking that the final answer contains that total, so a reply that merely quotes the prompt fails. Its line is `  live   <default_model>   OK (turn succeeded, <duration>)` or `  live   <default_model>   FAIL: <error>`. Both paths print the billed-call warning first; use `--live` deliberately, not in CI. Neither mode ever prints a key value.
 
 ## Environment
@@ -263,6 +265,7 @@ The `auth` line replaces `key`: the server starts Codex app-server and calls `ac
 | `SUBAGENT_MCP_CONFIG` | Config file path; defaults to `~/.config/subagent-mcp/config.toml`. |
 | `SUBAGENT_MCP_TOOL_NAME` | Base name for the two MCP tools; defaults to `subagent`, exposing `subagent` and `subagent-reply`. `codex` registers `codex` and `codex-reply`. The value must match `^[A-Za-z0-9_-]{1,64}$` and must not end with `-reply`; an invalid value fails startup naming `SUBAGENT_MCP_TOOL_NAME`. |
 | `SUBAGENT_MCP_ROLLOUT` | Set to `off` to disable rollout files. |
+| `SUBAGENT_MCP_ROLLOUT_FORMAT` | `codex` (default) or `opencode`: which rollout format a session is recorded in; overrides `[rollout] format`. See [OpenCode format](#opencode-format). |
 | `SUBAGENT_MCP_DEBUG_STREAM` | Directory (created `0700`) that receives the raw response of every model API request, one `0600` file per request named `<UTC time>-<api>-<n>.sse`: a `#` header with the method, URL without query, status and content type, then the body exactly as received. For diagnosing what a server really streamed (for example a reply the parsed result shows as empty). Request headers and bodies are never written, so neither the key nor the prompt reaches the files, but the model's output does; unset it when done. Not applied to `codex-app-server`. |
 
 Before running any shell command, the server removes from the command environment every variable named by any provider's `env_key` and every variable whose name starts with `SUBAGENT_MCP_`, including values a login profile tries to re-export. The command still runs through `bash -lc`, so profile-provided settings such as `PATH` work; cleanup happens after the profile is loaded. On Linux, the server also starts non-dumpable, preventing a same-user shell child from reading the server's environment through `/proc`. `read_file` additionally refuses to read the loaded config file, resolved through symlinks, and the server's own `/proc/<pid>` entries (`environ`, `mem`, `cmdline`, ...), to keep provider topology and keys out of model context. Reads are otherwise unrestricted. In particular the server being non-dumpable protects only its own `/proc/<pid>/environ`: a shell command can still read the environment of an ancestor process such as the MCP client that launched the server (`cat /proc/$PPID/environ`), and any key stored in a file. Deliver keys through the MCP client's `env` block or a file with restricted access, not by exporting them in a shell that also starts the client. Allowlisted `git` reads run with the repository's filters, diff drivers, hooks, and signing programs disabled; this needs Git 2.31 or newer (older Git makes those shell calls exit 126), and the user's own global Git config still applies.
@@ -440,6 +443,31 @@ Every session writes a Codex-compatible rollout as JSONL under `$CODEX_HOME/sess
 Set `SUBAGENT_MCP_ROLLOUT=off` to disable rollout writing. A rollout write or open failure logs one line to stderr and disables the rollout for that session; it never fails an agent run.
 
 The rollout records the prompt, the composed system prompt, tool arguments, tool results, and command output, so it can contain secrets and file contents. Treat the rollout directory with the same care as the session transcript.
+
+### OpenCode format
+
+By default a session is recorded as a Codex rollout (above). Set `[rollout] format = "opencode"` (or `SUBAGENT_MCP_ROLLOUT_FORMAT=opencode`) to record it in [OpenCode](https://opencode.ai)'s session list instead, so the subagent sessions can be browsed in OpenCode. The two formats are mutually exclusive: one process writes one format. `SUBAGENT_MCP_ROLLOUT=off` disables both. It applies to the native providers (chat completions, responses, messages); the Codex provider keeps writing its own rollout.
+
+```toml
+[rollout]
+format = "opencode"          # default "codex"
+
+[rollout.opencode]
+mode = "api"                 # "api" (default) or "db"
+fallback = "db"              # "db" (default) or "none"; only used when mode = "api"
+# bin = "/path/to/opencode"  # default: `opencode` on PATH
+# db_path = "/path/to/opencode.db"  # default: $OPENCODE_DB, then ~/.local/share/opencode/opencode.db
+```
+
+How it works:
+
+- After every run, the session's transcript (prompts, answers, reasoning, tool calls and their results) is written **in the background**; a run never waits for OpenCode and never fails because of it. The session appears under the OpenCode project that matches its working directory: the git root, else the nearest ancestor directory OpenCode knows as a project. OpenCode's global project is never used; with no matching project the write is skipped and a warning says so.
+- `mode = "api"` uses the official import endpoint through `opencode api`, so OpenCode handles authentication and this server never sees a credential. That endpoint is **experimental** in OpenCode; the format was verified against OpenCode 2.3.x. A different version produces a warning, and the API is still tried. A transcript larger than about 100,000 bytes cannot be passed on a command line and counts as an API failure.
+- `fallback = "db"` writes OpenCode's SQLite database directly when the API path fails (for example when `opencode` is not installed). `mode = "db"` uses only the database and never runs `opencode`; the OpenCode version is then read from the database.
+- **The database is owned by another program** (and also holds its account credentials), so this path is deliberately narrow: Linux and macOS only; only OpenCode 2.3.x is accepted (anything else is refused); the file must already exist; one transaction per write that touches only the session, message and sequence tables; no migration, no table creation, foreign keys off so nothing cascades, and no checkpointing. While OpenCode is not running the write-ahead log (`opencode.db-wal`) therefore keeps growing with these writes, and a backup of `opencode.db` alone would miss them. Prefer the API.
+- **Each run replaces the whole session in OpenCode** (the import endpoint cannot append): the previous copy is deleted and the full transcript imported again. Anything you did to that session inside OpenCode, such as continuing it or renaming it, is overwritten by the next run.
+- A failure is reported once per cause, on stderr and as a `warning:` line at the top of that session's next reply. When every allowed path has failed, writing stops for that session. At shutdown the server waits for pending writes within the shutdown grace period; a write still running when the process ends, or a forced kill, loses the last run, and one that is cut between the delete and the import loses the session.
+- The transcript, including command output and file contents, lives in OpenCode's database afterwards and is subject to OpenCode's own features such as sharing (this server never shares a session). Treat it like the Codex rollout.
 
 ## Notes
 

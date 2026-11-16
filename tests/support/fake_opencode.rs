@@ -39,6 +39,7 @@ for a in "$@"; do printf 'ARG:%s\n' "$a" >> "$d/log"; done
 if [ -f "$d/r$n.sleep" ]; then sleep "$(cat "$d/r$n.sleep")"; fi
 if [ -f "$d/r$n.out" ]; then cat "$d/r$n.out"; fi
 if [ -f "$d/r$n.err" ]; then cat "$d/r$n.err" >&2; fi
+: > "$d/done$n"
 exit "$(cat "$d/r$n.code" 2>/dev/null || echo 0)"
 "#
         );
@@ -67,6 +68,12 @@ exit "$(cat "$d/r$n.code" 2>/dev/null || echo 0)"
     pub fn sleep(self, n: usize, secs: &str) -> Self {
         fs::write(self.dir.path().join(format!("r{n}.sleep")), secs).unwrap();
         self
+    }
+
+    /// Whether call number `n` ran to its end (a call that was killed, for
+    /// example because the process shut down, never gets there).
+    pub fn finished(&self, n: usize) -> bool {
+        self.dir.path().join(format!("done{n}")).exists()
     }
 
     /// Like [`Fake::calls`] without the `--version` calls.

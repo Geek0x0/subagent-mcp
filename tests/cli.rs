@@ -1568,3 +1568,67 @@ fn validate_tool_name_matches_go_contract() {
         );
     }
 }
+
+// --check-config reports the rollout format ---------------------------------------
+
+#[test]
+fn check_config_reports_rollout_format() {
+    use subagent_mcp::config::{
+        OpenCodeConfig, OpenCodeFallback, OpenCodeMode, RolloutConfig, RolloutFormat,
+    };
+    let _guard = env_guard();
+    let stub = Arc::new(StubProvider::new());
+    let factory = StubFactory {
+        built: built(&stub, false, false, false),
+    };
+
+    // The default format adds nothing to the report.
+    let default = config_with(vec![], None);
+    let (_, out) = run_check(&default, false, &factory);
+    assert!(!out.contains("rollout"), "{out}");
+    assert!(!out.contains("opencode"), "{out}");
+
+    let dir = tempfile::tempdir().unwrap();
+    let bin = dir.path().join("opencode");
+    std::fs::write(&bin, "").unwrap();
+    let db = dir.path().join("opencode.db");
+    std::fs::write(&db, "").unwrap();
+    let mut config = config_with(vec![], None);
+    config.rollout = RolloutConfig {
+        format: RolloutFormat::OpenCode,
+        opencode: OpenCodeConfig {
+            mode: OpenCodeMode::Api,
+            fallback: OpenCodeFallback::None,
+            bin: Some(bin.clone()),
+            db_path: Some(db.clone()),
+        },
+    };
+    let (_, found) = run_check(&config, false, &factory);
+    assert!(
+        found.contains("rollout  opencode   mode api, fallback none\n"),
+        "{found}"
+    );
+    assert!(
+        found.contains(&format!("  bin    {}   found\n", bin.display())),
+        "{found}"
+    );
+    #[cfg(unix)]
+    assert!(
+        found.contains(&format!("  db     {}   found\n", db.display())),
+        "{found}"
+    );
+
+    // Nothing found: said plainly, and never counted as a provider failure.
+    config.rollout.opencode.bin = Some(dir.path().join("missing"));
+    config.rollout.opencode.db_path = Some(dir.path().join("missing.db"));
+    config.rollout.opencode.mode = OpenCodeMode::Db;
+    config.rollout.opencode.fallback = OpenCodeFallback::Db;
+    let (_, missing) = run_check(&config, false, &factory);
+    assert!(
+        missing.contains("rollout  opencode   mode db, fallback db\n"),
+        "{missing}"
+    );
+    assert!(missing.contains("  bin    not found"), "{missing}");
+    #[cfg(unix)]
+    assert!(missing.contains("not found\n"), "{missing}");
+}

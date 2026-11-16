@@ -209,6 +209,58 @@ fn warn_if_cleartext<W: Write>(out: &mut W, name: &str, base_url: &str) {
     }
 }
 
+/// For the OpenCode rollout format: the mode, the fallback, and whether the
+/// `opencode` binary and its database were found. Informational: it never counts
+/// towards the result. Nothing is printed for the default (Codex) format.
+fn report_rollout<W: Write>(out: &mut W, config: &Config) {
+    use crate::config::{OpenCodeFallback, OpenCodeMode, RolloutFormat};
+    let rollout = &config.rollout;
+    // The default format adds nothing to the report (existing output is unchanged).
+    if rollout.format == RolloutFormat::Codex {
+        return;
+    }
+    let mode = match rollout.opencode.mode {
+        OpenCodeMode::Api => "api",
+        OpenCodeMode::Db => "db",
+    };
+    let fallback = match rollout.opencode.fallback {
+        OpenCodeFallback::Db => "db",
+        OpenCodeFallback::None => "none",
+    };
+    let _ = writeln!(out, "rollout  opencode   mode {mode}, fallback {fallback}");
+    match crate::rollout::opencode::api::find_opencode(&rollout.opencode) {
+        Some(bin) => {
+            let _ = writeln!(out, "  bin    {}   found", bin.display());
+        }
+        None => {
+            let _ = writeln!(out, "  bin    not found (the API path is unavailable)");
+        }
+    }
+    #[cfg(unix)]
+    {
+        let db = rollout
+            .opencode
+            .db_path
+            .clone()
+            .or_else(crate::rollout::opencode::db::default_db_path);
+        match db {
+            Some(path) if path.is_file() => {
+                let _ = writeln!(out, "  db     {}   found", path.display());
+            }
+            Some(path) => {
+                let _ = writeln!(out, "  db     {}   not found", path.display());
+            }
+            None => {
+                let _ = writeln!(out, "  db     no database path could be determined");
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = writeln!(out, "  db     not supported on this platform");
+    }
+}
+
 /// [`run_to`] with an explicit adapter factory (the test seam).
 pub fn run_with<W: Write, F: AdapterFactory + ?Sized>(
     out: &mut W,
@@ -392,6 +444,7 @@ async fn run_async<W: Write, F: AdapterFactory + ?Sized>(
     } else {
         ("PASS", "")
     };
+    report_rollout(out, config);
     let _ = writeln!(
         out,
         "result   {status} ({checked} checked, {skipped} skipped, {failed} failed){reason}"

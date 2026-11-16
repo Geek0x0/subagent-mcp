@@ -931,3 +931,59 @@ fn runtime_protects_the_config_file_from_read_file() {
     server.close_stdin();
     assert!(server.wait_exit(SHUTDOWN_BUDGET).success());
 }
+
+#[cfg(unix)]
+#[path = "support/fake_opencode.rs"]
+mod fake_opencode;
+
+/// A run that just ended is still writing its OpenCode transcript in the
+/// background; shutting down (EOF) waits for that flush within the grace period
+/// instead of killing it half done.
+#[cfg(unix)]
+#[test]
+fn shutdown_waits_for_the_opencode_flush() {
+    let chat = spawn_fake_chat(vec![sse_text("done")]);
+    let dir = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let project = dir.path().canonicalize().unwrap();
+    // `opencode api GET /api/project` lists the project; the import takes 2 s.
+    let opencode = fake_opencode::Fake::new()
+        .reply(
+            0,
+            &json!([{"id": "prj_1", "canonical": project}]).to_string(),
+            "",
+            0,
+        )
+        .sleep(1, "2")
+        .reply(1, r#"{"data":{}}"#, "", 0);
+    let config_toml = format!(
+        "{}\n[rollout]\nformat = \"opencode\"\n[rollout.opencode]\nmode = \"api\"\nfallback = \"none\"\nbin = \"{}\"\n",
+        config_text(&chat.base),
+        opencode.bin.display()
+    );
+    let config = write_config(dir.path(), &config_toml);
+
+    let mut server = Server::start(&config, home.path(), &[(API_KEY, API_SECRET)]);
+    server.initialize();
+    server.call_subagent(2, &project);
+    let response = server.wait_for_id(2, MCP_TIMEOUT);
+    assert!(
+        response.get("error").is_none(),
+        "tools/call failed: {response}"
+    );
+
+    // The run is over; its flush (the slow import) is still in flight.
+    server.close_stdin();
+    let started = Instant::now();
+    assert!(server.wait_exit(SHUTDOWN_BUDGET).success());
+    assert!(
+        started.elapsed() < Duration::from_secs(9),
+        "shutdown must stay within the grace period"
+    );
+    assert_eq!(opencode.api_calls().len(), 2, "{:?}", opencode.api_calls());
+    assert!(
+        opencode.finished(1),
+        "the import was killed instead of being waited for; stderr:\n{}",
+        server.stderr()
+    );
+}
