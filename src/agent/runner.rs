@@ -344,6 +344,11 @@ impl Runner {
         hooks: &RunHooks,
     ) -> Result<String, AgentError> {
         let result = self.run_inner(ctx, lease, prompt, hooks).await;
+        // Every exit path of the run (answer, error, turn limit, cancellation)
+        // passes here, so this is the one place a recorder learns a run ended.
+        if let Some(r) = &mut lease.rollout {
+            r.run_ended();
+        }
         lease.last_used = Instant::now();
         result
     }

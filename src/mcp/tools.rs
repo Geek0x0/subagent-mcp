@@ -580,7 +580,7 @@ impl SubagentTools {
         let created = SystemTime::now();
         let rollout_warning = &mut warnings;
         if !is_agent {
-            match RolloutRecorder::create(&session.id) {
+            match RolloutRecorder::create_with(&session.id, &self.config.rollout, &cwd) {
                 Ok(mut recorder) => {
                     let meta = session_meta(
                         &session.id,

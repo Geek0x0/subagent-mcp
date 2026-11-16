@@ -222,7 +222,8 @@ impl RolloutRecorder {
     }
 
     /// Go `recordToolOutput`: apply_patch -> custom_tool_call_output, else
-    /// function_call_output. `is_error` is history state, not a rollout field.
+    /// function_call_output. `is_error` is not a Codex rollout field; it is passed
+    /// on to [`Self::note_tool_error`] for the OpenCode backend.
     pub fn record_tool_output(
         &mut self,
         turn_id: &str,
@@ -230,7 +231,7 @@ impl RolloutRecorder {
         output: &str,
         is_error: bool,
     ) {
-        let _ = (turn_id, is_error);
+        let _ = turn_id;
         let item_type = if call.name == "apply_patch" {
             "custom_tool_call_output"
         } else {
@@ -240,6 +241,8 @@ impl RolloutRecorder {
             "response_item",
             json!({"type": item_type, "call_id": call.id, "output": output}),
         );
+        // The Codex rollout has no error field; the OpenCode backend does.
+        self.note_tool_error(&call.id, is_error);
     }
 
     /// Go `recordPatchApplied`: patch_apply_end event with a per-path changes

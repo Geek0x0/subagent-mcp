@@ -8,7 +8,12 @@
 //!
 //! Unlike Go's `Open` (which reopens the file per write so sessions hold no
 //! descriptors), the Rust recorder keeps the file descriptor open, as the
-//! brief's `RolloutRecorder { file: File, disabled: bool }` shape requires.
+//! brief's `RolloutRecorder { file: File, disabled: bool }` shape requires
+//! (now held by the Codex backend).
+//!
+//! `RolloutRecorder` is backend-switched by `rollout.format`: the Codex backend
+//! above, or the OpenCode backend in [`opencode`]. Every record funnels through
+//! [`RolloutRecorder::write_line`], so the call sites do not know the backend.
 //!
 //! The recorder NEVER handles provider replay payloads or opaque bytes: its
 //! API accepts only plain scalars, strings, `Usage`, `ToolCall`, and
@@ -24,7 +29,10 @@ use std::time::SystemTime;
 use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
+use crate::config::{RolloutConfig, RolloutFormat};
 use crate::util::time::rfc3339_nano;
+
+pub mod opencode;
 
 /// The recorder's error type: a message, `Display`, and `Error`.
 #[derive(Clone, Debug)]
@@ -48,14 +56,25 @@ impl fmt::Display for RolloutError {
 
 impl std::error::Error for RolloutError {}
 
-/// Appends Codex rollout lines for one session. A disabled recorder is a no-op.
+/// Records one session's rollout in the configured format. A disabled Codex
+/// recorder is a no-op.
 pub struct RolloutRecorder {
+    backend: Backend,
+}
+
+enum Backend {
+    Codex(CodexFile),
+    OpenCode(opencode::Recorder),
+}
+
+/// The Codex backend: Codex rollout lines appended to one held descriptor.
+struct CodexFile {
     file: fs::File,
     disabled: bool,
 }
 
 impl RolloutRecorder {
-    /// Create the rollout file for `thread_id`.
+    /// Create the Codex rollout file for `thread_id`.
     ///
     /// Returns `Err` when `SUBAGENT_MCP_ROLLOUT=off`, when the home directory
     /// cannot be resolved, or when the directory/file cannot be created (Go's
@@ -66,15 +85,76 @@ impl RolloutRecorder {
         create_at(thread_id, SystemTime::now())
     }
 
+    /// Create the recorder for `thread_id` in the format `cfg.format` selects.
+    /// `SUBAGENT_MCP_ROLLOUT=off` wins for every format.
+    pub fn create_with(
+        thread_id: &str,
+        cfg: &RolloutConfig,
+        cwd: &Path,
+    ) -> Result<Self, RolloutError> {
+        match cfg.format {
+            RolloutFormat::Codex => Self::create(thread_id),
+            RolloutFormat::OpenCode => {
+                if disabled_by_env() {
+                    return Err(RolloutError::new(
+                        "rollout disabled by SUBAGENT_MCP_ROLLOUT=off",
+                    ));
+                }
+                Ok(Self {
+                    backend: Backend::OpenCode(opencode::Recorder::new(
+                        cfg.opencode.clone(),
+                        cwd.to_path_buf(),
+                        thread_id.to_string(),
+                    )),
+                })
+            }
+        }
+    }
+
     /// Whether rollout writing was disabled on purpose (`SUBAGENT_MCP_ROLLOUT=off`).
     pub fn disabled_by_env() -> bool {
         disabled_by_env()
     }
 
-    /// Append one `{timestamp, type, payload}` line and flush it. On failure,
-    /// log once and disable the recorder. Crate-visible so the in-crate server
-    /// (Task 24) can write `session_meta` without exposing a public API.
+    /// Record one `{timestamp, type, payload}` line. Crate-visible so the
+    /// in-crate server (Task 24) can write `session_meta` without exposing a
+    /// public API.
     pub(crate) fn write_line(&mut self, line_type: &str, payload: Value) {
+        match &mut self.backend {
+            Backend::Codex(file) => file.write_line(line_type, &payload),
+            Backend::OpenCode(recorder) => recorder.push_line(line_type, &payload),
+        }
+    }
+
+    /// Mark a recorded tool call as failed or succeeded. Only the OpenCode
+    /// backend keeps tool state; the Codex rollout has no such field.
+    pub fn note_tool_error(&mut self, call_id: &str, is_error: bool) {
+        if let Backend::OpenCode(recorder) = &mut self.backend {
+            recorder.mark_tool_error(call_id, is_error);
+        }
+    }
+
+    /// The run finished (success, error, turn limit or cancellation). The
+    /// OpenCode backend flushes its transcript here; Codex has nothing to do.
+    pub fn run_ended(&mut self) {
+        if let Backend::OpenCode(recorder) = &mut self.backend {
+            recorder.run_ended();
+        }
+    }
+
+    /// A pending warning to attach once to the session's next response.
+    pub fn take_warning(&mut self) -> Option<String> {
+        match &mut self.backend {
+            Backend::Codex(_) => None,
+            Backend::OpenCode(recorder) => recorder.take_warning(),
+        }
+    }
+}
+
+impl CodexFile {
+    /// Append one line and flush it. On failure, log once and disable the
+    /// recorder.
+    fn write_line(&mut self, line_type: &str, payload: &Value) {
         if self.disabled {
             return;
         }
@@ -147,8 +227,10 @@ fn try_create(thread_id: &str, created: SystemTime) -> io::Result<RolloutRecorde
     let path = dir.join(filename);
     let file = open_rollout_file(&path)?;
     Ok(RolloutRecorder {
-        file,
-        disabled: false,
+        backend: Backend::Codex(CodexFile {
+            file,
+            disabled: false,
+        }),
     })
 }
 
@@ -215,16 +297,16 @@ mod tests {
         fs::write(&path, b"").unwrap();
         // Read-only descriptor: write(2) fails with EBADF.
         let file = fs::OpenOptions::new().read(true).open(&path).unwrap();
-        let mut recorder = RolloutRecorder {
+        let mut recorder = CodexFile {
             file,
             disabled: false,
         };
-        recorder.write_line("a", json!({}));
+        recorder.write_line("a", &json!({}));
         assert!(
             recorder.disabled,
             "first failure should disable the recorder"
         );
-        recorder.write_line("b", json!({}));
+        recorder.write_line("b", &json!({}));
         assert!(recorder.disabled, "later writes stay a no-op");
         assert!(fs::read(&path).unwrap().is_empty(), "nothing was written");
     }
