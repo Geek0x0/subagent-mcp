@@ -167,6 +167,19 @@ fn open_refuses_an_older_migration_and_a_missing_table() {
 }
 
 #[test]
+fn open_refuses_a_newer_migration() {
+    let (_d, path) = fixture();
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch("INSERT INTO migration VALUES ('29991231000000_future', 1)")
+        .unwrap();
+    assert!(matches!(
+        DbWriter::open(&path, "2.3.0"),
+        Err(OpenCodeError::Schema(_))
+    ));
+}
+
+#[test]
 fn open_refuses_a_read_only_database() {
     use std::os::unix::fs::PermissionsExt;
     let (_d, path) = fixture();

@@ -3,10 +3,9 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde_json::json;
 use subagent_mcp::config::OpenCodeConfig;
 use subagent_mcp::rollout::opencode::OpenCodeError;
-use subagent_mcp::rollout::opencode::api::{ApiClient, MAX_BODY_BYTES, find_opencode};
+use subagent_mcp::rollout::opencode::api::{ApiClient, find_opencode};
 use subagent_mcp::rollout::opencode::project::{ProjectRef, pick_project};
 
 #[cfg(unix)]
@@ -103,6 +102,8 @@ async fn missing_binary_is_not_found() {
 mod with_fake {
     use super::*;
     use fake_opencode::Fake;
+    use serde_json::json;
+    use subagent_mcp::rollout::opencode::api::MAX_BODY_BYTES;
 
     fn client(fake: &Fake, timeout: Duration) -> ApiClient {
         ApiClient::new(fake.bin.clone(), timeout)

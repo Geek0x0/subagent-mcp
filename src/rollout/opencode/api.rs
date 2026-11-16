@@ -20,7 +20,13 @@ use crate::config::OpenCodeConfig;
 
 /// The largest request body sent on a command line. Linux limits one argument
 /// to about 128 KiB; this stays well below it.
+#[cfg(not(windows))]
 pub const MAX_BODY_BYTES: usize = 100_000;
+/// Windows limits a whole command line to about 32,767 characters, and the JSON
+/// is quoted again on the way: stay far below that. (Unverified on Windows; the
+/// OpenCode format is supported on Linux and macOS.)
+#[cfg(windows)]
+pub const MAX_BODY_BYTES: usize = 12_000;
 
 /// `TooLarge` when `body` cannot travel on a command line. Check this BEFORE
 /// deleting an earlier copy of the session: a refused import after a delete
@@ -52,7 +58,7 @@ impl ApiClient {
         let items = parsed
             .as_array()
             .ok_or_else(|| OpenCodeError::Other("project list is not a JSON array".to_string()))?;
-        Ok(items
+        let projects: Vec<ProjectRef> = items
             .iter()
             .filter_map(|item| {
                 Some(ProjectRef {
@@ -60,7 +66,16 @@ impl ApiClient {
                     canonical: PathBuf::from(item.get("canonical")?.as_str()?),
                 })
             })
-            .collect())
+            .collect();
+        // Entries without `id`/`canonical` are skipped, but a list in which none is
+        // usable means the shape changed: say so instead of reporting "no project".
+        if projects.is_empty() && !items.is_empty() {
+            return Err(OpenCodeError::Other(format!(
+                "none of the {} listed projects has an id and a canonical path",
+                items.len()
+            )));
+        }
+        Ok(projects)
     }
 
     /// `POST /api/experimental/session/import`.
@@ -83,8 +98,11 @@ impl ApiClient {
     /// `opencode --version`: stdout such as `opencode v2.3.0` -> `2.3.0`.
     pub async fn version(&self) -> Result<String, OpenCodeError> {
         let out = self.run(&["--version"]).await?;
-        out.split_whitespace()
-            .last()
+        // The version is the last word of the first line; later lines (an upgrade
+        // notice, for instance) are ignored.
+        out.lines()
+            .find(|line| !line.trim().is_empty())
+            .and_then(|line| line.split_whitespace().last())
             .map(|word| word.trim_start_matches('v').to_string())
             .filter(|version| !version.is_empty())
             .ok_or_else(|| OpenCodeError::Other("opencode --version printed nothing".to_string()))
@@ -108,6 +126,15 @@ impl ApiClient {
     /// `Status` when the output names an HTTP status, `Other` otherwise.
     async fn run(&self, args: &[&str]) -> Result<String, OpenCodeError> {
         let mut command = Command::new(&self.bin);
+        // Same scrubbing as the shell tool: the provider API keys and the
+        // `SUBAGENT_MCP_*` variables never reach another program.
+        command
+            .env_clear()
+            .envs(crate::tools::shell::scrubbed_env());
+        // A neutral working directory: the server's own is usually the repository the
+        // agent works on, which must not influence another program.
+        #[cfg(unix)]
+        command.current_dir("/");
         command
             .args(args.iter().map(OsString::from))
             .stdin(Stdio::null())
@@ -127,19 +154,38 @@ impl ApiClient {
             return Ok(stdout);
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let text = format!("{} {}", stdout.trim(), stderr.trim());
+        let text = format!("{}\n{}", stdout.trim(), stderr.trim());
         match http_status(&text) {
-            Some(code) => Err(OpenCodeError::Status(code, text.trim().to_string())),
-            None => Err(OpenCodeError::Other(text.trim().to_string())),
+            Some(code) => Err(OpenCodeError::Status(code, summary(&text))),
+            None => Err(OpenCodeError::Other(summary(&text))),
         }
     }
 }
 
-/// The number after the first `HTTP ` in `text` (`HTTP 409 Conflict` -> 409).
+/// The status of a line that starts with `HTTP ` (`HTTP 409 Conflict` -> 409).
+/// Only a whole line counts: a JSON body that merely mentions "HTTP 409" does not.
 fn http_status(text: &str) -> Option<u16> {
-    let rest = &text[text.find("HTTP ")? + "HTTP ".len()..];
-    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
-    digits.parse().ok()
+    text.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("HTTP ")?;
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        digits.parse().ok()
+    })
+}
+
+/// A failure text as one short line: the first non-empty line, at most 300
+/// characters. It ends up in a warning shown to the caller, so it must stay small.
+fn summary(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    if line.chars().count() > 300 {
+        let cut: String = line.chars().take(300).collect();
+        format!("{cut}...")
+    } else {
+        line.to_string()
+    }
 }
 
 /// The `opencode` binary: the configured path when it exists, else the first

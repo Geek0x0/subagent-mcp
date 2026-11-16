@@ -35,6 +35,8 @@ fi
 n=$(cat "$d/n" 2>/dev/null || echo 0)
 echo $((n+1)) > "$d/n"
 echo "--- call $n" >> "$d/log"
+env > "$d/env$n"
+pwd > "$d/pwd$n"
 for a in "$@"; do printf 'ARG:%s\n' "$a" >> "$d/log"; done
 if [ -f "$d/r$n.sleep" ]; then sleep "$(cat "$d/r$n.sleep")"; fi
 if [ -f "$d/r$n.out" ]; then cat "$d/r$n.out"; fi
@@ -74,6 +76,18 @@ exit "$(cat "$d/r$n.code" 2>/dev/null || echo 0)"
     /// example because the process shut down, never gets there).
     pub fn finished(&self, n: usize) -> bool {
         self.dir.path().join(format!("done{n}")).exists()
+    }
+
+    /// The environment (`KEY=value` lines) and working directory of call `n`.
+    pub fn env_of(&self, n: usize) -> String {
+        fs::read_to_string(self.dir.path().join(format!("env{n}"))).unwrap_or_default()
+    }
+
+    pub fn cwd_of(&self, n: usize) -> String {
+        fs::read_to_string(self.dir.path().join(format!("pwd{n}")))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
     }
 
     /// Like [`Fake::calls`] without the `--version` calls.

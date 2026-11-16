@@ -619,14 +619,14 @@ async fn a_delete_timeout_is_reported_as_possibly_missing() {
     let fake = Fake::new()
         .reply(0, &project_json(&cwd), "", 0)
         .reply(1, OK, "", 0)
-        .sleep(2, "3")
+        .sleep(2, "5")
         .reply(2, "Session deleted", "", 0);
     let flusher = Flusher::new(
         cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::None, None),
         cwd.clone(),
         "ses_fix3".to_string(),
     )
-    .with_api_timeout(Duration::from_millis(500));
+    .with_api_timeout(Duration::from_millis(1500));
     flusher.schedule(snapshot(&cwd, "one"));
     drain(Duration::from_secs(10)).await;
     flusher.schedule(snapshot(&cwd, "two"));
@@ -646,14 +646,14 @@ async fn a_delete_timeout_is_restored_through_the_db() {
     let fake = Fake::new()
         .reply(0, &project_json(&cwd), "", 0)
         .reply(1, OK, "", 0)
-        .sleep(2, "3")
+        .sleep(2, "5")
         .reply(2, "Session deleted", "", 0);
     let flusher = Flusher::new(
         cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::Db, Some(&db)),
         cwd.clone(),
         "ses_fix4".to_string(),
     )
-    .with_api_timeout(Duration::from_millis(500));
+    .with_api_timeout(Duration::from_millis(1500));
     flusher.schedule(snapshot(&cwd, "one"));
     drain(Duration::from_secs(10)).await;
     flusher.schedule(snapshot(&cwd, "two"));

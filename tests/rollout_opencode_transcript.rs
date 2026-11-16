@@ -325,6 +325,19 @@ fn an_error_event_fails_the_session_and_the_message() {
 }
 
 #[test]
+fn an_earlier_run_error_does_not_fail_a_later_run() {
+    let t = feed(&[
+        session_meta(),
+        user("first"),
+        ("event_msg", json!({"type": "error", "message": "boom"})),
+        user("second"),
+        assistant("fine"),
+        event("task_complete"),
+    ]);
+    assert_eq!(t.to_import("s", "p")["info"]["outcome"], "succeeded");
+}
+
+#[test]
 fn ids_match_the_required_shape() {
     fn check(id: &str, prefix: &str, ms: u64) {
         let rest = id.strip_prefix(prefix).expect("prefix");

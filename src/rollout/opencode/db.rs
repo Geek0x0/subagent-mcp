@@ -6,8 +6,9 @@
 //! migration is run; the OpenCode version must be inside the tested range
 //! (`2.3.x`, a leading `v` is tolerated); the schema is verified before every
 //! write and an unknown shape is refused (an additive nullable or defaulted
-//! column is tolerated, a new required column or an older `migration` id is
-//! not); only `session_v2`, `session_message` and `event_sequence` are written
+//! column is tolerated, a new required column is not, and the latest `migration`
+//! id must be exactly the verified one: neither an older nor a newer one is
+//! accepted); only `session_v2`, `session_message` and `event_sequence` are written
 //! and only `project` and `migration` are read; one `BEGIN IMMEDIATE`
 //! transaction per session; the journal mode is never changed.
 //!
@@ -311,11 +312,15 @@ fn check_schema(conn: &Connection) -> Result<(), OpenCodeError> {
             }
             _ => map_err(e),
         })?;
+    // Exactly the verified migration: a newer one means the schema may have
+    // changed under us (or the tables we write may be abandoned), an older one a
+    // layout we have not seen. The version stored in rows cannot decide this: our
+    // own newest row would keep it at the tested value.
     match latest {
-        Some(id) if id.as_str() >= BASELINE_MIGRATION => {}
+        Some(id) if id == BASELINE_MIGRATION => {}
         other => {
             return Err(OpenCodeError::Schema(format!(
-                "latest migration {other:?} is older than {BASELINE_MIGRATION}"
+                "latest migration {other:?} is not the verified {BASELINE_MIGRATION}"
             )));
         }
     }

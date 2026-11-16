@@ -250,6 +250,8 @@ impl Transcript {
     }
 
     fn user_message(&mut self, text: String, now_ms: u64) {
+        // A new run starts: the session's outcome is that of the last run.
+        self.failed = false;
         self.close_open("stop", now_ms);
         if self.first_prompt.is_none() {
             self.first_prompt = Some(text.clone());
