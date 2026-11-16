@@ -102,14 +102,22 @@ impl Shared {
 
     /// Report `cause` once: on stderr now, and as a pending `warning:` line.
     fn note(&self, cause: String) {
-        let first = self.lock().warned.insert(cause.clone());
+        let first = {
+            let mut state = self.lock();
+            let first = state.warned.insert(cause.clone());
+            if first {
+                // Queued before anything is printed: a failing stderr must not
+                // be able to lose the warning.
+                state
+                    .warnings
+                    .push(format!("warning: OpenCode rollout: {cause}"));
+            }
+            first
+        };
         if first {
             // Printed outside the lock: a blocked or failing stderr must not stall
             // `schedule` or `take_warning` on the run's path.
             eprintln!("opencode rollout: {cause}");
-            self.lock()
-                .warnings
-                .push(format!("warning: OpenCode rollout: {cause}"));
         }
     }
 }
@@ -156,7 +164,13 @@ impl Flusher {
         state.running = true;
         PENDING.fetch_add(1, Ordering::SeqCst);
         drop(state);
-        handle.spawn(worker(self.shared.clone()));
+        // The guard is built here and moved into the task, so even a task that is
+        // dropped before its first poll (a runtime shutting down) releases its claim.
+        let guard = WorkerGuard {
+            shared: self.shared.clone(),
+            cleared_running: false,
+        };
+        handle.spawn(worker(guard));
     }
 
     /// Warnings recorded since the last call (one `warning:` line each), or `None`.
@@ -170,34 +184,46 @@ impl Flusher {
     }
 }
 
-/// Releases a worker's claim when it ends for any reason (all snapshots done, a
-/// panic, or the runtime dropping the task): the session stops counting as
-/// pending and a later `schedule` can start a new worker.
-struct WorkerGuard(Arc<Shared>);
+/// Releases a worker's claim on the process-wide pending count when the worker
+/// ends for any reason (all snapshots done, a panic, or the runtime dropping the
+/// task, even before its first poll).
+///
+/// `running` is normally cleared by the worker itself, inside the same critical
+/// section that saw nothing left to do: `schedule` sets `pending` and reads
+/// `running` under that lock, so a snapshot can never be left behind. Only an
+/// abnormal end clears it here.
+struct WorkerGuard {
+    shared: Arc<Shared>,
+    cleared_running: bool,
+}
 
 impl Drop for WorkerGuard {
     fn drop(&mut self) {
-        self.0.lock().running = false;
+        if !self.cleared_running {
+            self.shared.lock().running = false;
+        }
         PENDING.fetch_sub(1, Ordering::SeqCst);
         IDLE.notify_waiters();
     }
 }
 
-async fn worker(shared: Arc<Shared>) {
-    let _guard = WorkerGuard(shared.clone());
+async fn worker(mut guard: WorkerGuard) {
+    let shared = guard.shared.clone();
     loop {
         let snapshot = {
             let mut state = shared.lock();
             if state.disabled {
                 // A flush failed while this snapshot waited: do not retry.
                 state.pending = None;
-                return;
             }
             match state.pending.take() {
                 Some(snapshot) => snapshot,
-                // `running` is cleared by the guard; schedule sets `pending` and
-                // reads `running` under this same lock, so nothing is stranded.
-                None => return,
+                None => {
+                    // Cleared in this critical section (see `WorkerGuard`).
+                    state.running = false;
+                    guard.cleared_running = true;
+                    return;
+                }
             }
         };
         if let Err(Failure { cause, disable }) = write_session(&shared, &snapshot).await {
@@ -362,6 +388,20 @@ fn api_client(shared: &Shared) -> Result<ApiClient, OpenCodeError> {
     Ok(ApiClient::new(bin, shared.api_timeout))
 }
 
+/// A delete that failed: a timeout or an unreadable failure may still have
+/// deleted the session, so it counts as possibly missing (and the next write
+/// starts from "nothing exists"); a clear refusal leaves the old copy in place.
+fn delete_failure(shared: &Shared, error: OpenCodeError) -> ApiFailure {
+    let maybe_deleted = matches!(error, OpenCodeError::Timeout | OpenCodeError::Other(_));
+    if maybe_deleted {
+        shared.lock().written = false;
+    }
+    ApiFailure {
+        error,
+        session_missing: maybe_deleted,
+    }
+}
+
 /// Write through the API: replace the earlier copy of the session when there is one.
 async fn api_write(shared: &Arc<Shared>, body: &Value) -> Result<(), ApiFailure> {
     let plain = |error| ApiFailure {
@@ -378,18 +418,7 @@ async fn api_write(shared: &Arc<Shared>, body: &Value) -> Result<(), ApiFailure>
     if written {
         match client.delete(id).await {
             Ok(()) | Err(OpenCodeError::Status(404, _)) => deleted = true,
-            Err(error) => {
-                // A timeout (or an unreadable failure) may still have deleted it.
-                let maybe_deleted =
-                    matches!(error, OpenCodeError::Timeout | OpenCodeError::Other(_));
-                if maybe_deleted {
-                    shared.lock().written = false;
-                }
-                return Err(ApiFailure {
-                    error,
-                    session_missing: maybe_deleted,
-                });
-            }
+            Err(error) => return Err(delete_failure(shared, error)),
         }
     }
     match client.import(body).await {
@@ -398,7 +427,7 @@ async fn api_write(shared: &Arc<Shared>, body: &Value) -> Result<(), ApiFailure>
         Err(OpenCodeError::Status(409, _)) if !deleted => {
             match client.delete(id).await {
                 Ok(()) | Err(OpenCodeError::Status(404, _)) => {}
-                Err(error) => return Err(plain(error)),
+                Err(error) => return Err(delete_failure(shared, error)),
             }
             client.import(body).await.map_err(|error| ApiFailure {
                 error,

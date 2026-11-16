@@ -735,3 +735,78 @@ async fn a_snapshot_queued_during_a_failing_flush_is_not_retried() {
     drain(Duration::from_secs(15)).await;
     assert_eq!(fake.api_calls().len(), 2, "B must be dropped, not retried");
 }
+
+// --- fix round 2: the worker's claim ---------------------------------------------------
+
+#[test]
+fn a_task_dropped_before_its_first_poll_releases_the_session() {
+    let _serial = SERIAL.blocking_lock();
+    let (_d, cwd) = new_cwd();
+    let fake = Fake::new()
+        .reply(0, &project_json(&cwd), "", 0)
+        .reply(1, OK, "", 0);
+    let flusher = Flusher::new(
+        cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::None, None),
+        cwd.clone(),
+        "ses_fix8".to_string(),
+    );
+    // The worker task is spawned but this runtime never polls it before it is dropped.
+    let first = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    first.block_on(async {
+        flusher.schedule(snapshot(&cwd, "never-written"));
+    });
+    drop(first);
+
+    let second = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    second.block_on(async {
+        let started = Instant::now();
+        drain(Duration::from_secs(5)).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "the dropped task must not keep the process 'pending', took {:?}",
+            started.elapsed()
+        );
+        // The session is not stuck: a later snapshot starts a new worker and is written.
+        flusher.schedule(snapshot(&cwd, "written"));
+        drain(Duration::from_secs(10)).await;
+    });
+    let calls = fake.api_calls();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(calls[1].last().unwrap().contains("written"));
+}
+
+/// Best effort: the window between a worker finding nothing to do and ending is
+/// a few instructions wide, so this cannot prove the absence of the race, only
+/// catch a regression that widens it. The structure (`running` is cleared in the
+/// critical section that sees no work) is what guards it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_last_snapshot_is_always_written() {
+    let _serial = SERIAL.lock().await;
+    let (_d, cwd) = new_cwd();
+    let (_dd, db) = db_fixture(&cwd, Some("2.3.0"));
+    let fake = Fake::new();
+    let flusher = Flusher::new(
+        cfg(&fake, OpenCodeMode::Db, OpenCodeFallback::None, Some(&db)),
+        cwd.clone(),
+        "ses_fix9".to_string(),
+    );
+    for round in 0..40 {
+        for i in 0..5 {
+            flusher.schedule(snapshot(&cwd, &format!("m-{round}-{i}")));
+            tokio::task::yield_now().await;
+        }
+        drain(Duration::from_secs(20)).await;
+        assert_eq!(
+            db_messages(&db)[1]["content"][0]["text"],
+            format!("m-{round}-4"),
+            "round {round}: the newest snapshot must be the one written"
+        );
+    }
+    assert!(flusher.take_warning().is_none());
+}

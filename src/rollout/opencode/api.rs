@@ -96,7 +96,9 @@ impl ApiClient {
             Ok(_) => Ok(()),
             // `session delete` reports a missing session as `Session not found: <id>`
             // on stderr (no `HTTP 404` line, unlike `opencode api`).
-            Err(OpenCodeError::Other(text)) if text.to_lowercase().contains("not found") => {
+            Err(OpenCodeError::Other(text))
+                if text.to_lowercase().contains("session not found") =>
+            {
                 Err(OpenCodeError::Status(404, text))
             }
             Err(error) => Err(error),
