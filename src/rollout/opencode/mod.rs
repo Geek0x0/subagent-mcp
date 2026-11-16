@@ -7,6 +7,8 @@
 //! `take_warning` has nothing to report.
 
 pub mod api;
+#[cfg(unix)]
+pub mod db;
 pub mod project;
 pub mod transcript;
 

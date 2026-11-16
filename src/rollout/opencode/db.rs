@@ -1,0 +1,317 @@
+//! Writing an OpenCode session straight into OpenCode's SQLite database.
+//!
+//! This is the fallback when the official API is unavailable, and it writes a
+//! database owned by another, possibly running, program. The rules are strict:
+//! the file must already exist and be writable (it is never created); no
+//! migration is run; the schema is verified before every write and an unknown
+//! shape is refused; only `session_v2`, `session_message` and `event_sequence`
+//! are written and only `project` and `migration` are read; one `BEGIN
+//! IMMEDIATE` transaction per session; the journal mode is never changed.
+
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use rusqlite::{Connection, ErrorCode, OpenFlags, TransactionBehavior, params};
+use serde_json::Value;
+
+use super::OpenCodeError;
+use super::project::ProjectRef;
+
+/// The migration the row layout below was verified against; a database whose
+/// latest migration is older than this is refused.
+const BASELINE_MIGRATION: &str = "20261030054400_job";
+const DEFAULT_BUSY: Duration = Duration::from_secs(3);
+
+const SESSION_COLUMNS: &[&str] = &[
+    "id",
+    "project_id",
+    "slug",
+    "directory",
+    "title",
+    "version",
+    "cost",
+    "tokens_input",
+    "tokens_output",
+    "tokens_reasoning",
+    "tokens_cache_read",
+    "tokens_cache_write",
+    "time_created",
+    "time_updated",
+    "agent",
+    "model",
+];
+const MESSAGE_COLUMNS: &[&str] = &[
+    "id",
+    "session_id",
+    "type",
+    "seq",
+    "time_created",
+    "time_updated",
+    "data",
+];
+const SEQUENCE_COLUMNS: &[&str] = &["aggregate_id", "seq", "owner_id"];
+
+/// `$OPENCODE_DB`, else `$XDG_DATA_HOME/opencode/opencode.db`, else
+/// `~/.local/share/opencode/opencode.db`.
+pub fn default_db_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("OPENCODE_DB").filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(path));
+    }
+    let data_home = match std::env::var_os("XDG_DATA_HOME").filter(|p| !p.is_empty()) {
+        Some(dir) => PathBuf::from(dir),
+        None => crate::config::user_home()?.join(".local/share"),
+    };
+    Some(data_home.join("opencode/opencode.db"))
+}
+
+/// A validated handle on an OpenCode database file.
+pub struct DbWriter {
+    path: PathBuf,
+    version: String,
+    busy: Duration,
+}
+
+impl DbWriter {
+    /// Check that `path` is an existing, writable OpenCode database of a known
+    /// shape. `opencode_version` fills the `version` column of written sessions.
+    pub fn open(path: &Path, opencode_version: &str) -> Result<Self, OpenCodeError> {
+        let writer = Self {
+            path: path.to_path_buf(),
+            version: opencode_version.to_string(),
+            busy: DEFAULT_BUSY,
+        };
+        writer.connect()?;
+        Ok(writer)
+    }
+
+    /// Override the lock wait (the default is 3 s).
+    pub fn with_busy_timeout(mut self, busy: Duration) -> Self {
+        self.busy = busy;
+        self
+    }
+
+    /// Every project's id and root directory, from the read-only `project` table.
+    pub fn list_projects(&self) -> Result<Vec<ProjectRef>, OpenCodeError> {
+        let conn = self.connect()?;
+        let mut stmt = conn
+            .prepare("SELECT id, worktree FROM project")
+            .map_err(map_err)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ProjectRef {
+                    id: row.get(0)?,
+                    canonical: PathBuf::from(row.get::<_, String>(1)?),
+                })
+            })
+            .map_err(map_err)?;
+        rows.collect::<Result<_, _>>().map_err(map_err)
+    }
+
+    /// Replace the session described by an import body (`{info, messages}`):
+    /// delete its rows and insert the new ones in one transaction.
+    pub fn replace_session(&self, body: &Value) -> Result<(), OpenCodeError> {
+        let info = body
+            .get("info")
+            .ok_or_else(|| OpenCodeError::Other("import body has no info".to_string()))?;
+        let session_id = text(info, "id")?;
+        let messages = body
+            .get("messages")
+            .and_then(Value::as_array)
+            .ok_or_else(|| OpenCodeError::Other("import body has no messages".to_string()))?;
+
+        let mut conn = self.connect()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_err)?;
+        // Foreign keys are off on a new connection, so children go first.
+        for sql in [
+            "DELETE FROM session_message WHERE session_id = ?1",
+            "DELETE FROM event_sequence WHERE aggregate_id = ?1",
+            "DELETE FROM session_v2 WHERE id = ?1",
+        ] {
+            tx.execute(sql, params![session_id]).map_err(map_err)?;
+        }
+
+        let tokens = info.get("tokens").cloned().unwrap_or(Value::Null);
+        let time = info.get("time").cloned().unwrap_or(Value::Null);
+        tx.execute(
+            "INSERT INTO session_v2 (id, project_id, slug, directory, title, version, cost, \
+             tokens_input, tokens_output, tokens_reasoning, tokens_cache_read, tokens_cache_write, \
+             time_created, time_updated, agent, model) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+            params![
+                session_id,
+                text(info, "projectID")?,
+                slug(&session_id),
+                info.pointer("/location/directory")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default(),
+                info.get("title").and_then(Value::as_str),
+                self.version,
+                info.get("cost").and_then(Value::as_f64).unwrap_or(0.0),
+                int(&tokens, "/input"),
+                int(&tokens, "/output"),
+                int(&tokens, "/reasoning"),
+                int(&tokens, "/cache/read"),
+                int(&tokens, "/cache/write"),
+                int(&time, "/created"),
+                int(&time, "/updated"),
+                info.get("agent").and_then(Value::as_str),
+                info.get("model").map(Value::to_string),
+            ],
+        )
+        .map_err(map_err)?;
+
+        for (index, message) in messages.iter().enumerate() {
+            let seq = index as i64 + 1;
+            let created = int(message, "/time/created");
+            let updated = message
+                .pointer("/time/completed")
+                .and_then(Value::as_i64)
+                .unwrap_or(created);
+            let mut data = message.clone();
+            if let Some(object) = data.as_object_mut() {
+                object.remove("id");
+                object.remove("type");
+            }
+            tx.execute(
+                "INSERT INTO session_message (id, session_id, type, seq, time_created, \
+                 time_updated, data) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    text(message, "id")?,
+                    session_id,
+                    text(message, "type")?,
+                    seq,
+                    created,
+                    updated,
+                    data.to_string(),
+                ],
+            )
+            .map_err(map_err)?;
+        }
+        tx.execute(
+            "INSERT INTO event_sequence (aggregate_id, seq, owner_id) VALUES (?1, ?2, NULL)",
+            params![session_id, messages.len() as i64],
+        )
+        .map_err(map_err)?;
+        tx.commit().map_err(map_err)
+    }
+
+    /// Open the file (never creating it), set the lock wait, and verify the
+    /// schema. Called for every operation, so a schema that changed under us is
+    /// noticed.
+    fn connect(&self) -> Result<Connection, OpenCodeError> {
+        if !self.path.is_file() {
+            return Err(OpenCodeError::NotFound);
+        }
+        let conn = Connection::open_with_flags(
+            &self.path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(map_err)?;
+        // SQLite silently falls back to read-only for an unwritable file.
+        if conn.is_readonly("main").map_err(map_err)? {
+            return Err(OpenCodeError::Other("database is read-only".to_string()));
+        }
+        conn.busy_timeout(self.busy).map_err(map_err)?;
+        check_schema(&conn)?;
+        Ok(conn)
+    }
+}
+
+/// Refuse a database whose shape we have not verified.
+fn check_schema(conn: &Connection) -> Result<(), OpenCodeError> {
+    let latest: Option<String> = conn
+        .query_row("SELECT max(id) FROM migration", [], |row| row.get(0))
+        .map_err(|e| OpenCodeError::Schema(format!("no readable migration table: {e}")))?;
+    match latest {
+        Some(id) if id.as_str() >= BASELINE_MIGRATION => {}
+        other => {
+            return Err(OpenCodeError::Schema(format!(
+                "latest migration {other:?} is older than {BASELINE_MIGRATION}"
+            )));
+        }
+    }
+    check_table(conn, "session_v2", SESSION_COLUMNS)?;
+    check_table(conn, "session_message", MESSAGE_COLUMNS)?;
+    check_table(conn, "event_sequence", SEQUENCE_COLUMNS)?;
+    check_table(conn, "project", &["id", "worktree"])
+}
+
+/// `table` must exist with every column in `written` (or read), and must not
+/// require a value for any column we do not supply.
+fn check_table(conn: &Connection, table: &str, written: &[&str]) -> Result<(), OpenCodeError> {
+    let mut stmt = conn
+        .prepare(&format!("PRAGMA table_info({table})"))
+        .map_err(map_err)?;
+    // (name, not null, has default, part of the primary key)
+    let columns: Vec<(String, bool, bool, bool)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(3)? != 0,
+                row.get::<_, Option<String>>(4)?.is_some(),
+                row.get::<_, i64>(5)? != 0,
+            ))
+        })
+        .map_err(map_err)?
+        .collect::<Result<_, _>>()
+        .map_err(map_err)?;
+    if columns.is_empty() {
+        return Err(OpenCodeError::Schema(format!("table {table} is missing")));
+    }
+    let present: HashSet<&str> = columns.iter().map(|c| c.0.as_str()).collect();
+    if let Some(missing) = written.iter().find(|c| !present.contains(**c)) {
+        return Err(OpenCodeError::Schema(format!(
+            "table {table} has no column {missing}"
+        )));
+    }
+    // `project` is only read, so what it requires of inserts does not matter.
+    if table != "project"
+        && let Some((name, ..)) = columns.iter().find(|(name, not_null, has_default, pk)| {
+            *not_null && !*has_default && !*pk && !written.contains(&name.as_str())
+        })
+    {
+        return Err(OpenCodeError::Schema(format!(
+            "table {table} requires a value for unknown column {name}"
+        )));
+    }
+    Ok(())
+}
+
+/// `subagent-mcp-` plus the last 8 characters of the session id.
+fn slug(session_id: &str) -> String {
+    let tail: String = session_id
+        .chars()
+        .rev()
+        .take(8)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("subagent-mcp-{tail}")
+}
+
+fn text(value: &Value, key: &str) -> Result<String, OpenCodeError> {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| OpenCodeError::Other(format!("import body is missing {key}")))
+}
+
+fn int(value: &Value, pointer: &str) -> i64 {
+    value.pointer(pointer).and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn map_err(error: rusqlite::Error) -> OpenCodeError {
+    if let rusqlite::Error::SqliteFailure(failure, _) = &error {
+        match failure.code {
+            ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked => return OpenCodeError::Locked,
+            ErrorCode::CannotOpen => return OpenCodeError::NotFound,
+            _ => {}
+        }
+    }
+    OpenCodeError::Other(error.to_string())
+}

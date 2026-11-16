@@ -58,6 +58,10 @@ regex = "1"
 libc = "0.2"
 rustix = { version = "1", features = ["fs"] }
 
+[target.'cfg(unix)'.dependencies]
+# The OpenCode database fallback (src/rollout/opencode/db.rs); Unix only.
+rusqlite = { version = "0.37", features = ["bundled"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = "0.4"
 
