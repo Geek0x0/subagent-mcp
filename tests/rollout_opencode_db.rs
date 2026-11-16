@@ -479,7 +479,17 @@ fn the_journal_mode_stays_wal() {
 #[test]
 fn open_refuses_versions_outside_the_tested_range() {
     let (_d, path) = fixture();
-    for version in ["9.9.9", "2.4.0", "1.0.0", ""] {
+    for version in [
+        "9.9.9",
+        "2.4.0",
+        "1.0.0",
+        "",
+        "2.30.0",
+        "2.3",
+        "2.3.",
+        "2.3.garbage",
+        "vv2.3.0",
+    ] {
         assert!(
             matches!(
                 DbWriter::open(&path, version),
@@ -548,4 +558,49 @@ fn closing_our_connection_leaves_the_wal_for_opencode() {
     let wal = PathBuf::from(format!("{}-wal", path.display()));
     let size = std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0);
     assert!(size > 0, "{} must still hold our commit", wal.display());
+}
+
+#[test]
+fn an_unknown_project_is_refused_and_writes_nothing() {
+    // Foreign keys are off on our connection, so the writer must check the project.
+    let (_d, path) = fixture();
+    let mut input = body("ses_x", &["a", "b"]);
+    input["info"]["projectID"] = json!("prj_missing");
+    assert!(matches!(
+        writer(&path).replace_session(&input),
+        Err(OpenCodeError::Other(_))
+    ));
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(count(&conn, "session_v2"), 0);
+    assert_eq!(count(&conn, "session_message"), 0);
+    assert_eq!(count(&conn, "event_sequence"), 0);
+}
+
+#[test]
+fn the_normalized_version_is_stored() {
+    let (_d, path) = fixture();
+    DbWriter::open(&path, " v2.3.5 ")
+        .unwrap()
+        .replace_session(&body("ses_x", &["a", "b"]))
+        .unwrap();
+    let version: String = Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT version FROM session_v2 WHERE id = 'ses_x'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "2.3.5");
+}
+
+#[test]
+fn a_negative_timestamp_is_refused() {
+    let (_d, path) = fixture();
+    let mut input = body("ses_x", &["a", "b"]);
+    input["info"]["time"]["created"] = json!(-5);
+    assert!(matches!(
+        writer(&path).replace_session(&input),
+        Err(OpenCodeError::Other(_))
+    ));
 }

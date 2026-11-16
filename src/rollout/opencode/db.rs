@@ -19,6 +19,9 @@
 //! connection would checkpoint and delete the `-wal` file OpenCode relies on,
 //! so every connection disables auto-checkpointing and checkpoint-on-close
 //! (`SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE`); we ourselves never issue a checkpoint.
+//! While OpenCode is not running the `-wal` file therefore keeps growing with
+//! our writes (OpenCode folds it back on its own next commit), so a backup of
+//! `opencode.db` alone would miss them.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -91,15 +94,19 @@ impl DbWriter {
     /// Check that `path` is an existing, writable OpenCode database of a known
     /// shape. `opencode_version` fills the `version` column of written sessions.
     pub fn open(path: &Path, opencode_version: &str) -> Result<Self, OpenCodeError> {
-        let release = opencode_version.trim().trim_start_matches('v');
-        if !release.starts_with(TESTED_VERSION_PREFIX) {
+        let release = opencode_version.trim();
+        let release = release.strip_prefix('v').unwrap_or(release);
+        let in_range = release
+            .strip_prefix(TESTED_VERSION_PREFIX)
+            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
+        if !in_range {
             return Err(OpenCodeError::Schema(format!(
                 "OpenCode {opencode_version} is outside the tested range 2.3.x"
             )));
         }
         let writer = Self {
             path: path.to_path_buf(),
-            version: opencode_version.to_string(),
+            version: release.to_string(),
             busy: DEFAULT_BUSY,
         };
         writer.connect()?;
@@ -155,6 +162,22 @@ impl DbWriter {
             tx.execute(sql, params![session_id]).map_err(map_err)?;
         }
 
+        // Foreign keys are off, so the database no longer rejects a session whose
+        // project does not exist; check it here, inside the transaction.
+        let project_id = text(info, "projectID")?;
+        let known: i64 = tx
+            .query_row(
+                "SELECT count(*) FROM project WHERE id = ?1",
+                params![project_id],
+                |row| row.get(0),
+            )
+            .map_err(map_err)?;
+        if known == 0 {
+            return Err(OpenCodeError::Other(format!(
+                "unknown OpenCode project {project_id}"
+            )));
+        }
+
         let tokens = info.get("tokens").cloned().unwrap_or(Value::Null);
         let time = info.get("time").cloned().unwrap_or(Value::Null);
         tx.execute(
@@ -164,7 +187,7 @@ impl DbWriter {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 session_id,
-                text(info, "projectID")?,
+                project_id,
                 slug(&session_id),
                 text_at(info, "/location/directory")?,
                 info.get("title").and_then(Value::as_str),
@@ -350,13 +373,18 @@ fn int(value: &Value, pointer: &str) -> i64 {
     value.pointer(pointer).and_then(Value::as_i64).unwrap_or(0)
 }
 
-/// A required integer (a timestamp): missing, a float or out of `i64` range is
-/// an error rather than a silent 1970.
+/// A required integer (a timestamp): missing, a float, negative or out of `i64`
+/// range is an error rather than a silent 1970.
 fn required_int(value: &Value, pointer: &str) -> Result<i64, OpenCodeError> {
     value
         .pointer(pointer)
         .and_then(Value::as_i64)
-        .ok_or_else(|| OpenCodeError::Other(format!("import body has no integer at {pointer}")))
+        .filter(|n| *n >= 0)
+        .ok_or_else(|| {
+            OpenCodeError::Other(format!(
+                "import body has no non-negative integer at {pointer}"
+            ))
+        })
 }
 
 fn text_at(value: &Value, pointer: &str) -> Result<String, OpenCodeError> {
