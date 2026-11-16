@@ -26,6 +26,12 @@ impl Fake {
         let script = format!(
             r#"#!/bin/sh
 d="{d}"
+if [ "$1" = "--version" ]; then
+  echo "--- call v" >> "$d/log"
+  printf 'ARG:%s\n' "$@" >> "$d/log"
+  if [ -f "$d/version" ]; then cat "$d/version"; else echo "opencode v2.3.0"; fi
+  exit 0
+fi
 n=$(cat "$d/n" 2>/dev/null || echo 0)
 echo $((n+1)) > "$d/n"
 echo "--- call $n" >> "$d/log"
@@ -50,10 +56,25 @@ exit "$(cat "$d/r$n.code" 2>/dev/null || echo 0)"
         self
     }
 
+    /// What `opencode --version` prints. A `--version` call never uses up a
+    /// scripted reply (and is logged like any call, see [`Fake::calls`]).
+    pub fn version(self, text: &str) -> Self {
+        fs::write(self.dir.path().join("version"), text).unwrap();
+        self
+    }
+
     /// Make call number `n` sleep for `secs` seconds before replying.
     pub fn sleep(self, n: usize, secs: &str) -> Self {
         fs::write(self.dir.path().join(format!("r{n}.sleep")), secs).unwrap();
         self
+    }
+
+    /// Like [`Fake::calls`] without the `--version` calls.
+    pub fn api_calls(&self) -> Vec<Vec<String>> {
+        self.calls()
+            .into_iter()
+            .filter(|call| call != &vec!["--version".to_string()])
+            .collect()
     }
 
     /// The arguments of every call so far, one `Vec` per call.

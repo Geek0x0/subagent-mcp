@@ -201,20 +201,37 @@ mod with_fake {
 
     #[tokio::test]
     async fn version_parses_the_cli_output() {
-        let fake = Fake::new().reply(0, "opencode v2.3.0\n", "", 0);
+        let fake = Fake::new().version("opencode v2.3.0\n");
         let version = client(&fake, Duration::from_secs(5))
             .version()
             .await
             .unwrap();
         assert_eq!(version, "2.3.0");
         assert_eq!(fake.calls(), vec![vec!["--version"]]);
-        let empty = Fake::new().reply(0, "", "", 0);
+        let empty = Fake::new().version("");
         assert!(
             client(&empty, Duration::from_secs(5))
                 .version()
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn delete_maps_session_not_found_to_404() {
+        // `opencode session delete <missing>` prints this on stderr and exits 1.
+        let fake = Fake::new().reply(0, "", "Session not found: ses_x", 1);
+        let err = client(&fake, Duration::from_secs(5))
+            .delete("ses_x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OpenCodeError::Status(404, _)), "{err:?}");
+        let other = Fake::new().reply(0, "", "disk exploded", 1);
+        let err = client(&other, Duration::from_secs(5))
+            .delete("ses_x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OpenCodeError::Other(_)), "{err:?}");
     }
 
     #[tokio::test]

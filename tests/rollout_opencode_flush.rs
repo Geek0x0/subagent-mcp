@@ -159,7 +159,7 @@ async fn api_success_replaces_the_session() {
         .reply(2, "Session deleted", "", 0)
         .reply(3, OK, "", 0);
     let flusher = Flusher::new(
-        cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::Db, None),
+        cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::None, None),
         cwd.clone(),
         "ses_flush1".to_string(),
     );
@@ -168,7 +168,7 @@ async fn api_success_replaces_the_session() {
     flusher.schedule(snapshot(&cwd, "marker-B"));
     drain(Duration::from_secs(10)).await;
 
-    let calls = fake.calls();
+    let calls = fake.api_calls();
     assert_eq!(calls.len(), 4, "{calls:?}");
     assert_eq!(calls[0], vec!["api", "GET", "/api/project"]);
     assert!(is_import(&calls[1]), "the first flush only imports");
@@ -186,10 +186,12 @@ async fn api_failure_falls_back_to_the_db() {
     let _serial = SERIAL.lock().await;
     let (_d, cwd) = new_cwd();
     let (_dd, db) = db_fixture(&cwd, None);
-    let fake = Fake::new()
-        .reply(0, &project_json(&cwd), "", 0)
-        .reply(1, "", "HTTP 500 Internal Server Error", 1)
-        .reply(2, "opencode v2.3.0", "", 0);
+    let fake = Fake::new().reply(0, &project_json(&cwd), "", 0).reply(
+        1,
+        "",
+        "HTTP 500 Internal Server Error",
+        1,
+    );
     let flusher = Flusher::new(
         cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::Db, Some(&db)),
         cwd.clone(),
@@ -245,8 +247,7 @@ async fn import_failure_after_delete_restores_via_the_db() {
         .reply(0, &project_json(&cwd), "", 0)
         .reply(1, OK, "", 0)
         .reply(2, "Session deleted", "", 0)
-        .reply(3, "", "HTTP 500 boom", 1)
-        .reply(4, "opencode v2.3.0", "", 0);
+        .reply(3, "", "HTTP 500 boom", 1);
     let flusher = Flusher::new(
         cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::Db, Some(&db)),
         cwd.clone(),
@@ -280,7 +281,7 @@ async fn a_first_import_that_finds_the_id_deletes_and_retries() {
     );
     flusher.schedule(snapshot(&cwd, "x"));
     drain(Duration::from_secs(10)).await;
-    let calls = fake.calls();
+    let calls = fake.api_calls();
     assert_eq!(calls.len(), 4, "{calls:?}");
     assert!(is_import(&calls[1]));
     assert_eq!(calls[2], vec!["session", "delete", "ses_flush5"]);
@@ -373,7 +374,7 @@ async fn no_project_match_skips_with_one_warning() {
     flusher.schedule(snapshot(&cwd, "b"));
     drain(Duration::from_secs(10)).await;
     assert!(flusher.take_warning().is_none());
-    let calls = fake.calls();
+    let calls = fake.api_calls();
     assert_eq!(calls.len(), 2, "{calls:?}");
     assert!(calls.iter().all(|c| !is_import(c)), "nothing was written");
 }
@@ -397,7 +398,7 @@ async fn warning_is_returned_once_and_a_failed_flusher_stops() {
     // Every allowed path failed: later snapshots are dropped, nothing is retried.
     flusher.schedule(snapshot(&cwd, "b"));
     drain(Duration::from_secs(10)).await;
-    assert_eq!(fake.calls().len(), 2);
+    assert_eq!(fake.api_calls().len(), 2);
     assert!(flusher.take_warning().is_none());
 }
 
@@ -424,7 +425,7 @@ async fn rapid_second_run_only_writes_the_latest_snapshot() {
     flusher.schedule(snapshot(&cwd, "marker-C"));
     drain(Duration::from_secs(15)).await;
 
-    let calls = fake.calls();
+    let calls = fake.api_calls();
     assert_eq!(calls.len(), 4, "{calls:?}");
     assert!(calls[1].last().unwrap().contains("marker-A"));
     assert_eq!(calls[2], vec!["session", "delete", "ses_flush11"]);
@@ -458,7 +459,7 @@ async fn run_never_waits_for_the_flush() {
         started.elapsed()
     );
     drain(Duration::from_secs(15)).await;
-    assert_eq!(fake.calls().len(), 2);
+    assert_eq!(fake.api_calls().len(), 2);
 }
 
 #[tokio::test]
@@ -483,7 +484,7 @@ async fn drain_waits_for_pending_flushes_up_to_the_timeout() {
         "a short drain gives up at its timeout, took {short:?}"
     );
     drain(Duration::from_secs(15)).await;
-    assert_eq!(fake.calls().len(), 2, "the flush finished once drained");
+    assert_eq!(fake.api_calls().len(), 2, "the flush finished once drained");
     assert!(started.elapsed() >= Duration::from_millis(1500));
 }
 
@@ -521,7 +522,7 @@ async fn run_ended_reaches_the_flusher_and_tool_errors_are_marked() {
     recorder.run_ended();
     drain(Duration::from_secs(10)).await;
 
-    let calls = fake.calls();
+    let calls = fake.api_calls();
     assert_eq!(calls.len(), 2, "{calls:?}");
     let body = body_of(&calls[1]);
     let tool = &body["messages"][1]["content"][0];
@@ -542,5 +543,195 @@ async fn an_empty_transcript_flushes_nothing() {
     );
     recorder.run_ended();
     drain(Duration::from_secs(5)).await;
-    assert!(fake.calls().is_empty());
+    assert!(fake.api_calls().is_empty());
+}
+
+// --- fix round 1: data safety and version awareness --------------------------------
+
+#[tokio::test]
+async fn a_version_outside_the_tested_range_warns_but_still_writes() {
+    let _serial = SERIAL.lock().await;
+    let (_d, cwd) = new_cwd();
+    let fake = Fake::new()
+        .version("opencode v2.4.0")
+        .reply(0, &project_json(&cwd), "", 0)
+        .reply(1, OK, "", 0);
+    let flusher = Flusher::new(
+        cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::None, None),
+        cwd.clone(),
+        "ses_fix1".to_string(),
+    );
+    flusher.schedule(snapshot(&cwd, "x"));
+    drain(Duration::from_secs(10)).await;
+    let calls = fake.api_calls();
+    assert_eq!(calls.len(), 2, "the API is still tried: {calls:?}");
+    assert!(is_import(&calls[1]));
+    let warning = flusher.take_warning().expect("a version warning");
+    assert!(warning.contains("outside the tested range"), "{warning}");
+    assert_eq!(
+        fake.calls()
+            .iter()
+            .filter(|c| *c == &vec!["--version"])
+            .count(),
+        1,
+        "the version is read once"
+    );
+}
+
+#[tokio::test]
+async fn a_too_large_body_never_deletes_the_earlier_copy() {
+    let _serial = SERIAL.lock().await;
+    let (_d, cwd) = new_cwd();
+    let fake = Fake::new()
+        .reply(0, &project_json(&cwd), "", 0)
+        .reply(1, OK, "", 0);
+    let flusher = Flusher::new(
+        cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::None, None),
+        cwd.clone(),
+        "ses_fix2".to_string(),
+    );
+    flusher.schedule(snapshot(&cwd, "small"));
+    drain(Duration::from_secs(10)).await;
+    assert!(flusher.take_warning().is_none());
+    // The session has grown past what a command line can carry.
+    flusher.schedule(snapshot(&cwd, &"x".repeat(120_000)));
+    drain(Duration::from_secs(10)).await;
+
+    let calls = fake.api_calls();
+    assert_eq!(calls.len(), 2, "no delete and no second import: {calls:?}");
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.get(1).map(String::as_str) != Some("delete"))
+    );
+    let warning = flusher.take_warning().expect("a warning");
+    assert!(warning.contains("too large"), "{warning}");
+    assert!(
+        !warning.contains("missing"),
+        "the earlier copy is intact: {warning}"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_timeout_is_reported_as_possibly_missing() {
+    let _serial = SERIAL.lock().await;
+    let (_d, cwd) = new_cwd();
+    let fake = Fake::new()
+        .reply(0, &project_json(&cwd), "", 0)
+        .reply(1, OK, "", 0)
+        .sleep(2, "3")
+        .reply(2, "Session deleted", "", 0);
+    let flusher = Flusher::new(
+        cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::None, None),
+        cwd.clone(),
+        "ses_fix3".to_string(),
+    )
+    .with_api_timeout(Duration::from_millis(500));
+    flusher.schedule(snapshot(&cwd, "one"));
+    drain(Duration::from_secs(10)).await;
+    flusher.schedule(snapshot(&cwd, "two"));
+    drain(Duration::from_secs(10)).await;
+    let warning = flusher.take_warning().expect("a warning");
+    assert!(
+        warning.contains("missing"),
+        "the server may have deleted it: {warning}"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_timeout_is_restored_through_the_db() {
+    let _serial = SERIAL.lock().await;
+    let (_d, cwd) = new_cwd();
+    let (_dd, db) = db_fixture(&cwd, None);
+    let fake = Fake::new()
+        .reply(0, &project_json(&cwd), "", 0)
+        .reply(1, OK, "", 0)
+        .sleep(2, "3")
+        .reply(2, "Session deleted", "", 0);
+    let flusher = Flusher::new(
+        cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::Db, Some(&db)),
+        cwd.clone(),
+        "ses_fix4".to_string(),
+    )
+    .with_api_timeout(Duration::from_millis(500));
+    flusher.schedule(snapshot(&cwd, "one"));
+    drain(Duration::from_secs(10)).await;
+    flusher.schedule(snapshot(&cwd, "two"));
+    drain(Duration::from_secs(10)).await;
+    assert_eq!(db_sessions(&db), 1, "the database restored the session");
+    assert_eq!(db_messages(&db)[1]["content"][0]["text"], "two");
+}
+
+#[tokio::test]
+async fn a_failed_db_fallback_after_the_delete_says_the_session_is_missing() {
+    let _serial = SERIAL.lock().await;
+    let (_d, cwd) = new_cwd();
+    let missing_db = cwd.join("no-such-opencode.db");
+    let fake = Fake::new()
+        .reply(0, &project_json(&cwd), "", 0)
+        .reply(1, OK, "", 0)
+        .reply(2, "Session deleted", "", 0)
+        .reply(3, "", "HTTP 500 boom", 1);
+    let flusher = Flusher::new(
+        cfg(
+            &fake,
+            OpenCodeMode::Api,
+            OpenCodeFallback::Db,
+            Some(&missing_db),
+        ),
+        cwd.clone(),
+        "ses_fix5".to_string(),
+    );
+    flusher.schedule(snapshot(&cwd, "one"));
+    drain(Duration::from_secs(10)).await;
+    flusher.schedule(snapshot(&cwd, "two"));
+    drain(Duration::from_secs(10)).await;
+    let warning = flusher.take_warning().expect("a warning");
+    assert!(warning.contains("missing from OpenCode"), "{warning}");
+    assert!(warning.contains("database fallback failed"), "{warning}");
+}
+
+#[tokio::test]
+async fn deleting_a_session_that_is_already_gone_is_fine() {
+    let _serial = SERIAL.lock().await;
+    let (_d, cwd) = new_cwd();
+    let fake = Fake::new()
+        .reply(0, &project_json(&cwd), "", 0)
+        .reply(1, OK, "", 0)
+        // The user deleted the session in OpenCode in the meantime.
+        .reply(2, "", "Session not found: ses_fix6", 1)
+        .reply(3, OK, "", 0);
+    let flusher = Flusher::new(
+        cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::None, None),
+        cwd.clone(),
+        "ses_fix6".to_string(),
+    );
+    flusher.schedule(snapshot(&cwd, "one"));
+    drain(Duration::from_secs(10)).await;
+    flusher.schedule(snapshot(&cwd, "two"));
+    drain(Duration::from_secs(10)).await;
+    let calls = fake.api_calls();
+    assert_eq!(calls.len(), 4, "{calls:?}");
+    assert!(is_import(&calls[3]), "the import went ahead");
+    assert!(flusher.take_warning().is_none());
+}
+
+#[tokio::test]
+async fn a_snapshot_queued_during_a_failing_flush_is_not_retried() {
+    let _serial = SERIAL.lock().await;
+    let (_d, cwd) = new_cwd();
+    let fake = Fake::new()
+        .reply(0, &project_json(&cwd), "", 0)
+        .sleep(1, "1")
+        .reply(1, "", "HTTP 500 boom", 1);
+    let flusher = Flusher::new(
+        cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::None, None),
+        cwd.clone(),
+        "ses_fix7".to_string(),
+    );
+    flusher.schedule(snapshot(&cwd, "A"));
+    tokio::time::sleep(Duration::from_millis(300)).await; // A's import is in flight
+    flusher.schedule(snapshot(&cwd, "B"));
+    drain(Duration::from_secs(15)).await;
+    assert_eq!(fake.api_calls().len(), 2, "B must be dropped, not retried");
 }

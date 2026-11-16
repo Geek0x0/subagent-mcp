@@ -22,6 +22,17 @@ use crate::config::OpenCodeConfig;
 /// to about 128 KiB; this stays well below it.
 pub const MAX_BODY_BYTES: usize = 100_000;
 
+/// `TooLarge` when `body` cannot travel on a command line. Check this BEFORE
+/// deleting an earlier copy of the session: a refused import after a delete
+/// loses the session.
+pub fn check_body_size(body: &Value) -> Result<(), OpenCodeError> {
+    if body.to_string().len() > MAX_BODY_BYTES {
+        Err(OpenCodeError::TooLarge)
+    } else {
+        Ok(())
+    }
+}
+
 /// A client that shells out to `opencode`.
 pub struct ApiClient {
     bin: PathBuf,
@@ -54,10 +65,8 @@ impl ApiClient {
 
     /// `POST /api/experimental/session/import`.
     pub async fn import(&self, body: &Value) -> Result<(), OpenCodeError> {
+        check_body_size(body)?;
         let body = body.to_string();
-        if body.len() > MAX_BODY_BYTES {
-            return Err(OpenCodeError::TooLarge);
-        }
         self.run(&[
             "api",
             "POST",
@@ -83,11 +92,16 @@ impl ApiClient {
 
     /// `opencode session delete <id>` (also deletes the session's children).
     pub async fn delete(&self, session_id: &str) -> Result<(), OpenCodeError> {
-        self.run(&["session", "delete", session_id])
-            .await
-            .map(|_| ())
+        match self.run(&["session", "delete", session_id]).await {
+            Ok(_) => Ok(()),
+            // `session delete` reports a missing session as `Session not found: <id>`
+            // on stderr (no `HTTP 404` line, unlike `opencode api`).
+            Err(OpenCodeError::Other(text)) if text.to_lowercase().contains("not found") => {
+                Err(OpenCodeError::Status(404, text))
+            }
+            Err(error) => Err(error),
+        }
     }
-
     /// Run `opencode <args>` and return its stdout. A non-zero exit becomes
     /// `Status` when the output names an HTTP status, `Other` otherwise.
     async fn run(&self, args: &[&str]) -> Result<String, OpenCodeError> {

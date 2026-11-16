@@ -1,10 +1,10 @@
 //! OpenCode rollout backend.
 //!
 //! The recorder here consumes the same Codex-shaped lines the Codex backend
-//! writes (`RolloutRecorder::write_line` is the single funnel) and, in later
-//! tasks, projects them to OpenCode's session format. For now it is a stub with
-//! the final public signatures: the first three methods drop their input and
-//! `take_warning` has nothing to report.
+//! writes (`RolloutRecorder::write_line` is the single funnel), keeps them as a
+//! transcript, and at the end of every run hands a snapshot to a background
+//! flusher that writes the session into OpenCode (the official API first, the
+//! SQLite database as the fallback).
 
 pub mod api;
 #[cfg(unix)]
@@ -59,6 +59,20 @@ impl fmt::Display for OpenCodeError {
 }
 
 impl std::error::Error for OpenCodeError {}
+
+/// The OpenCode release line the API shapes and the database layout were
+/// verified against.
+pub const TESTED_VERSION_PREFIX: &str = "2.3.";
+
+/// Whether `version` (`2.3.0`, `v2.3.5`, ` 2.3.1 `) is in the tested range: a
+/// single optional leading `v`, then `2.3.` followed by a digit.
+pub fn in_tested_range(version: &str) -> bool {
+    let release = version.trim();
+    let release = release.strip_prefix('v').unwrap_or(release);
+    release
+        .strip_prefix(TESTED_VERSION_PREFIX)
+        .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()))
+}
 
 /// Per-session OpenCode recorder: accumulates the transcript from the Codex
 /// lines the session produces and flushes it in the background at the end of

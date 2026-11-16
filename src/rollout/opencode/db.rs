@@ -38,8 +38,6 @@ use super::project::ProjectRef;
 /// latest migration is older than this is refused.
 const BASELINE_MIGRATION: &str = "20261030054400_job";
 const DEFAULT_BUSY: Duration = Duration::from_secs(3);
-/// The OpenCode release line the row layout was verified against.
-const TESTED_VERSION_PREFIX: &str = "2.3.";
 
 const SESSION_COLUMNS: &[&str] = &[
     "id",
@@ -94,16 +92,13 @@ impl DbWriter {
     /// Check that `path` is an existing, writable OpenCode database of a known
     /// shape. `opencode_version` fills the `version` column of written sessions.
     pub fn open(path: &Path, opencode_version: &str) -> Result<Self, OpenCodeError> {
-        let release = opencode_version.trim();
-        let release = release.strip_prefix('v').unwrap_or(release);
-        let in_range = release
-            .strip_prefix(TESTED_VERSION_PREFIX)
-            .is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit()));
-        if !in_range {
+        if !super::in_tested_range(opencode_version) {
             return Err(OpenCodeError::Schema(format!(
                 "OpenCode {opencode_version} is outside the tested range 2.3.x"
             )));
         }
+        let release = opencode_version.trim();
+        let release = release.strip_prefix('v').unwrap_or(release);
         let writer = Self {
             path: path.to_path_buf(),
             version: release.to_string(),
