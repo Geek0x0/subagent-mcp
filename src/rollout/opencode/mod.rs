@@ -6,6 +6,8 @@
 //! the final public signatures: the first three methods drop their input and
 //! `take_warning` has nothing to report.
 
+pub mod transcript;
+
 use std::path::PathBuf;
 
 use serde_json::Value;
