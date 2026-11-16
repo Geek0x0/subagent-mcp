@@ -175,7 +175,9 @@ pub async fn serve(config: Config, tool_name: String) -> Result<(), CliError> {
         // Runs that just ended may still be writing their OpenCode transcript in the
         // background: give those flushes the rest of the grace period (a flush that
         // is still running when it ends is lost, which the README documents).
-        crate::rollout::opencode::flush::drain(remaining(deadline)).await;
+        // Capped: a hung `opencode` must not take the time sessions need to close.
+        crate::rollout::opencode::flush::drain(remaining(deadline).min(Duration::from_secs(3)))
+            .await;
 
         // Sessions go next: releasing their bound directories and closing their
         // provider threads (which interrupts a pending Codex turn) is what makes

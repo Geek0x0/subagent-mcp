@@ -274,7 +274,7 @@ async fn write_session(shared: &Arc<Shared>, snapshot: &Transcript) -> Result<()
                 shared.lock().written = true;
                 Ok(())
             }
-            Err(failure) if cfg.fallback == OpenCodeFallback::Db => {
+            Err(failure) if cfg.fallback == OpenCodeFallback::Db && !rejected(&failure.error) => {
                 match db_write(shared, &body).await {
                     Ok(()) => {
                         shared.lock().written = true;
@@ -403,6 +403,17 @@ fn delete_failure(shared: &Shared, error: OpenCodeError) -> ApiFailure {
 }
 
 /// Write through the API: replace the earlier copy of the session when there is one.
+/// A 4xx that says the server judged the body invalid: writing the same body to
+/// the database would bypass that check. 401/403/404/408/409/429 are about the
+/// request's circumstances, not its content, and still fall back.
+fn rejected(error: &OpenCodeError) -> bool {
+    matches!(
+        error,
+        OpenCodeError::Status(400..=499, _)
+            if !matches!(error, OpenCodeError::Status(401 | 403 | 404 | 408 | 409 | 429, _))
+    )
+}
+
 async fn api_write(shared: &Arc<Shared>, body: &Value) -> Result<(), ApiFailure> {
     let plain = |error| ApiFailure {
         error,

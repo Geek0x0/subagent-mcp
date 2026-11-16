@@ -110,17 +110,9 @@ impl ApiClient {
 
     /// `opencode session delete <id>` (also deletes the session's children).
     pub async fn delete(&self, session_id: &str) -> Result<(), OpenCodeError> {
-        match self.run(&["session", "delete", session_id]).await {
-            Ok(_) => Ok(()),
-            // `session delete` reports a missing session as `Session not found: <id>`
-            // on stderr (no `HTTP 404` line, unlike `opencode api`).
-            Err(OpenCodeError::Other(text))
-                if text.to_lowercase().contains("session not found") =>
-            {
-                Err(OpenCodeError::Status(404, text))
-            }
-            Err(error) => Err(error),
-        }
+        self.run(&["session", "delete", session_id])
+            .await
+            .map(|_| ())
     }
     /// Run `opencode <args>` and return its stdout. A non-zero exit becomes
     /// `Status` when the output names an HTTP status, `Other` otherwise.
@@ -155,7 +147,14 @@ impl ApiClient {
         }
         let stderr = String::from_utf8_lossy(&output.stderr);
         let text = format!("{}\n{}", stdout.trim(), stderr.trim());
-        match http_status(&text) {
+        // `session delete` reports a missing session as `Session not found: <id>`
+        // (no `HTTP 404` line, unlike `opencode api`); it may follow a banner line.
+        let code = http_status(&text).or_else(|| {
+            text.to_lowercase()
+                .contains("session not found")
+                .then_some(404)
+        });
+        match code {
             Some(code) => Err(OpenCodeError::Status(code, summary(&text))),
             None => Err(OpenCodeError::Other(summary(&text))),
         }
@@ -172,27 +171,32 @@ fn http_status(text: &str) -> Option<u16> {
     })
 }
 
-/// A failure text as one short line: the first non-empty line, at most 300
-/// characters. It ends up in a warning shown to the caller, so it must stay small.
+/// A failure text as one short line: the first three non-empty lines joined, at
+/// most 300 characters. It ends up in a warning shown to the caller, so it must
+/// stay small; three lines keep a pretty-printed error body readable.
 fn summary(text: &str) -> String {
     let line = text
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default();
+        .filter(|line| !line.is_empty())
+        .take(3)
+        .collect::<Vec<_>>()
+        .join(" ");
     if line.chars().count() > 300 {
         let cut: String = line.chars().take(300).collect();
         format!("{cut}...")
     } else {
-        line.to_string()
+        line
     }
 }
 
 /// The `opencode` binary: the configured path when it exists, else the first
 /// `opencode` (`opencode.exe` on Windows) on `PATH`.
 pub fn find_opencode(cfg: &OpenCodeConfig) -> Option<PathBuf> {
+    // Absolute, because the child runs in `/`: a relative path would resolve there.
+    let absolute = |path: PathBuf| std::path::absolute(&path).unwrap_or(path);
     if let Some(bin) = &cfg.bin {
-        return bin.is_file().then(|| bin.clone());
+        return bin.is_file().then(|| absolute(bin.clone()));
     }
     let name = if cfg!(windows) {
         "opencode.exe"
@@ -202,4 +206,5 @@ pub fn find_opencode(cfg: &OpenCodeConfig) -> Option<PathBuf> {
     std::env::split_paths(&std::env::var_os("PATH")?)
         .map(|dir| dir.join(name))
         .find(|candidate| candidate.is_file())
+        .map(absolute)
 }

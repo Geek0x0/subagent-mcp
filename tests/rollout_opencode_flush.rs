@@ -182,6 +182,33 @@ async fn api_success_replaces_the_session() {
 }
 
 #[tokio::test]
+async fn a_rejected_body_is_not_written_to_the_db() {
+    let _serial = SERIAL.lock().await;
+    let (_d, cwd) = new_cwd();
+    let (_dd, db) = db_fixture(&cwd, None);
+    let fake = Fake::new().reply(0, &project_json(&cwd), "", 0).reply(
+        1,
+        "",
+        "HTTP 422 Unprocessable Entity",
+        1,
+    );
+    let flusher = Flusher::new(
+        cfg(&fake, OpenCodeMode::Api, OpenCodeFallback::Db, Some(&db)),
+        cwd.clone(),
+        "ses_reject".to_string(),
+    );
+    flusher.schedule(snapshot(&cwd, "x"));
+    drain(Duration::from_secs(10)).await;
+    assert_eq!(
+        db_sessions(&db),
+        0,
+        "the server's validation is not bypassed"
+    );
+    let warning = flusher.take_warning().expect("a warning");
+    assert!(warning.contains("422"), "{warning}");
+}
+
+#[tokio::test]
 async fn api_failure_falls_back_to_the_db() {
     let _serial = SERIAL.lock().await;
     let (_d, cwd) = new_cwd();

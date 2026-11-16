@@ -227,6 +227,13 @@ mod with_fake {
             .await
             .unwrap_err();
         assert!(matches!(err, OpenCodeError::Status(404, _)), "{err:?}");
+        // A banner line before the message must not hide it.
+        let banner = Fake::new().reply(0, "", "update available\nSession not found: ses_x", 1);
+        let err = client(&banner, Duration::from_secs(5))
+            .delete("ses_x")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, OpenCodeError::Status(404, _)), "{err:?}");
         let other = Fake::new().reply(0, "", "disk exploded", 1);
         let err = client(&other, Duration::from_secs(5))
             .delete("ses_x")
