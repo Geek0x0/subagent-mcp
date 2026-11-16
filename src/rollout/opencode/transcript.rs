@@ -71,12 +71,14 @@ impl Tokens {
     }
 }
 
+#[derive(Clone)]
 enum Part {
     Text(String),
     Reasoning { text: String, created: u64 },
     Tool(Tool),
 }
 
+#[derive(Clone)]
 struct Tool {
     id: String,
     name: String,
@@ -87,6 +89,7 @@ struct Tool {
     is_error: bool,
 }
 
+#[derive(Clone)]
 enum Message {
     User {
         id: String,
@@ -96,6 +99,7 @@ enum Message {
     Assistant(Assistant),
 }
 
+#[derive(Clone)]
 struct Assistant {
     id: String,
     created: u64,
@@ -109,7 +113,7 @@ struct Assistant {
 }
 
 /// The accumulated session transcript.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Transcript {
     cwd: String,
     provider: String,

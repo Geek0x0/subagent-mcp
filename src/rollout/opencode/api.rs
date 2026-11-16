@@ -71,6 +71,16 @@ impl ApiClient {
         .map(|_| ())
     }
 
+    /// `opencode --version`: stdout such as `opencode v2.3.0` -> `2.3.0`.
+    pub async fn version(&self) -> Result<String, OpenCodeError> {
+        let out = self.run(&["--version"]).await?;
+        out.split_whitespace()
+            .last()
+            .map(|word| word.trim_start_matches('v').to_string())
+            .filter(|version| !version.is_empty())
+            .ok_or_else(|| OpenCodeError::Other("opencode --version printed nothing".to_string()))
+    }
+
     /// `opencode session delete <id>` (also deletes the session's children).
     pub async fn delete(&self, session_id: &str) -> Result<(), OpenCodeError> {
         self.run(&["session", "delete", session_id])

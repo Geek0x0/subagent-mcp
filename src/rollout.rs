@@ -64,7 +64,8 @@ pub struct RolloutRecorder {
 
 enum Backend {
     Codex(CodexFile),
-    OpenCode(opencode::Recorder),
+    /// Boxed: the OpenCode recorder holds a whole transcript.
+    OpenCode(Box<opencode::Recorder>),
 }
 
 /// The Codex backend: Codex rollout lines appended to one held descriptor.
@@ -101,11 +102,11 @@ impl RolloutRecorder {
                     ));
                 }
                 Ok(Self {
-                    backend: Backend::OpenCode(opencode::Recorder::new(
+                    backend: Backend::OpenCode(Box::new(opencode::Recorder::new(
                         cfg.opencode.clone(),
                         cwd.to_path_buf(),
                         thread_id.to_string(),
-                    )),
+                    ))),
                 })
             }
         }

@@ -113,6 +113,30 @@ impl DbWriter {
         Ok(writer)
     }
 
+    /// The OpenCode version recorded on the newest session in the database
+    /// (`session_v2.version`), for when the `opencode` binary is not used. Read
+    /// only; the file must exist.
+    pub fn detect_version(path: &Path) -> Result<String, OpenCodeError> {
+        if !path.is_file() {
+            return Err(OpenCodeError::NotFound);
+        }
+        let conn =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(map_err)?;
+        conn.busy_timeout(DEFAULT_BUSY).map_err(map_err)?;
+        let version: Option<String> = conn
+            .query_row(
+                "SELECT version FROM session_v2 ORDER BY time_created DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .map(Some)
+            .or_else(|error| match error {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(map_err(other)),
+            })?;
+        version.ok_or_else(|| OpenCodeError::Other("OpenCode version unknown".to_string()))
+    }
+
     /// Override the lock wait (the default is 3 s).
     pub fn with_busy_timeout(mut self, busy: Duration) -> Self {
         self.busy = busy;

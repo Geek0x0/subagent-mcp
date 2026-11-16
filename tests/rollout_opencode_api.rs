@@ -200,6 +200,24 @@ mod with_fake {
     }
 
     #[tokio::test]
+    async fn version_parses_the_cli_output() {
+        let fake = Fake::new().reply(0, "opencode v2.3.0\n", "", 0);
+        let version = client(&fake, Duration::from_secs(5))
+            .version()
+            .await
+            .unwrap();
+        assert_eq!(version, "2.3.0");
+        assert_eq!(fake.calls(), vec![vec!["--version"]]);
+        let empty = Fake::new().reply(0, "", "", 0);
+        assert!(
+            client(&empty, Duration::from_secs(5))
+                .version()
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn delete_runs_session_delete() {
         let fake = Fake::new().reply(0, "Session ses_1 deleted", "", 0);
         client(&fake, Duration::from_secs(5))

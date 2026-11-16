@@ -9,6 +9,7 @@
 pub mod api;
 #[cfg(unix)]
 pub mod db;
+pub mod flush;
 pub mod project;
 pub mod transcript;
 
@@ -59,37 +60,52 @@ impl fmt::Display for OpenCodeError {
 
 impl std::error::Error for OpenCodeError {}
 
-/// Per-session OpenCode recorder.
+/// Per-session OpenCode recorder: accumulates the transcript from the Codex
+/// lines the session produces and flushes it in the background at the end of
+/// every run.
 pub struct Recorder {
-    // Held for the real implementation; unused by the stub.
-    #[allow(dead_code)]
-    cfg: OpenCodeConfig,
-    #[allow(dead_code)]
-    cwd: PathBuf,
-    #[allow(dead_code)]
-    session_id: String,
+    transcript: transcript::Transcript,
+    flusher: flush::Flusher,
 }
 
 impl Recorder {
-    pub fn new(cfg: OpenCodeConfig, cwd: PathBuf, session_id: String) -> Self {
+    pub fn new(cfg: OpenCodeConfig, cwd: PathBuf, _session_id: String) -> Self {
+        // OpenCode gets its own session id; the subagent-mcp thread id is not used.
+        let opencode_id = transcript::new_session_id(now_ms());
         Self {
-            cfg,
-            cwd,
-            session_id,
+            transcript: transcript::Transcript::new(),
+            flusher: flush::Flusher::new(cfg, cwd, opencode_id),
         }
     }
 
     /// Consume one Codex-shaped rollout line.
-    pub fn push_line(&mut self, _kind: &str, _payload: &Value) {}
+    pub fn push_line(&mut self, kind: &str, payload: &Value) {
+        self.transcript.push_line_at(kind, payload, now_ms());
+    }
 
-    /// Mark a recorded tool call as an error (or not).
-    pub fn mark_tool_error(&mut self, _call_id: &str, _is_error: bool) {}
+    /// Mark a recorded tool call as an error (a success needs no mark).
+    pub fn mark_tool_error(&mut self, call_id: &str, is_error: bool) {
+        if is_error {
+            self.transcript.mark_tool_error(call_id);
+        }
+    }
 
-    /// A run finished: schedule a flush.
-    pub fn run_ended(&mut self) {}
+    /// A run finished: hand a snapshot to the background flusher.
+    pub fn run_ended(&mut self) {
+        if !self.transcript.is_empty() {
+            self.flusher.schedule(self.transcript.clone());
+        }
+    }
 
     /// A pending warning, once.
     pub fn take_warning(&mut self) -> Option<String> {
-        None
+        self.flusher.take_warning()
     }
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
