@@ -349,6 +349,14 @@ impl Runner {
         if let Some(r) = &mut lease.rollout {
             r.run_ended();
         }
+        // A delegated thread's first run moves the recorder out of the lease
+        // into the thread accounting cell, so notify it there too. The lock is
+        // held only for the call, never across an await.
+        if let Some(cell) = &lease.thread_accounting
+            && let Some(r) = &mut cell.lock().unwrap().rollout
+        {
+            r.run_ended();
+        }
         lease.last_used = Instant::now();
         result
     }
