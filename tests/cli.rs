@@ -211,7 +211,7 @@ fn version_prints_expected() {
         assert_eq!(out.status.code(), Some(0));
         assert_eq!(
             String::from_utf8_lossy(&out.stdout),
-            "subagent-mcp 0.14.3\n"
+            "subagent-mcp 0.14.4\n"
         );
     }
 }
