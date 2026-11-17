@@ -24,7 +24,7 @@ const readMode = async ($: EngineInterface) => {
   const path = await modePath($)
   return (await $.fs.read(path).catch(() => '')).trim() === 'sonnet' ? 'sonnet' : 'mcp'
 }
-const refresh = ($: EngineInterface, off: boolean, mode: string) => $.ui.status(off ? '🔴 worker off' : `🟢 worker · ${mode}`)
+const refresh = ($: EngineInterface, off: boolean, mode: string) => $.ui.status(off ? '🔴' : `🟢 ${mode}`)
 
 export const register: Register = (on, options) => {
   let policy: Promise<string> | undefined
