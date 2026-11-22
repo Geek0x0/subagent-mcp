@@ -20,4 +20,6 @@ The release archives are built with `scripts/package-rust-release.sh` and contai
 
 After publishing a release, run `scripts/update-release-lock.sh <version>` and commit `scripts/release.lock` so the plugin launcher picks up the new binary.
 
+The plugin ships two manifests: `.claude-plugin/plugin.json` for Claude Code and `.codex-plugin/plugin.json` for Codex. Keep their `version` fields in sync. Codex does not expand `${CLAUDE_PLUGIN_ROOT}`, so it reads its MCP server from `.codex-mcp.json` (relative command, `cwd` set to the plugin root) instead of `.mcp.json`, and only forwards environment variables listed in that file's `env_vars`. Codex does not load `commands/`, so `codex/skills/subagent-setup` wraps `commands/setup.md` with the Codex differences; it lives outside `skills/` so Claude Code does not load it alongside `/subagent:setup`.
+
 [Back to README](../README.md)

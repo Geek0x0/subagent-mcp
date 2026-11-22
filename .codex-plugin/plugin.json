@@ -1,0 +1,21 @@
+{
+  "name": "subagent",
+  "version": "0.14.4",
+  "description": "subagent-mcp coding agent exposed as MCP tools (subagent / subagent-reply)",
+  "author": {
+    "name": "Kaidi Shi"
+  },
+  "repository": "https://github.com/Geek0x0/subagent-mcp",
+  "skills": ["./skills/", "./codex/skills/"],
+  "mcpServers": "./.codex-mcp.json",
+  "hooks": {
+    "hooks": {}
+  },
+  "interface": {
+    "displayName": "subagent-mcp",
+    "shortDescription": "Delegate coding work to configured model providers over MCP",
+    "developerName": "Kaidi Shi",
+    "category": "Developer Tools",
+    "capabilities": ["Interactive", "Read", "Write"]
+  }
+}

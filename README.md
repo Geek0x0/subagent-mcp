@@ -1,6 +1,6 @@
 # subagent-mcp
 
-An MCP server that runs coding-agent sessions with shell and file tools. Choose a configured provider/model, let a decision model choose once per session, or delegate the session to Codex app-server.
+An MCP server that runs coding-agent sessions with shell and file tools. Choose a configured provider/model, let a decision model choose once per session, or delegate the session to Codex app-server. Install it as a Claude Code or Codex plugin, or register the binary with any MCP client.
 
 | `api` | Protocol | Example providers |
 |---|---|---|
@@ -27,6 +27,21 @@ For a local checkout, replace `Geek0x0/subagent-mcp` with `/path/to/subagent-mcp
 The launcher downloads the matching release binary on first start, verifies it against `scripts/release.lock`, and caches it in the plugin's data directory. Set `SUBAGENT_MCP_BIN` to use an existing binary instead.
 
 Create the config below, supply its API key in the environment that launches the MCP server, then restart or reconnect the server and run `/subagent:setup`.
+
+### Codex plugin
+
+On Linux or macOS, install the plugin into Codex:
+
+```bash
+codex plugin marketplace add Geek0x0/subagent-mcp
+codex plugin add subagent@subagent-mcp
+```
+
+Codex uses the same launcher, the `subagent-dispatch` skill, and exposes the tools as `mcp__subagent__subagent` and `mcp__subagent__subagent_reply`. The launcher caches the binary under `~/.cache/subagent-mcp` (or `$XDG_CACHE_HOME`).
+
+Codex starts MCP servers with a minimal environment and forwards only the variables listed in [`.codex-mcp.json`](https://github.com/Geek0x0/subagent-mcp/blob/main/.codex-mcp.json): the `SUBAGENT_MCP_*` variables, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `TYPESAFE_API_KEY`, `CLOUDFLARE_API_TOKEN`, `CODEX_HOME`, proxy settings, and a few path variables. A provider whose `env_key` uses another name will not see its key; use one of these names or a `key` in the config file. The `/worker` policy hooks and the `worker-sonnet` agent are Claude Code only. Codex installs a local marketplace by copying the whole directory, including `target/`, so prefer the GitHub source over a local checkout.
+
+Create the config below, export its API key before starting Codex, then start a new Codex session and ask it to check the subagent-mcp installation. That uses the plugin's `subagent-setup` skill, the Codex counterpart of `/subagent:setup`: it runs `--check-config` against the cached binary (downloading it first if needed) and also reports whether Codex forwards each provider's key to the server.
 
 ### Manual installation
 
@@ -123,7 +138,7 @@ Codex owns its tools, sandbox, and rollout. Shell, file-change, and network appr
 
 ## Worker policy
 
-The Claude Code plugin provides `/worker on|off` and `/worker mode mcp|sonnet`. When delegation is off or Sonnet mode is selected, the plugin refuses calls to its MCP worker tools. This needs a Claude Code build supporting plugin hooks modules. See [worker policy details](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/runtime.md#worker-policy).
+The Claude Code plugin provides `/worker on|off` and `/worker mode mcp|sonnet`. When delegation is off or Sonnet mode is selected, the plugin refuses calls to its MCP worker tools. This needs a Claude Code build supporting plugin hooks modules; the Codex plugin does not include the worker policy. See [worker policy details](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/runtime.md#worker-policy).
 
 ## Sandbox and approvals
 

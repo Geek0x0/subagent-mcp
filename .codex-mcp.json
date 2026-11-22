@@ -1,0 +1,34 @@
+{
+  "mcpServers": {
+    "subagent": {
+      "command": "./scripts/launch.sh",
+      "cwd": ".",
+      "env_vars": [
+        "SUBAGENT_MCP_BIN",
+        "SUBAGENT_MCP_CONFIG",
+        "SUBAGENT_MCP_TOOL_NAME",
+        "SUBAGENT_MCP_ROLLOUT",
+        "SUBAGENT_MCP_ROLLOUT_FORMAT",
+        "SUBAGENT_MCP_RELEASE_BASE",
+        "SUBAGENT_MCP_DEBUG_STREAM",
+        "DEEPSEEK_API_KEY",
+        "OPENAI_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "TYPESAFE_API_KEY",
+        "CLOUDFLARE_API_TOKEN",
+        "CODEX_HOME",
+        "OPENCODE_DB",
+        "XDG_CACHE_HOME",
+        "XDG_DATA_HOME",
+        "TMPDIR",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "NO_PROXY",
+        "SSL_CERT_FILE"
+      ],
+      "startup_timeout_sec": 120,
+      "tool_timeout_sec": 86400
+    }
+  }
+}
