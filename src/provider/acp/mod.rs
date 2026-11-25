@@ -17,6 +17,7 @@ use crate::provider::{
     Agent, AuthChecker, AuthStatus, DeltaSink, ModelInfo, ModelLister, Provider, ProviderError,
     Thread, ThreadOptions, TurnRequest, TurnResult,
 };
+use crate::util::json::go_quote;
 use crate::util::run::RunContext;
 
 /// How long a capability probe (`initialize`) may take.
@@ -34,7 +35,7 @@ impl AcpAdapter {
         register_shutdown();
         if cfg.command.as_deref().unwrap_or_default().is_empty() {
             return Err(ProviderError {
-                message: format!("acp provider {name:?}: command is required"),
+                message: format!("acp provider {}: command is required", go_quote(name)),
             });
         }
         Ok(Self {
@@ -80,8 +81,8 @@ impl Provider for AcpAdapter {
     ) -> Result<TurnResult, ProviderError> {
         Err(ProviderError {
             message: format!(
-                "acp provider {:?}: turn is not supported; acp runs whole threads",
-                self.name
+                "acp provider {}: turn is not supported; acp runs whole threads",
+                go_quote(&self.name)
             ),
         })
     }

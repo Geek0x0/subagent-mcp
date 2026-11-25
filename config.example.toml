@@ -50,6 +50,18 @@ models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
 # models = [{ id = "gpt-6.1-sol" }, { id = "gpt-6-astra" }, { id = "gpt-6.1-terra" }]
 # effort_map = { none = "low", minimal = "low" }
 
+# acp: experimental; runs any Agent Client Protocol agent over stdio. `command`
+# is required and nothing is appended to it; `args` and `env` are acp only. Log
+# in with the agent itself. Sandbox settings are advisory, and there is no
+# resume. Do not set env_key, key, base_url, max_output_tokens or extra_body.
+# [providers.claude]
+# api = "acp"
+# command = "npx"
+# args = ["-y", "@zed-industries/claude-code-acp"]
+# env = { SOME_FLAG = "1" }
+# default_model = "default"
+# models = [{ id = "default", description = "whatever the agent picks" }]
+
 # Optional: let `start` choose a provider/model with TypeSafe's Jev decision model.
 # Pass model = "auto" to use it. "auto" is reserved and cannot be a model id above.
 # [auto]

@@ -10,7 +10,8 @@ Behaviour is chosen by ACP_FAKE_MODE:
   hang                  never answers session/prompt until session/cancel
   ignore_cancel         never answers session/prompt, even after cancel
   agent_cancel          answers session/prompt with stopReason cancelled
-  auth                  session/new returns -32000
+  auth                  initialize reports agentInfo fake-agent 1.2.3 and
+                        authMethods [login]; session/new returns -32000
   crash                 exits during session/prompt, after writing stderr
   bad_version           initialize returns protocolVersion 99
   set_model_unsupported session/set_model returns -32601
@@ -128,7 +129,10 @@ def handle(msg):
     if method == "initialize":
         version = 99 if MODE == "bad_version" else 1
         auth = [{"id": "login", "name": "Log in"}] if MODE == "auth" else []
-        result(id_, {"protocolVersion": version, "agentCapabilities": {}, "authMethods": auth})
+        init = {"protocolVersion": version, "agentCapabilities": {}, "authMethods": auth}
+        if MODE == "auth":
+            init["agentInfo"] = {"name": "fake-agent", "version": "1.2.3"}
+        result(id_, init)
     elif method == "session/new":
         if MODE == "auth":
             error(id_, -32000, "Authentication required")

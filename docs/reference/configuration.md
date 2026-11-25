@@ -39,11 +39,13 @@ model = "jev-latest"
 
 | Field | Level | Required | Rules |
 |---|---|---|---|
-| `api` | provider | yes | One of `chat-completions`, `responses`, `messages`, `codex-app-server`. |
+| `api` | provider | yes | One of `chat-completions`, `responses`, `messages`, `codex-app-server`, `acp` (experimental; see [ACP agents](#acp-agents-experimental)). |
 | `base_url` | provider | no | Defaults per api: `https://api.openai.com/v1` for `chat-completions` and `responses`, `https://api.anthropic.com` for `messages`. Rejected when non-empty for `codex-app-server`, which has no URL default. |
 | `env_key` | provider | one of `env_key`, `key`; except Codex | Name of the environment variable holding the key. Its value is read when a session is created for that provider (via the `provider` argument, or the sole configured provider); a missing value fails that call naming the variable and `providers.<name>.env_key`. Rejected when non-empty for `codex-app-server`: authentication goes through `codex login`. |
 | `key` | provider | one of `env_key`, `key`; except Codex | The API key itself, instead of `env_key`; setting both is an error. A config file that holds a key must be mode `600` (see [API keys](#api-keys)). Rejected when non-empty for `codex-app-server`. |
-| `command` | provider | no | Executable name or path for `codex-app-server`; defaults to `codex` on `PATH`. The server adds the `app-server` argument; this is not a shell command or argument list. Rejected when non-empty for every other api. |
+| `command` | provider | for `acp` | Executable name or path. For `codex-app-server` it is optional, defaults to `codex` on `PATH`, and the server adds the `app-server` argument. For `acp` it is required and nothing is appended; pass arguments with `args`. This is not a shell command or argument list. Rejected when non-empty for every other api. |
+| `args` | provider | no | `acp` only. List of arguments passed to `command` as given, with no shell. Rejected for every other api. |
+| `env` | provider | no | `acp` only. Table of environment variables added to the agent's environment after the server's scrubbing (`[server] scrub_env`, provider `env_key` variables and `SUBAGENT_MCP_*`). Rejected for every other api. |
 | `default_model` | provider | yes | Must be one of `models[].id`. Used when a caller omits `model`. |
 | `models` | provider | yes | Non-empty list of `{ id, description? }` tables; ids must be unique and are advertised in config order. |
 | `effort_map` | provider | no | Maps a caller effort value to the value sent to the API: `effort_map[value]` if present, else the caller's value. Keys and values must be in the effort set below. |
@@ -150,9 +152,33 @@ The session inherits the user's whole Codex environment — auth, config, plugin
 - A pending approval wait ends when the call is cancelled or the five-minute approval timeout expires (denial), and also when the Codex child process dies or the thread closes, so a pending approval never outlives either.
 - Codex sends `item/started` before it asks for approval, so a declined file change still emits `exec_command_begin` and `exec_command_end`; see [Events](events.md).
 
+## ACP agents (experimental)
+
+`api = "acp"` runs any [Agent Client Protocol](https://agentclientprotocol.com) agent over stdio, protocol version 1. Each session spawns one child process from `command` and `args` in the session `cwd`; the child gets the scrubbed environment plus `env`. Like Codex, the agent uses its own tools, prompt and loop, not subagent-mcp's native runner. `base_url`, `env_key`, `key`, `max_output_tokens` and `extra_body` are rejected for `acp`; `max_nudges` is accepted and ignored.
+
+```toml
+[providers.claude]
+api = "acp"
+command = "npx"
+args = ["-y", "@zed-industries/claude-code-acp"]
+env = { SOME_FLAG = "1" }
+default_model = "default"
+models = [{ id = "default", description = "whatever the agent picks" }]
+```
+
+Limits:
+
+- **Login happens in the agent itself.** subagent-mcp sends no key and never calls `authenticate`. `--check-config` reports the agent's `agentInfo` and advertised `authMethods`; a session that fails with "authentication required" means you must log in with the agent's own tooling.
+- **Sandbox is advisory.** `sandbox`, `max_sandbox` and `config.writable_roots` are not enforced by subagent-mcp; the agent runs with the server user's permissions and its own policy, if any.
+- **The read-only auto-reject applies only to agents that request permission.** Under `read-only`, a `session/request_permission` for an `edit`, `delete`, `move` or `execute` tool call is rejected without asking the MCP client. An agent that acts without asking is not stopped.
+- **No resume.** Each thread is a fresh agent session; `ephemeral` has no effect.
+- **No respawn.** If the agent process dies, the thread fails; start a new session.
+- **Effort is ignored.** `reasoning-effort` and `effort_map` have no ACP equivalent; a requested effort is ignored with one warning per thread. A model other than the agent's default is set with `session/set_model`, and an agent that does not support it produces a warning.
+- **Process teardown.** On Unix the agent is started in its own process group and the whole group is killed on close or shutdown. On Windows only the direct child process is killed, so a wrapper agent (for example one launched through `npx`) can leave orphaned grandchildren.
+
 ## Validating the config
 
-`--check-config` loads and validates the config file, reports whether the Landlock kernel sandbox is usable on this machine (a `WARN` there does not change the exit code), reports each model API provider's `env_key` name and whether it is set (or Codex's `auth` status), and asks each reachable provider for its model list so authentication and reachability errors fail loudly and unlisted model ids are warned about:
+`--check-config` loads and validates the config file, reports whether the Landlock kernel sandbox is usable on this machine (a `WARN` there does not change the exit code), reports each model API provider's `env_key` name and whether it is set (or Codex's `auth` status, or an ACP agent's `agentInfo` and `authMethods` from `initialize`), and asks each reachable provider for its model list so authentication and reachability errors fail loudly and unlisted model ids are warned about:
 
 ```bash
 subagent-mcp --check-config [path]

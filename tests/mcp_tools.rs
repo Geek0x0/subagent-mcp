@@ -2824,7 +2824,7 @@ async fn check_auth_reports_agent_info() {
         subagent_mcp::provider::acp::AcpAdapter::new("fake", &acp_provider_config("auth")).unwrap();
     let status = adapter.check_auth().await.unwrap();
     assert!(
-        status.summary.ends_with("; authMethods: login"),
+        status.summary == "fake-agent 1.2.3; authMethods: login",
         "{}",
         status.summary
     );
@@ -2832,7 +2832,7 @@ async fn check_auth_reports_agent_info() {
         subagent_mcp::provider::acp::AcpAdapter::new("fake", &acp_provider_config("echo")).unwrap();
     let status = adapter.check_auth().await.unwrap();
     assert!(
-        status.summary.ends_with("; authMethods: none"),
+        status.summary == "ACP agent ready (protocol 1); authMethods: none",
         "{}",
         status.summary
     );

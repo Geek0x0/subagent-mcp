@@ -1640,3 +1640,43 @@ fn check_config_reports_rollout_format() {
         "{missing}"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn check_config_reports_acp_agent() {
+    let have = std::env::var_os("PATH")
+        .is_some_and(|p| std::env::split_paths(&p).any(|d| d.join("python3").is_file()));
+    if !have {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let fixture = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/acp_fake_agent.py"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_config(
+        dir.path(),
+        &format!(
+            "[providers.fake]\napi = \"acp\"\ncommand = \"python3\"\nargs = [{fixture:?}]\n\
+             env = {{ ACP_FAKE_MODE = \"auth\" }}\ndefault_model = \"default\"\n\
+             models = [{{ id = \"default\" }}]\n"
+        ),
+    );
+    let out = run_cli(&["--check-config", path.to_str().unwrap()], &[], dir.path());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "stdout = {stdout}\nstderr = {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    for want in [
+        "provider fake (acp)",
+        "  auth   fake-agent 1.2.3; authMethods: login   OK",
+        "  model  default     OK",
+        "result   PASS (1 checked, 0 skipped, 0 failed)",
+    ] {
+        assert!(stdout.contains(want), "stdout = {stdout}\nmissing {want}");
+    }
+}

@@ -157,8 +157,8 @@ pub async fn resolve_auto(
 }
 
 /// List the models of every provider that can start a session. HTTP providers
-/// without their key are omitted with all their models; Codex providers
-/// authenticate out of band, so they are included whenever the adapter is
+/// without their key are omitted with all their models; Codex and ACP providers
+/// authenticate out of band, so they are included whenever their adapter is
 /// registered in this build.
 fn auto_candidates(config: &Config) -> (Vec<Candidate>, Vec<String>) {
     let mut candidates = Vec::new();

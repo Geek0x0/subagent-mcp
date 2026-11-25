@@ -103,8 +103,8 @@ fn register_adapters() {
 }
 
 /// The optional `Agent` capability of a resolved provider. The design keeps
-/// `Agent` out of the provider god trait and uses a downcast; Codex is the only
-/// adapter that implements it.
+/// `Agent` out of the provider god trait and uses a downcast; Codex and ACP are
+/// the only adapters that implement it.
 ///
 /// Rust has no `dyn Any` -> `dyn Trait` downcast, so the capability is reached
 /// through the concrete adapter that implements it and returned as the
@@ -130,10 +130,12 @@ pub fn acp_available() -> bool {
     factory::lookup(Api::Acp.as_str()).is_some()
 }
 
-/// Reject a `codex-app-server` provider whose adapter cannot start threads.
+/// Reject a `codex-app-server` or `acp` provider whose adapter cannot start
+/// threads.
 ///
-/// Returns whether the adapter exposes the `Agent` capability. Non-Codex APIs
-/// are never required to be agents.
+/// Returns whether the adapter exposes the `Agent` capability. The model API
+/// families (`chat-completions`, `responses`, `messages`) are never required to
+/// be agents.
 fn ensure_agent_capable(
     name: &str,
     cfg: &ProviderConfig,
@@ -1617,7 +1619,7 @@ mod tests {
         assert!(error.contains("codex-app-server"), "{error}");
         assert!(error.contains("Agent capability"), "{error}");
 
-        // Non-Codex APIs are never required to be agents.
+        // The model API families are never required to be agents.
         let http = ProviderConfig {
             api: Api::Responses,
             ..codex_provider_cfg()
