@@ -65,6 +65,8 @@ impl Spawn {
 
 struct ChildSlot {
     child: Mutex<Option<Child>>,
+    /// Only Unix signals the process group; elsewhere the pid is unused.
+    #[cfg(unix)]
     pid: Option<u32>,
     /// Set once `try_wait` has reaped the leader. From then on its pid, and
     /// so the process group id, may belong to an unrelated process.
@@ -73,6 +75,7 @@ struct ChildSlot {
 
 /// Whether the kill path may signal the child's process group. Never once the
 /// leader has been reaped: the pgid may have been reused.
+#[cfg(unix)]
 fn may_signal_group(pid: Option<u32>, reaped: bool) -> bool {
     pid.is_some() && !reaped
 }
@@ -302,6 +305,7 @@ impl Process {
             cmd.spawn()
                 .map_err(|e| perr(&name, format!("start {:?} failed: {e}", spawn.command)))?
         };
+        #[cfg(unix)]
         let pid = child.id();
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
@@ -311,6 +315,7 @@ impl Process {
         };
         let slot = Arc::new(ChildSlot {
             child: Mutex::new(Some(child)),
+            #[cfg(unix)]
             pid,
             reaped: AtomicBool::new(false),
         });
@@ -942,7 +947,7 @@ impl Thread for AcpThread {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::may_signal_group;
 
