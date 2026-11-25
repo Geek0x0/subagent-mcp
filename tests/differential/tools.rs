@@ -105,6 +105,8 @@ async fn execute(cwd: &Path, tool_call: &ToolCall) -> subagent_mcp::agent::ToolR
         max_output_tokens: None,
         max_nudges: None,
         extra_body: None,
+        args: Vec::new(),
+        env: Default::default(),
     };
     let provider = Arc::new(
         subagent_mcp::provider::ChatCompletions::new("mock", &cfg).expect("adapter builds"),

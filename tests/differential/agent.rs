@@ -97,6 +97,8 @@ fn provider_config(base_url: &str, default_model: &str) -> ProviderConfig {
         max_output_tokens: None,
         max_nudges: None,
         extra_body: None,
+        args: Vec::new(),
+        env: Default::default(),
     }
 }
 

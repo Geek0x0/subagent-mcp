@@ -23,6 +23,7 @@ const API_CHAT: &str = "chat-completions";
 const API_RESPONSES: &str = "responses";
 const API_MESSAGES: &str = "messages";
 const API_CODEX: &str = "codex-app-server";
+const API_ACP: &str = "acp";
 
 pub const EFFORT_VALUES: [&str; 8] = [
     "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
@@ -58,6 +59,8 @@ pub enum Api {
     Responses,
     Messages,
     CodexAppServer,
+    /// A generic Agent Client Protocol agent over stdio (experimental).
+    Acp,
 }
 
 impl Api {
@@ -68,6 +71,7 @@ impl Api {
             Api::Responses => API_RESPONSES,
             Api::Messages => API_MESSAGES,
             Api::CodexAppServer => API_CODEX,
+            Api::Acp => API_ACP,
         }
     }
 
@@ -77,6 +81,7 @@ impl Api {
             API_RESPONSES => Some(Api::Responses),
             API_MESSAGES => Some(Api::Messages),
             API_CODEX => Some(Api::CodexAppServer),
+            API_ACP => Some(Api::Acp),
             _ => None,
         }
     }
@@ -95,6 +100,10 @@ pub struct ProviderConfig {
     pub env_key: Option<String>,
     pub key: Option<String>,
     pub command: Option<String>,
+    /// Extra arguments passed to `command` (acp only).
+    pub args: Vec<String>,
+    /// Extra environment variables for the spawned agent (acp only).
+    pub env: BTreeMap<String, String>,
     pub default_model: String,
     pub models: Vec<ModelConfig>,
     pub effort_map: BTreeMap<String, String>,
@@ -686,8 +695,9 @@ fn walk_provider(t: &dyn TableLike, prefix: &[String], out: &mut Vec<String>) {
     for (key, item) in t.iter() {
         match key {
             // effort_map and extra_body have dynamic keys; never walked.
-            "api" | "base_url" | "env_key" | "key" | "command" | "default_model"
-            | "max_output_tokens" | "max_nudges" | "effort_map" | "extra_body" => {}
+            "api" | "base_url" | "env_key" | "key" | "command" | "args" | "env"
+            | "default_model" | "max_output_tokens" | "max_nudges" | "effort_map"
+            | "extra_body" => {}
             "models" => walk_models(item, prefix, out),
             _ => report_unknown(key, item, prefix, out),
         }
@@ -806,6 +816,8 @@ struct RawProvider {
     env_key: String,
     key: String,
     command: String,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
     default_model: String,
     models: Vec<RawModel>,
     effort_map: BTreeMap<String, String>,
@@ -1112,6 +1124,8 @@ fn extract_provider(
             path,
             data,
         )?,
+        args: string_array_field(t, "args", &format!("providers.{pname}.args"), path, data)?,
+        env: string_map_field(t, "env", &format!("providers.{pname}.env"), path, data)?,
         default_model: str_field(
             t,
             "default_model",
@@ -1258,6 +1272,41 @@ fn extract_auto(t: &dyn TableLike, path: &Path, data: &str) -> Result<RawAuto, C
         timeout_seconds: int_field(t, "timeout_seconds", "auto.timeout_seconds", path, data)?,
         descriptions: string_map_field(t, "descriptions", "auto.descriptions", path, data)?,
     })
+}
+
+/// A `["a", "b"]` array of strings (`args`); non-string elements are an
+/// unusable config rather than silently ignored.
+fn string_array_field(
+    t: &dyn TableLike,
+    key: &str,
+    field: &str,
+    path: &Path,
+    data: &str,
+) -> Result<Vec<String>, ConfigError> {
+    let Some(item) = t.get(key) else {
+        return Ok(Vec::new());
+    };
+    if item.is_none() {
+        return Ok(Vec::new());
+    }
+    let Some(arr) = item.as_array() else {
+        return Err(item_type_err(path, data, item, field, "array"));
+    };
+    let mut out = Vec::new();
+    for (i, elem) in arr.iter().enumerate() {
+        let Some(text) = elem.as_str() else {
+            return Err(type_error(
+                path,
+                data,
+                elem.span(),
+                &format!("{field}[{i}]"),
+                elem.type_name(),
+                "string",
+            ));
+        };
+        out.push(text.to_string());
+    }
+    Ok(out)
 }
 
 /// A `name = "value"` table (`[auto.descriptions]`); non-string values are an
@@ -1407,17 +1456,44 @@ fn validate_provider(name: &str, p: &RawProvider) -> Result<(), String> {
     let prefix = format!("providers.{name}");
 
     match p.api.as_str() {
-        API_CHAT | API_RESPONSES | API_MESSAGES | API_CODEX => {}
+        API_CHAT | API_RESPONSES | API_MESSAGES | API_CODEX | API_ACP => {}
         other => {
             return Err(format!(
-                "{prefix}.api must be one of {API_CHAT}, {API_RESPONSES}, {API_MESSAGES}, {API_CODEX}; got {}",
+                "{prefix}.api must be one of {API_CHAT}, {API_RESPONSES}, {API_MESSAGES}, {API_CODEX}, {API_ACP}; got {}",
                 go_quote(other)
             ));
         }
     }
 
     let is_codex = p.api == API_CODEX;
-    if is_codex {
+    let is_acp = p.api == API_ACP;
+    if !is_acp {
+        if !p.args.is_empty() {
+            return Err(format!("{prefix}.args is only valid for {API_ACP}"));
+        }
+        if !p.env.is_empty() {
+            return Err(format!("{prefix}.env is only valid for {API_ACP}"));
+        }
+    }
+    if is_acp {
+        if p.command.is_empty() {
+            return Err(format!(
+                "{prefix}.command is required for {API_ACP}: it names the agent to run"
+            ));
+        }
+        for (field, set) in [
+            ("env_key", !p.env_key.is_empty()),
+            ("key", !p.key.is_empty()),
+            ("base_url", !p.base_url.is_empty()),
+            ("max_output_tokens", p.max_output_tokens != 0),
+        ] {
+            if set {
+                return Err(format!(
+                    "{prefix}.{field} is not used by {API_ACP}: the agent handles its own authentication and limits"
+                ));
+            }
+        }
+    } else if is_codex {
         if !p.env_key.is_empty() {
             return Err(format!(
                 "{prefix}.env_key is not used by codex-app-server: authentication goes through codex login"
@@ -1439,7 +1515,7 @@ fn validate_provider(name: &str, p: &RawProvider) -> Result<(), String> {
     } else {
         if !p.command.is_empty() {
             return Err(format!(
-                "{prefix}.command is only valid for codex-app-server"
+                "{prefix}.command is only valid for codex-app-server or {API_ACP}"
             ));
         }
         if p.env_key.is_empty() && p.key.is_empty() {
@@ -1714,6 +1790,8 @@ fn build_config(path: PathBuf, raw: RawConfig) -> Config {
                 env_key: opt_str(p.env_key),
                 key: opt_str(p.key),
                 command: opt_str(p.command),
+                args: p.args,
+                env: p.env,
                 default_model: p.default_model,
                 models,
                 effort_map: p.effort_map,

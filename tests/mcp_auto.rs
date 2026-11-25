@@ -177,6 +177,8 @@ fn provider_config(base_url: String) -> ProviderConfig {
         max_output_tokens: None,
         max_nudges: None,
         extra_body: None,
+        args: Vec::new(),
+        env: Default::default(),
     }
 }
 
@@ -752,6 +754,8 @@ fn codex_provider_config() -> ProviderConfig {
         max_output_tokens: None,
         max_nudges: None,
         extra_body: None,
+        args: Vec::new(),
+        env: Default::default(),
     }
 }
 
@@ -1297,6 +1301,8 @@ fn factory_new_works_for_the_http_apis() {
         max_output_tokens: None,
         max_nudges: None,
         extra_body: None,
+        args: Vec::new(),
+        env: Default::default(),
     };
     let messages = ProviderConfig {
         api: Api::Messages,

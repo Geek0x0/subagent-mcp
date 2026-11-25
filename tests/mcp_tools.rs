@@ -220,6 +220,8 @@ fn provider_config(base_url: String) -> ProviderConfig {
         max_output_tokens: None,
         max_nudges: None,
         extra_body: None,
+        args: Vec::new(),
+        env: Default::default(),
     }
 }
 
@@ -1390,6 +1392,8 @@ fn codex_provider_config(command: &str) -> ProviderConfig {
         max_output_tokens: None,
         max_nudges: None,
         extra_body: None,
+        args: Vec::new(),
+        env: Default::default(),
     }
 }
 
@@ -1690,6 +1694,8 @@ fn factory_new_works_for_responses() {
         max_output_tokens: None,
         max_nudges: None,
         extra_body: None,
+        args: Vec::new(),
+        env: Default::default(),
     };
     assert!(factory::new("responses", &cfg).is_ok());
     assert!(factory::lookup(Api::Responses.as_str()).is_some());

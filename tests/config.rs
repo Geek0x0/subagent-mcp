@@ -220,7 +220,7 @@ fn provider_validation_errors() {
         (
             "bad api",
             repl(VALID_TOML, "api = \"messages\"", "api = \"grpc\""),
-            r#"config file <PATH>: providers.anthropic.api must be one of chat-completions, responses, messages, codex-app-server; got "grpc""#,
+            r#"config file <PATH>: providers.anthropic.api must be one of chat-completions, responses, messages, codex-app-server, acp; got "grpc""#,
         ),
         (
             "missing env_key",
@@ -249,7 +249,7 @@ fn provider_validation_errors() {
         (
             "native command",
             format!("{VALID_TOML}command = \"codex\"\n"),
-            r#"config file <PATH>: providers.anthropic.command is only valid for codex-app-server"#,
+            r#"config file <PATH>: providers.anthropic.command is only valid for codex-app-server or acp"#,
         ),
         (
             "chat-completions command",
@@ -258,7 +258,7 @@ fn provider_validation_errors() {
                 "api = \"chat-completions\"",
                 "api = \"chat-completions\"\ncommand = \"codex\"",
             ),
-            r#"config file <PATH>: providers.deepseek.command is only valid for codex-app-server"#,
+            r#"config file <PATH>: providers.deepseek.command is only valid for codex-app-server or acp"#,
         ),
         (
             "responses command",
@@ -267,7 +267,7 @@ fn provider_validation_errors() {
                 "api = \"chat-completions\"",
                 "api = \"responses\"\ncommand = \"codex\"",
             ),
-            r#"config file <PATH>: providers.deepseek.command is only valid for codex-app-server"#,
+            r#"config file <PATH>: providers.deepseek.command is only valid for codex-app-server or acp"#,
         ),
         (
             "codex missing default_model",
@@ -1269,4 +1269,108 @@ fn rollout_env_overrides_file() {
         config::load(&path).unwrap().rollout.format,
         config::RolloutFormat::OpenCode
     );
+}
+
+// ---------------------------------------------------------------------------
+// api = "acp"
+// ---------------------------------------------------------------------------
+
+const ACP_TOML: &str = r#"
+[providers.agent]
+api = "acp"
+command = "agent"
+default_model = "m1"
+models = [{ id = "m1" }]
+"#;
+
+const ACP_NO_COMMAND_TOML: &str = r#"
+[providers.agent]
+api = "acp"
+default_model = "m1"
+models = [{ id = "m1" }]
+"#;
+
+fn load_err(content: &str) -> String {
+    let (dir, path) = write_config(content);
+    let err = config::load(&path).unwrap_err().to_string();
+    drop(dir);
+    err
+}
+
+#[test]
+fn acp_parses() {
+    let (dir, path) = write_config(ACP_TOML);
+    let cfg = config::load(&path).unwrap();
+    let c = &cfg.providers["agent"];
+    assert_eq!(c.api, config::Api::Acp);
+    assert_eq!(config::Api::Acp.as_str(), "acp");
+    assert_eq!(c.command.as_deref(), Some("agent"));
+    assert!(c.args.is_empty());
+    assert!(c.env.is_empty());
+    drop(dir);
+}
+
+#[test]
+fn acp_requires_command() {
+    let err = load_err(ACP_NO_COMMAND_TOML);
+    assert!(err.contains("providers.agent.command"), "{err}");
+}
+
+#[test]
+fn acp_rejects_http_keys() {
+    let cases = [
+        ("base_url", "base_url = \"https://x\"\n"),
+        ("env_key", "env_key = \"X_KEY\"\n"),
+        ("key", "key = \"secret\"\n"),
+        ("max_output_tokens", "max_output_tokens = 100\n"),
+        ("extra_body", "[providers.agent.extra_body]\nfoo = 1\n"),
+    ];
+    for (name, extra) in cases {
+        let err = load_err(&format!("{ACP_TOML}{extra}"));
+        assert!(
+            err.contains(&format!("providers.agent.{name}")),
+            "case {name}: {err}"
+        );
+    }
+}
+
+#[test]
+fn acp_args_env_parse() {
+    let (dir, path) = write_config(&format!(
+        "{ACP_TOML}args = [\"--x\"]\n[providers.agent.env]\nA = \"1\"\n"
+    ));
+    let cfg = config::load(&path).unwrap();
+    let c = &cfg.providers["agent"];
+    assert_eq!(c.args, vec!["--x".to_string()]);
+    let mut want = std::collections::BTreeMap::new();
+    want.insert("A".to_string(), "1".to_string());
+    assert_eq!(c.env, want);
+    drop(dir);
+}
+
+#[test]
+fn acp_args_env_only_for_acp() {
+    for base in [AUTO_PROVIDER_TOML, CODEX_TOML] {
+        let name = if base == CODEX_TOML {
+            "codex"
+        } else {
+            "deepseek"
+        };
+        let err = load_err(&format!("{base}args = [\"--x\"]\n"));
+        assert!(err.contains(&format!("providers.{name}.args")), "{err}");
+        let err = load_err(&format!("{base}[providers.{name}.env]\nA = \"1\"\n"));
+        assert!(err.contains(&format!("providers.{name}.env")), "{err}");
+    }
+}
+
+#[test]
+fn acp_accepts_effort_map_and_max_nudges() {
+    let (dir, path) = write_config(&format!(
+        "{ACP_TOML}max_nudges = 2\n[providers.agent.effort_map]\nhigh = \"low\"\n"
+    ));
+    let cfg = config::load(&path).unwrap();
+    let c = &cfg.providers["agent"];
+    assert_eq!(c.max_nudges, Some(2));
+    assert_eq!(c.effort_map.get("high").map(String::as_str), Some("low"));
+    drop(dir);
 }

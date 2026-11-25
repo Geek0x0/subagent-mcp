@@ -219,6 +219,8 @@ impl Mock {
             max_output_tokens: Some(max_output_tokens),
             max_nudges: None,
             extra_body: None,
+            args: Vec::new(),
+            env: Default::default(),
         }
     }
 

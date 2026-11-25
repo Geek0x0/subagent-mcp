@@ -122,6 +122,10 @@ impl AdapterFactory for ProductionFactory {
                     auth: Some(auth),
                 })
             }
+            // Replaced by the ACP adapter once it exists.
+            Api::Acp => Err(ProviderError {
+                message: format!("provider {}: acp adapter not available yet", go_quote(name)),
+            }),
         }
     }
 }

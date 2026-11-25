@@ -278,6 +278,8 @@ fn provider_config(api: Api) -> ProviderConfig {
         max_output_tokens: None,
         max_nudges: None,
         extra_body: None,
+        args: Vec::new(),
+        env: Default::default(),
     }
 }
 

@@ -70,6 +70,7 @@ fn build_adapter(api: Api, base_url: &str) -> Arc<dyn subagent_mcp::provider::Pr
         Api::CodexAppServer => Arc::new(
             subagent_mcp::provider::codex::CodexAdapter::new(name, &cfg).expect("codex adapter"),
         ),
+        Api::Acp => unreachable!("differential scenarios do not cover acp"),
     }
 }
 
@@ -103,6 +104,8 @@ fn provider_config(api: Api, base_url: &str) -> ProviderConfig {
         max_output_tokens,
         max_nudges: None,
         extra_body: None,
+        args: Vec::new(),
+        env: Default::default(),
     }
 }
 
