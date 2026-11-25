@@ -669,3 +669,14 @@ async fn cancel_with_blocked_writer_returns() {
         .expect("close hung")
         .unwrap();
 }
+
+#[tokio::test]
+async fn stop_reason_error_fails_run() {
+    need_python!();
+    let fake = Fake::new();
+    let t = start(&fake, fake.spawn("stop:error", &[])).await;
+    let (cb, _) = callbacks(TestApprover::new(Answer::Yes));
+    let err = t.run(ctx(), "x".into(), None, cb).await.unwrap_err();
+    assert!(err.message.contains("error"), "{}", err.message);
+    t.close().await.unwrap();
+}

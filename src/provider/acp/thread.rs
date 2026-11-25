@@ -862,6 +862,13 @@ impl Thread for AcpThread {
             }
             Stop::Cancelled if ctx_done(&ctx) => Err(self.cancel_error(&ctx)),
             Stop::Cancelled => Err(perr(&self.name, "agent cancelled the turn")),
+            Stop::Error(detail) => Err(perr(
+                &self.name,
+                match detail {
+                    Some(d) => format!("agent turn ended with error: {d}"),
+                    None => "agent turn ended with error".to_string(),
+                },
+            )),
         }
     }
 

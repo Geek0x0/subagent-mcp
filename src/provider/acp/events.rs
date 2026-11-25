@@ -31,6 +31,8 @@ pub enum Stop {
     Ok,
     Cancelled,
     Partial(String),
+    /// `stopReason: "error"`, with any embedded error detail.
+    Error(Option<String>),
 }
 
 fn str_at<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -201,13 +203,56 @@ pub fn pick_option(params: &Value, approved: bool) -> Value {
         .unwrap_or_else(|| json!({"outcome": {"outcome": "cancelled"}}))
 }
 
+/// `message (code N)` from a result's `error` object, or a top-level `message`.
+fn error_detail(result: &Value) -> Option<String> {
+    let err = result
+        .get("error")
+        .filter(|e| e.is_object())
+        .unwrap_or(result);
+    let message = str_at(err, "message").filter(|m| !m.is_empty());
+    let code = err.get("code").filter(|c| !c.is_null()).map(|c| match c {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    });
+    match (message, code) {
+        (Some(m), Some(c)) => Some(format!("{m} (code {c})")),
+        (Some(m), None) => Some(m.to_string()),
+        (None, Some(c)) => Some(format!("code {c}")),
+        (None, None) => None,
+    }
+}
+
 /// Classify a `session/prompt` result's `stopReason`.
 pub fn stop_reason(result: &Value) -> Stop {
     match str_at(result, "stopReason") {
         Some("cancelled") => Stop::Cancelled,
+        Some("error") => Stop::Error(error_detail(result)),
         Some(reason @ ("max_tokens" | "max_turn_requests" | "refusal")) => {
             Stop::Partial(reason.to_string())
         }
         _ => Stop::Ok,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stop_reason_error() {
+        assert_eq!(
+            stop_reason(&json!({"stopReason": "error"})),
+            Stop::Error(None)
+        );
+        assert_eq!(
+            stop_reason(&json!({"stopReason": "error", "error": {"code": 7, "message": "boom"}})),
+            Stop::Error(Some("boom (code 7)".into()))
+        );
+        assert_eq!(
+            stop_reason(&json!({"stopReason": "error", "message": "bad"})),
+            Stop::Error(Some("bad".into()))
+        );
+        assert_eq!(stop_reason(&json!({"stopReason": "weird"})), Stop::Ok);
+        assert_eq!(stop_reason(&json!({"stopReason": "end_turn"})), Stop::Ok);
     }
 }
