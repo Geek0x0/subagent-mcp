@@ -268,6 +268,49 @@ async fn instructions_prepended_once() {
 }
 
 #[tokio::test]
+async fn system_prompt_sent_when_supported() {
+    need_python!();
+    let fake = Fake::new();
+    let mut o = opts(fake.cwd());
+    o.base_instructions = Some("be brief".into());
+    o.developer_instructions = Some("dev note".into());
+    let t = thread::start(&ctx(), fake.spawn("system_prompt", &[]), o)
+        .await
+        .unwrap();
+    let (cb, _) = callbacks(TestApprover::new(Answer::Yes));
+    t.run(ctx(), "task".into(), None, cb).await.unwrap();
+    let new = fake
+        .messages()
+        .into_iter()
+        .find(|m| m["method"] == "session/new")
+        .unwrap();
+    assert_eq!(new["params"]["systemPrompt"], "be brief\n\ndev note");
+    assert_eq!(fake.prompts(), vec!["task".to_string()]);
+    t.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn no_system_prompt_without_capability() {
+    need_python!();
+    let fake = Fake::new();
+    let mut o = opts(fake.cwd());
+    o.base_instructions = Some("be brief".into());
+    let t = thread::start(&ctx(), fake.spawn("echo", &[]), o)
+        .await
+        .unwrap();
+    let (cb, _) = callbacks(TestApprover::new(Answer::Yes));
+    t.run(ctx(), "task".into(), None, cb).await.unwrap();
+    let new = fake
+        .messages()
+        .into_iter()
+        .find(|m| m["method"] == "session/new")
+        .unwrap();
+    assert!(new["params"].get("systemPrompt").is_none());
+    assert!(fake.prompts()[0].starts_with("<instructions>"));
+    t.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn effort_warns_once() {
     need_python!();
     let fake = Fake::new();

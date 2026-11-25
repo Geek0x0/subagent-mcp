@@ -19,6 +19,8 @@ Behaviour is chosen by ACP_FAKE_MODE:
   deaf                  stops reading stdin after session/new
   config_options        session/new advertises a model configOption with values
                         fancy/other; session/set_config_option succeeds
+  system_prompt         initialize advertises
+                        agentCapabilities.sessionCapabilities.systemPrompt
   stop:<reason>         one chunk, then stopReason <reason>
 
 Every received message is appended to ACP_FAKE_LOG (one JSON per line). The
@@ -75,7 +77,8 @@ def finish(reason):
 
 def on_prompt(id_):
     state["prompt_id"] = id_
-    if MODE in ("echo", "banner", "set_model_unsupported", "set_model_bad_params", "config_options"):
+    if MODE in ("echo", "banner", "set_model_unsupported", "set_model_bad_params", "config_options",
+                "system_prompt"):
         chunk("hello ")
         chunk("world")
         finish("end_turn")
@@ -133,7 +136,10 @@ def handle(msg):
     if method == "initialize":
         version = 99 if MODE == "bad_version" else 1
         auth = [{"id": "login", "name": "Log in"}] if MODE == "auth" else []
-        init = {"protocolVersion": version, "agentCapabilities": {}, "authMethods": auth}
+        caps = {}
+        if MODE == "system_prompt":
+            caps = {"sessionCapabilities": {"systemPrompt": True}}
+        init = {"protocolVersion": version, "agentCapabilities": caps, "authMethods": auth}
         if MODE == "auth":
             init["agentInfo"] = {"name": "fake-agent", "version": "1.2.3"}
         result(id_, init)

@@ -536,6 +536,20 @@ async fn set_model(
     }
 }
 
+/// Whether `initialize` advertised `systemPrompt` support in `session/new`.
+/// Tolerates the flag under `sessionCapabilities`, `promptCapabilities` or
+/// directly on `agentCapabilities`, as a bool or an (empty) object.
+fn supports_system_prompt(init: &Value) -> bool {
+    [
+        "/sessionCapabilities/systemPrompt",
+        "/promptCapabilities/systemPrompt",
+        "/systemPrompt",
+    ]
+    .iter()
+    .filter_map(|p| init.get("agentCapabilities").and_then(|c| c.pointer(p)))
+    .any(|v| v.as_bool().unwrap_or(v.is_object()))
+}
+
 /// Spawn the agent, initialize it and open a session.
 pub async fn start(
     ctx: &RunContext,
@@ -543,14 +557,25 @@ pub async fn start(
     opts: ThreadOptions,
 ) -> Result<AcpThread, ProviderError> {
     let proc = Process::spawn(&spawn, Some(&opts.cwd)).await?;
+    let instructions = [&opts.base_instructions, &opts.developer_instructions]
+        .into_iter()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .cloned()
+        .collect::<Vec<_>>();
+    let instructions = (!instructions.is_empty()).then(|| instructions.join("\n\n"));
     let init = initialize(&proc, ctx).await?;
+    let mut new_params = json!({"cwd": opts.cwd, "mcpServers": []});
+    let instructions = match instructions {
+        Some(ins) if supports_system_prompt(&init) => {
+            new_params["systemPrompt"] = json!(ins);
+            None
+        }
+        other => other,
+    };
     let new = proc
         .peer
-        .call(
-            &capability_ctx(ctx),
-            "session/new",
-            json!({"cwd": opts.cwd, "mcpServers": []}),
-        )
+        .call(&capability_ctx(ctx), "session/new", new_params)
         .await;
     let session = match new {
         Ok(v) => v,
@@ -584,13 +609,6 @@ pub async fn start(
     if opts.model != "default" && !opts.model.is_empty() {
         set_model(&proc, ctx, &session, &session_id, &opts.model).await?;
     }
-    let instructions = [&opts.base_instructions, &opts.developer_instructions]
-        .into_iter()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .cloned()
-        .collect::<Vec<_>>();
-    let instructions = (!instructions.is_empty()).then(|| instructions.join("\n\n"));
     Ok(AcpThread {
         name: spawn.provider.clone(),
         session_id,
