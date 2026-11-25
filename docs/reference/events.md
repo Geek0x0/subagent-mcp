@@ -6,6 +6,9 @@ During a running call, the server emits `subagent/event` notifications with `thr
 |---|---|
 | `task_started` | Processing began. |
 | `agent_message_delta` | Streamed assistant text in `delta`. Consecutive deltas are merged into one event (at most every 50 ms or 8 KiB, with the tail flushed when the turn ends), so append `delta` to a buffer rather than assuming one event per token — a busy client would otherwise overflow its notification channel and lose most of the stream. |
+| `agent_reasoning_delta` | Streamed reasoning text in `delta` (ACP `agent_thought_chunk`). Not part of the final answer. |
+| `plan_update` | The agent's current plan (ACP `plan` update) in `entries`. |
+| `warning` | A non-fatal notice in `message`, for example an ignored effort or a turn that stopped early. |
 | `token_count` | Model-turn usage in `prompt_tokens` (the full prompt, cached tokens included), `completion_tokens`, and `total_tokens` (their sum). |
 | `exec_command_begin` | Tool execution began; includes `call_id`, `tool`, and `command` for shell, `paths` (array) for `apply_patch`, or `path` for `read_file` and `write_file`. |
 | `exec_command_end` | Tool execution ended; includes `call_id`, `tool`, `exit_code` for shell, `paths` for `apply_patch`, and `error` when execution failed. |

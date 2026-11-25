@@ -169,12 +169,14 @@ models = [{ id = "default", description = "whatever the agent picks" }]
 Limits:
 
 - **Login happens in the agent itself.** subagent-mcp sends no key and never calls `authenticate`. `--check-config` reports the agent's `agentInfo` and advertised `authMethods`; a session that fails with "authentication required" means you must log in with the agent's own tooling.
+- **Do not put credentials in `env`.** `env` values sit in the config file in plain text, and the mode `600` check covers only `key`. Prefer letting the agent use its own login, or a variable in the environment that launches the server.
+- **Instructions.** When `initialize` advertises `systemPrompt` support (for example `agentCapabilities.sessionCapabilities.systemPrompt`), the base and developer instructions are sent as `systemPrompt` in `session/new`. Otherwise they are prefixed to the first prompt inside `<instructions>` tags.
 - **Sandbox is advisory.** `sandbox`, `max_sandbox` and `config.writable_roots` are not enforced by subagent-mcp; the agent runs with the server user's permissions and its own policy, if any.
 - **The read-only auto-reject applies only to agents that request permission.** Under `read-only`, a `session/request_permission` for an `edit`, `delete`, `move` or `execute` tool call is rejected without asking the MCP client. An agent that acts without asking is not stopped.
 - **Approval policy has no effect.** `approval-policy` (and the server's `max_approval_policy`) is ignored for ACP. Every `session/request_permission` is answered by asking the MCP client, except for the read-only auto-reject above. When to ask is decided by the agent.
 - **No resume.** Each thread is a fresh agent session; `ephemeral` has no effect.
 - **No respawn.** If the agent process dies, the thread fails; start a new session.
-- **Effort is ignored.** `reasoning-effort` and `effort_map` have no ACP equivalent; a requested effort is ignored with one warning per thread. A model other than the agent's default is set with `session/set_model`, and an agent that does not support it produces a warning.
+- **Effort is ignored.** `reasoning-effort` and `effort_map` have no ACP equivalent; a requested effort is ignored with one warning per thread. A model other than `default` (or empty) is applied after `session/new`. If the `session/new` result lists a `configOptions` entry with `category` or `id` `model`, the model must be one of its listed values (when it lists any) and is set with `session/set_config_option`. Otherwise the legacy `session/set_model` is used. If the requested model cannot be applied (there is no mechanism, the method is not found, the params are invalid, or the value is not listed), `start` fails with an error naming the model; it does not warn and continue.
 - **Process teardown.** On Unix the agent is started in its own process group and the whole group is killed on close or shutdown. On Windows only the direct child process is killed, so a wrapper agent (for example one launched through `npx`) can leave orphaned grandchildren.
 
 ## Validating the config
