@@ -12,6 +12,7 @@
 //! adapters are [`chat_completions`], [`responses`], [`messages`], and the
 //! [`codex`] client with its process pool.
 
+pub mod acp;
 pub mod chat_completions;
 pub mod codex;
 pub mod factory;
