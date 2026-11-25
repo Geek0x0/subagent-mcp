@@ -2739,3 +2739,101 @@ async fn reply_without_the_opencode_format_has_no_warning() {
     .unwrap();
     assert_eq!(text(&reply), "continued");
 }
+
+// ---------------------------------------------------------------------------
+// ACP provider
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+fn acp_fixture() -> String {
+    concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/acp_fake_agent.py"
+    )
+    .to_string()
+}
+
+#[cfg(unix)]
+fn have_python3() -> bool {
+    std::env::var_os("PATH")
+        .is_some_and(|path| std::env::split_paths(&path).any(|d| d.join("python3").is_file()))
+}
+
+#[cfg(unix)]
+fn acp_provider_config(mode: &str) -> ProviderConfig {
+    ProviderConfig {
+        api: Api::Acp,
+        base_url: String::new(),
+        env_key: None,
+        key: None,
+        command: Some("python3".into()),
+        default_model: "default".into(),
+        models: vec![subagent_mcp::config::ModelConfig {
+            id: "default".into(),
+            description: String::new(),
+        }],
+        effort_map: BTreeMap::new(),
+        max_output_tokens: None,
+        max_nudges: None,
+        extra_body: None,
+        args: vec![acp_fixture()],
+        env: BTreeMap::from([("ACP_FAKE_MODE".to_string(), mode.to_string())]),
+    }
+}
+
+#[test]
+fn acp_provider_registered() {
+    let _env = env_guard();
+    let _tools = tools(test_config(vec![]));
+    assert!(subagent_mcp::provider::factory::lookup("acp").is_some());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn acp_start_uses_agent_path() {
+    let _env = env_guard();
+    if !have_python3() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let config = Config {
+        path: PathBuf::from("/test/config.toml"),
+        providers: BTreeMap::from([("fake".to_string(), acp_provider_config("echo"))]),
+        auto: None,
+        limits: Default::default(),
+        rollout: Default::default(),
+    };
+    let tools = tools(config);
+    let result = call(&tools, "subagent", json!({"prompt": "hi", "cwd": cwd()}))
+        .await
+        .unwrap();
+    assert!(!is_error(&result), "{}", text(&result));
+    assert_eq!(text(&result), "hello world");
+    assert_eq!(structured(&result)["provider"], "fake");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn check_auth_reports_agent_info() {
+    use subagent_mcp::provider::AuthChecker;
+    if !have_python3() {
+        eprintln!("skipping: python3 not on PATH");
+        return;
+    }
+    let adapter =
+        subagent_mcp::provider::acp::AcpAdapter::new("fake", &acp_provider_config("auth")).unwrap();
+    let status = adapter.check_auth().await.unwrap();
+    assert!(
+        status.summary.ends_with("; authMethods: login"),
+        "{}",
+        status.summary
+    );
+    let adapter =
+        subagent_mcp::provider::acp::AcpAdapter::new("fake", &acp_provider_config("echo")).unwrap();
+    let status = adapter.check_auth().await.unwrap();
+    assert!(
+        status.summary.ends_with("; authMethods: none"),
+        "{}",
+        status.summary
+    );
+}

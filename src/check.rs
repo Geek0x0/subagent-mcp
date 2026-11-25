@@ -22,6 +22,7 @@ use serde_json::value::RawValue;
 
 use crate::config::{Api, Config, ProviderConfig};
 use crate::policy::{ApprovalPolicy, Sandbox};
+use crate::provider::acp::AcpAdapter;
 use crate::provider::chat_completions::ChatCompletions;
 use crate::provider::codex::CodexAdapter;
 use crate::provider::messages::Messages;
@@ -122,10 +123,19 @@ impl AdapterFactory for ProductionFactory {
                     auth: Some(auth),
                 })
             }
-            // Replaced by the ACP adapter once it exists.
-            Api::Acp => Err(ProviderError {
-                message: format!("provider {}: acp adapter not available yet", go_quote(name)),
-            }),
+            Api::Acp => {
+                let adapter = Arc::new(AcpAdapter::new(name, config)?);
+                let provider: Arc<dyn Provider> = adapter.clone();
+                let lister: Arc<dyn ModelLister> = adapter.clone();
+                let agent: Arc<dyn Agent> = adapter.clone();
+                let auth: Arc<dyn AuthChecker> = adapter;
+                Ok(Built {
+                    provider,
+                    lister: Some(lister),
+                    agent: Some(agent),
+                    auth: Some(auth),
+                })
+            }
         }
     }
 }

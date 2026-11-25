@@ -20,7 +20,7 @@ use crate::mcp::server::ToolError;
 use crate::util::json::go_quote;
 use crate::util::run::RunContext;
 
-use super::tools::{api_key_for, codex_available, provider_names};
+use super::tools::{acp_available, api_key_for, codex_available, provider_names};
 
 /// One resolved provider/model choice, with the decision metadata.
 #[derive(Debug, Clone, PartialEq)]
@@ -169,6 +169,13 @@ fn auto_candidates(config: &Config) -> (Vec<Candidate>, Vec<String>) {
             if !codex_available() {
                 omitted.push(format!(
                     "{name}: codex-app-server adapter is not available in this build"
+                ));
+                continue;
+            }
+        } else if provider.api == crate::config::Api::Acp {
+            if !acp_available() {
+                omitted.push(format!(
+                    "{name}: acp adapter is not available in this build"
                 ));
                 continue;
             }

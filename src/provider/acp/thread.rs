@@ -454,11 +454,18 @@ pub async fn probe(ctx: &RunContext, spawn: Spawn) -> Result<AuthStatus, Provide
             .map(str::to_string)
     };
     let version = field("version");
-    let summary = match (field("name"), &version) {
-        (Some(n), Some(v)) => format!("ACP agent {n} {v}"),
-        (Some(n), None) => format!("ACP agent {n}"),
+    let agent = match (field("name"), &version) {
+        (Some(n), Some(v)) => format!("{n} {v}"),
+        (Some(n), None) => n,
         _ => format!("ACP agent ready (protocol {PROTOCOL_VERSION})"),
     };
+    let ids = auth_method_ids(&init);
+    let methods = if ids.is_empty() {
+        "none".to_string()
+    } else {
+        ids.join(", ")
+    };
+    let summary = format!("{agent}; authMethods: {methods}");
     Ok(AuthStatus { summary, version })
 }
 

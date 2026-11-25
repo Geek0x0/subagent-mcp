@@ -1315,3 +1315,28 @@ fn factory_new_works_for_the_http_apis() {
     assert!(factory::lookup(Api::Responses.as_str()).is_some());
     assert!(factory::lookup(Api::CodexAppServer.as_str()).is_some());
 }
+
+#[tokio::test]
+async fn auto_includes_acp_without_preflight() {
+    let _env = env_guard();
+    let mut provider = codex_provider_config();
+    provider.api = Api::Acp;
+    provider.command = Some("acp-not-spawned".into());
+    let mut config = Config {
+        path: PathBuf::from("/test/config.toml"),
+        providers: BTreeMap::new(),
+        auto: None,
+        limits: Default::default(),
+        rollout: Default::default(),
+    };
+    config.providers.insert("agent".into(), provider);
+    config.auto = Some(auto_config("http://127.0.0.1:1"));
+    // Constructing the tools registers the ACP adapter.
+    let _tools = tools(config.clone());
+    let selection = resolve_auto(&plain_ctx(), &config, "task", &cwd().to_path_buf())
+        .await
+        .unwrap();
+    assert_eq!(selection.provider, "agent");
+    assert!(selection.skipped);
+    assert!(selection.omitted.is_empty(), "{:?}", selection.omitted);
+}

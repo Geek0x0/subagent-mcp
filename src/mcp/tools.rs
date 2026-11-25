@@ -29,6 +29,7 @@ use crate::mcp::auto::{AutoSelection, resolve_auto};
 use crate::mcp::progress::ProgressSink;
 use crate::mcp::server::{CallContext, ToolDefinition, ToolError, ToolHandler};
 use crate::policy::{ApprovalPolicy, Sandbox};
+use crate::provider::acp::AcpAdapter;
 use crate::provider::codex::CodexAdapter;
 use crate::provider::{
     Agent, ChatCompletions, Messages, Provider, Responses, Thread, ThreadOptions, factory,
@@ -94,6 +95,10 @@ fn register_adapters() {
             Api::CodexAppServer.as_str(),
             Arc::new(|name, cfg| Ok(Arc::new(CodexAdapter::new(name, cfg)?) as Arc<dyn Provider>)),
         );
+        register_if_absent(
+            Api::Acp.as_str(),
+            Arc::new(|name, cfg| Ok(Arc::new(AcpAdapter::new(name, cfg)?) as Arc<dyn Provider>)),
+        );
     });
 }
 
@@ -110,6 +115,19 @@ fn codex_agent(adapter: &Arc<dyn Provider>) -> Option<&dyn Agent> {
     (adapter.as_ref() as &dyn Any)
         .downcast_ref::<CodexAdapter>()
         .map(|codex| codex as &dyn Agent)
+        .or_else(|| acp_agent(adapter))
+}
+
+/// The `Agent` capability of an ACP adapter, reached the same way as Codex.
+fn acp_agent(adapter: &Arc<dyn Provider>) -> Option<&dyn Agent> {
+    (adapter.as_ref() as &dyn Any)
+        .downcast_ref::<AcpAdapter>()
+        .map(|acp| acp as &dyn Agent)
+}
+
+/// Whether this build can run ACP whole-thread sessions.
+pub fn acp_available() -> bool {
+    factory::lookup(Api::Acp.as_str()).is_some()
 }
 
 /// Reject a `codex-app-server` provider whose adapter cannot start threads.
@@ -125,6 +143,12 @@ fn ensure_agent_capable(
     if cfg.api == Api::CodexAppServer && !is_agent {
         return Err(format!(
             "provider {} uses codex-app-server but its adapter does not implement the Agent capability",
+            go_quote(name)
+        ));
+    }
+    if cfg.api == Api::Acp && !is_agent {
+        return Err(format!(
+            "provider {} uses acp but its adapter does not implement the Agent capability",
             go_quote(name)
         ));
     }
@@ -1136,7 +1160,7 @@ pub(crate) fn api_key_for(config: &Config, name: &str) -> Result<String, String>
             provider_names(config).join(", ")
         )
     })?;
-    if provider.api == Api::CodexAppServer {
+    if matches!(provider.api, Api::CodexAppServer | Api::Acp) {
         return Ok(String::new());
     }
     let env_key = provider.env_key.as_deref().unwrap_or("");
@@ -1604,5 +1628,43 @@ mod tests {
         let real: Arc<dyn Provider> =
             Arc::new(CodexAdapter::new("codex", &codex_provider_cfg()).unwrap());
         assert!(ensure_agent_capable("codex", &codex_provider_cfg(), &real).unwrap());
+    }
+
+    fn acp_provider_cfg() -> ProviderConfig {
+        ProviderConfig {
+            api: Api::Acp,
+            command: Some("acp-test".into()),
+            ..codex_provider_cfg()
+        }
+    }
+
+    #[test]
+    fn acp_requires_the_agent_capability() {
+        let plain: Arc<dyn Provider> = Arc::new(PlainProvider);
+        let error = ensure_agent_capable("a", &acp_provider_cfg(), &plain).unwrap_err();
+        assert_eq!(
+            error,
+            "provider \"a\" uses acp but its adapter does not implement the Agent capability"
+        );
+        let real: Arc<dyn Provider> = Arc::new(AcpAdapter::new("a", &acp_provider_cfg()).unwrap());
+        assert!(ensure_agent_capable("a", &acp_provider_cfg(), &real).unwrap());
+    }
+
+    #[test]
+    fn acp_needs_no_api_key() {
+        let config = Config {
+            path: std::path::PathBuf::from("/test/config.toml"),
+            providers: std::collections::BTreeMap::from([("a".to_string(), acp_provider_cfg())]),
+            auto: None,
+            limits: Default::default(),
+            rollout: Default::default(),
+        };
+        assert_eq!(api_key_for(&config, "a").unwrap(), "");
+    }
+
+    #[test]
+    fn acp_is_available() {
+        register_adapters();
+        assert!(acp_available());
     }
 }
