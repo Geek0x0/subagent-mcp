@@ -1,8 +1,9 @@
 //! Generic line-delimited JSON-RPC 2.0 peer over an `AsyncRead`/`AsyncWrite`
 //! pair. It has no ACP knowledge: outbound calls are matched to responses by
-//! id, and inbound notifications and requests are forwarded, in order, on a
-//! bounded channel. When the channel is full notifications are dropped
-//! (counted, logged once); requests are never dropped. A line longer than
+//! id, and inbound notifications and requests are forwarded, in order, on an
+//! [`InboundRx`]. At most its capacity of notifications are queued; further
+//! ones are dropped (logged once). Requests are never dropped and never block
+//! the reader, so responses are always delivered. A line longer than
 //! [`MAX_FRAME`] closes the connection. Lines that are not JSON objects (agent banners, logs,
 //! non-UTF-8 bytes) are skipped.
 //!
@@ -15,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
@@ -34,7 +35,7 @@ pub const CODE_DEADLINE: i64 = -32097;
 
 /// Largest inbound line accepted, matching the HTTP/SSE line limit.
 pub const MAX_FRAME: usize = crate::provider::sse::SSE_MAX_LINE;
-/// Capacity of the inbound channel.
+/// Most notifications queued on an [`InboundRx`] at once.
 pub const INBOUND_CAPACITY: usize = 1024;
 
 /// A message the far end initiated.
@@ -49,6 +50,36 @@ pub enum Inbound {
         method: String,
         params: Value,
     },
+}
+
+/// Receiving end of a peer's inbound stream. Order is preserved across
+/// notifications and requests; notifications beyond the capacity are dropped
+/// by the reader.
+pub struct InboundRx {
+    rx: mpsc::UnboundedReceiver<Inbound>,
+    queued: Arc<AtomicUsize>,
+}
+
+impl InboundRx {
+    fn took(&self, msg: &Inbound) {
+        if matches!(msg, Inbound::Notification { .. }) {
+            self.queued.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The next message; `None` once the reader has ended and all are taken.
+    pub async fn recv(&mut self) -> Option<Inbound> {
+        let msg = self.rx.recv().await?;
+        self.took(&msg);
+        Some(msg)
+    }
+
+    /// The next message if one is queued.
+    pub fn try_recv(&mut self) -> Result<Inbound, mpsc::error::TryRecvError> {
+        let msg = self.rx.try_recv()?;
+        self.took(&msg);
+        Ok(msg)
+    }
 }
 
 /// A JSON-RPC error object, or a local transport failure in the same shape.
@@ -140,7 +171,7 @@ pub struct Peer {
 impl Peer {
     /// Start the reader and writer tasks and return the peer plus the inbound
     /// stream. The stream ends when the reader hits EOF or a read error.
-    pub fn spawn<R, W>(r: R, w: W) -> (Peer, mpsc::Receiver<Inbound>)
+    pub fn spawn<R, W>(r: R, w: W) -> (Peer, InboundRx)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -154,7 +185,7 @@ impl Peer {
         mut w: W,
         max_frame: usize,
         capacity: usize,
-    ) -> (Peer, mpsc::Receiver<Inbound>)
+    ) -> (Peer, InboundRx)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -177,30 +208,33 @@ impl Peer {
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
         });
-        let (tx, rx) = mpsc::channel(capacity.max(1));
+        let (tx, rx) = mpsc::unbounded_channel();
+        let queued = Arc::new(AtomicUsize::new(0));
+        let rx = InboundRx {
+            rx,
+            queued: Arc::clone(&queued),
+        };
         let reader = Arc::clone(&inner);
         tokio::spawn(async move {
             let mut r = BufReader::new(r);
             let mut buf = Vec::new();
             let mut dropped = 0u64;
             while let Ok(true) = read_line_bounded(&mut r, &mut buf, max_frame).await {
-                if let Some(msg) = dispatch(&reader, &buf) {
-                    match msg {
-                        Inbound::Request { .. } => {
-                            if tx.send(msg).await.is_err() {
-                                continue;
-                            }
+                let Some(msg) = dispatch(&reader, &buf) else {
+                    continue;
+                };
+                if matches!(msg, Inbound::Notification { .. }) {
+                    if queued.load(Ordering::SeqCst) >= capacity {
+                        dropped += 1;
+                        if dropped == 1 {
+                            eprintln!("acp: inbound queue full; dropping notifications");
                         }
-                        Inbound::Notification { .. } => {
-                            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg) {
-                                dropped += 1;
-                                if dropped == 1 {
-                                    eprintln!("acp: inbound channel full; dropping notifications");
-                                }
-                            }
-                        }
+                        continue;
                     }
+                    queued.fetch_add(1, Ordering::SeqCst);
                 }
+                // Unbounded send: the reader never waits on the consumer.
+                let _ = tx.send(msg);
             }
             reader.close();
         });
@@ -371,48 +405,79 @@ mod tests {
         assert!(peer.closed());
     }
 
+    fn note() -> &'static str {
+        "{\"jsonrpc\":\"2.0\",\"method\":\"n\",\"params\":{}}\n"
+    }
+
+    /// Nobody drains the inbound channel (as during `start`): a request
+    /// arriving after the channel filled must not stop the reader from
+    /// delivering the response.
     #[tokio::test]
-    async fn notification_flood_does_not_block_requests() {
+    async fn full_channel_does_not_block_responses() {
         let (agent, ours) = tokio::io::duplex(1 << 20);
         let (r, w) = tokio::io::split(ours);
         let (ar, mut aw) = tokio::io::split(agent);
         let (peer, mut rx) = Peer::spawn_with_limits(r, w, SSE_MAX_LINE, 4);
         let call = tokio::spawn({
             let peer = peer.clone();
-            async move { peer.call(&ctx(), "ping", json!({})).await }
+            async move { peer.call(&ctx(), "initialize", json!({})).await }
         });
         let mut ar = BufReader::new(ar);
         let mut line = String::new();
         ar.read_line(&mut line).await.unwrap();
         let id = serde_json::from_str::<Value>(&line).unwrap()["id"].clone();
         let mut out = String::new();
-        for _ in 0..100 {
-            out.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"n\",\"params\":{}}\n");
+        for _ in 0..10 {
+            out.push_str(note());
         }
-        out.push_str("{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"req\",\"params\":{}}\n");
+        out.push_str("{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"req1\",\"params\":{}}\n");
+        out.push_str("{\"jsonrpc\":\"2.0\",\"id\":\"r2\",\"method\":\"req2\",\"params\":{}}\n");
         out.push_str(&format!(
             "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":7}}\n"
         ));
         aw.write_all(out.as_bytes()).await.unwrap();
-        let mut saw_request = false;
-        let mut notes = 0;
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+            .await
+            .expect("response blocked behind a full inbound channel")
+            .unwrap();
+        assert_eq!(res.unwrap(), json!(7));
+        // Both requests are still delivered, in order.
+        let mut reqs = Vec::new();
         while let Ok(Some(msg)) =
-            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
+        {
+            if let Inbound::Request { method, .. } = msg {
+                reqs.push(method);
+            }
+        }
+        assert_eq!(reqs, ["req1", "req2"]);
+    }
+
+    /// Capacity 4, no draining: 100 notifications then a request. Some
+    /// notifications are dropped; the request is not.
+    #[tokio::test]
+    async fn full_channel_drops_notifications_not_requests() {
+        let (agent, ours) = tokio::io::duplex(1 << 20);
+        let (r, w) = tokio::io::split(ours);
+        let (_ar, mut aw) = tokio::io::split(agent);
+        let (_peer, mut rx) = Peer::spawn_with_limits(r, w, SSE_MAX_LINE, 4);
+        let mut out = String::new();
+        for _ in 0..100 {
+            out.push_str(note());
+        }
+        out.push_str("{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"req\",\"params\":{}}\n");
+        aw.write_all(out.as_bytes()).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let (mut notes, mut saw_request) = (0, false);
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
         {
             match msg {
-                Inbound::Request { ref method, .. } if method == "req" => {
-                    saw_request = true;
-                    break;
-                }
+                Inbound::Request { ref method, .. } if method == "req" => saw_request = true,
                 _ => notes += 1,
             }
         }
-        assert!(notes <= 100);
-        let res = tokio::time::timeout(std::time::Duration::from_secs(2), call)
-            .await
-            .expect("call blocked by notification flood")
-            .unwrap();
-        assert_eq!(res.unwrap(), json!(7));
+        assert!(notes < 100, "no notification was dropped ({notes})");
         assert!(saw_request, "request must never be dropped");
     }
 }

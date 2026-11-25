@@ -13,12 +13,11 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
-use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::events::{self, Stop, ToolCallCache};
-use super::rpc::{Inbound, Peer, RpcError};
+use super::rpc::{Inbound, InboundRx, Peer, RpcError};
 use crate::provider::types::{AuthStatus, ProviderError, Thread, ThreadCallbacks, ThreadOptions};
 use crate::util::approval::Approver;
 use crate::util::json::go_quote;
@@ -270,7 +269,7 @@ impl AsyncWrite for SharedStdin {
 struct Process {
     name: String,
     peer: Peer,
-    inbound: Receiver<Inbound>,
+    inbound: InboundRx,
     slot: Arc<ChildSlot>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     tail: Arc<Mutex<StderrTail>>,
@@ -605,7 +604,6 @@ pub async fn start(
             "session/new failed: no sessionId in result",
         ));
     };
-    let warnings = Vec::new();
     if opts.model != "default" && !opts.model.is_empty() {
         set_model(&proc, ctx, &session, &session_id, &opts.model).await?;
     }
@@ -621,7 +619,6 @@ pub async fn start(
             cache: ToolCallCache::default(),
             instructions,
             effort_warned: false,
-            warnings,
         }),
     })
 }
@@ -634,8 +631,6 @@ struct Turn {
     /// Prepended to the first prompt, then cleared.
     instructions: Option<String>,
     effort_warned: bool,
-    /// Start-time warnings emitted on the first run.
-    warnings: Vec<String>,
 }
 
 /// One ACP session in its own child process.
@@ -809,9 +804,6 @@ impl Thread for AcpThread {
         let _forward_guard = ctx.cancel.clone().drop_guard();
         // Updates that arrived between turns are stale.
         while proc.inbound.try_recv().is_ok() {}
-        for w in turn.warnings.drain(..) {
-            warn(&callbacks, &w);
-        }
         if effort.is_some() && !turn.effort_warned {
             turn.effort_warned = true;
             warn(&callbacks, "acp: effort is not supported and was ignored");
