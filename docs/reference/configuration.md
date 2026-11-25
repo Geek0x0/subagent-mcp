@@ -171,6 +171,7 @@ Limits:
 - **Login happens in the agent itself.** subagent-mcp sends no key and never calls `authenticate`. `--check-config` reports the agent's `agentInfo` and advertised `authMethods`; a session that fails with "authentication required" means you must log in with the agent's own tooling.
 - **Sandbox is advisory.** `sandbox`, `max_sandbox` and `config.writable_roots` are not enforced by subagent-mcp; the agent runs with the server user's permissions and its own policy, if any.
 - **The read-only auto-reject applies only to agents that request permission.** Under `read-only`, a `session/request_permission` for an `edit`, `delete`, `move` or `execute` tool call is rejected without asking the MCP client. An agent that acts without asking is not stopped.
+- **Approval policy has no effect.** `approval-policy` (and the server's `max_approval_policy`) is ignored for ACP. Every `session/request_permission` is answered by asking the MCP client, except for the read-only auto-reject above. When to ask is decided by the agent.
 - **No resume.** Each thread is a fresh agent session; `ephemeral` has no effect.
 - **No respawn.** If the agent process dies, the thread fails; start a new session.
 - **Effort is ignored.** `reasoning-effort` and `effort_map` have no ACP equivalent; a requested effort is ignored with one warning per thread. A model other than the agent's default is set with `session/set_model`, and an agent that does not support it produces a warning.
