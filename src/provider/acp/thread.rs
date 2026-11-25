@@ -91,7 +91,8 @@ fn leader_exited_unreaped(pid: u32) -> bool {
         )
     };
     if rc != 0 {
-        // ECHILD: no such child any more; treat as gone.
+        // Any error (ECHILD, but also EINTR) is treated as exited. That is
+        // harmless: the kill path signals the group before it reaps.
         return true;
     }
     // With WNOHANG and no state change, si_pid stays 0.

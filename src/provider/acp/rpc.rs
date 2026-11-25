@@ -467,7 +467,12 @@ mod tests {
         }
         out.push_str("{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"req\",\"params\":{}}\n");
         aw.write_all(out.as_bytes()).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        // Wait until the request is queued: with the cap that is 4 kept
+        // notifications plus the request.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while rx.rx.len() < 5 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         let (mut notes, mut saw_request) = (0, false);
         while let Ok(Some(msg)) =
             tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv()).await
