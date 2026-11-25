@@ -66,36 +66,65 @@ impl Spawn {
 struct ChildSlot {
     child: Mutex<Option<Child>>,
     pid: Option<u32>,
+    /// Set once `try_wait` has reaped the leader. From then on its pid, and
+    /// so the process group id, may belong to an unrelated process.
+    reaped: AtomicBool,
+}
+
+/// Whether the kill path may signal the child's process group. Never once the
+/// leader has been reaped: the pgid may have been reused.
+fn may_signal_group(pid: Option<u32>, reaped: bool) -> bool {
+    pid.is_some() && !reaped
 }
 
 impl ChildSlot {
     /// Kill the child (and on Unix its process group) and reap it, waiting at
     /// most `wait`. Synchronous so the shutdown hook can use it.
     fn kill_and_reap(&self, wait: Duration) {
+        // Holding the child (taken under the lock) means no other path can
+        // reap it between the check and the signal.
         let Some(mut child) = self.child.lock().unwrap().take() else {
             return;
         };
+        // Signal the group before any reaping `try_wait` in this path.
         #[cfg(unix)]
-        if let Some(pid) = self.pid {
+        if may_signal_group(self.pid, self.reaped.load(Ordering::SeqCst))
+            && let Some(pid) = self.pid
+        {
             // SAFETY: killpg has no memory-safety preconditions; the group id
-            // is the child's pid because it was spawned with process_group(0).
+            // is the child's pid because it was spawned with process_group(0),
+            // and the leader is unreaped so the id cannot have been reused.
             unsafe {
                 libc::killpg(pid as libc::pid_t, libc::SIGKILL);
             }
+        }
+        if self.reaped.load(Ordering::SeqCst) {
+            return;
         }
         let _ = child.start_kill();
         let deadline = std::time::Instant::now() + wait;
         while std::time::Instant::now() < deadline {
             if !matches!(child.try_wait(), Ok(None)) {
+                self.reaped.store(true, Ordering::SeqCst);
                 return;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
 
+    /// Whether the leader has exited. Reaps it if so, and records that.
     fn exited(&self) -> bool {
+        if self.reaped.load(Ordering::SeqCst) {
+            return true;
+        }
         match self.child.lock().unwrap().as_mut() {
-            Some(child) => !matches!(child.try_wait(), Ok(None)),
+            Some(child) => {
+                let gone = !matches!(child.try_wait(), Ok(None));
+                if gone {
+                    self.reaped.store(true, Ordering::SeqCst);
+                }
+                gone
+            }
             None => true,
         }
     }
@@ -248,6 +277,7 @@ impl Process {
         let slot = Arc::new(ChildSlot {
             child: Mutex::new(Some(child)),
             pid,
+            reaped: AtomicBool::new(false),
         });
         register(&slot);
         let tail = Arc::new(Mutex::new(StderrTail::default()));
@@ -796,5 +826,18 @@ impl Thread for AcpThread {
             proc.shutdown(CLOSE_GRACE).await;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::may_signal_group;
+
+    #[test]
+    fn no_group_signal_after_leader_reaped() {
+        assert!(may_signal_group(Some(42), false));
+        assert!(!may_signal_group(Some(42), true));
+        assert!(!may_signal_group(None, false));
+        assert!(!may_signal_group(None, true));
     }
 }
