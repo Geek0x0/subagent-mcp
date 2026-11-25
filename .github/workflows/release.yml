@@ -2,14 +2,16 @@ name: Release
 
 # Publishing workflow for the Rust-only 0.14.0 release.
 #
-# A tag push is the only trigger. The build jobs package each target exactly
-# once with scripts/package-rust-release.sh; the checksums job downloads those
-# archives (never rebuilds) and writes checksums.txt; the publish job creates a
-# new GitHub release and uploads that same set. It fails if the release already
-# exists, so a rerun cannot silently replace archives or checksums.
+# A tag push is the only trigger. The package job calls release-package.yml,
+# which packages each target exactly once with scripts/package-rust-release.sh,
+# downloads those archives (never rebuilds) and writes checksums.txt; the
+# publish job creates a new GitHub release and uploads that same set. It fails
+# if the release already exists, so a rerun cannot silently replace archives or
+# checksums.
 #
-# The runtime-gates job calls rust-ci.yml, which runs the native Linux/macOS/
-# Windows runtime and TLS trust gates. Publishing is blocked on it.
+# The runtime-gates job calls rust-gates.yml, the same reusable gate set rust-ci
+# runs, including native Linux/macOS/Windows runtime and TLS trust tests.
+# Publishing is blocked on it.
 #
 # The last job, sync-plugin-versions, runs only after publish and pins the plugin
 # manifests and scripts/release.lock to the tag, then pushes that to main.
@@ -44,172 +46,27 @@ jobs:
 
   runtime-gates:
     name: native runtime and TLS gates
-    uses: ./.github/workflows/rust-ci.yml
+    uses: ./.github/workflows/rust-gates.yml
     permissions:
       contents: read
 
-  build:
-    name: package (${{ matrix.name }})
+  # Six-target packaging plus checksums, shared with the dry-run workflow so
+  # the matrices cannot drift. mode=publish keeps the release assets to the six
+  # archives and checksums.txt; a cargo-xwin fallback is rejected by the
+  # reusable workflow and never runs here.
+  package:
+    name: package (six targets + checksums)
     needs: [verify-version]
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-amd64-musl
-            target: x86_64-unknown-linux-musl
-            runner: ubuntu-24.04
-            musl: true
-          - name: linux-arm64-musl
-            target: aarch64-unknown-linux-musl
-            runner: ubuntu-24.04-arm
-            musl: true
-          - name: macos-amd64
-            target: x86_64-apple-darwin
-            runner: macos-15-intel
-            deployment_target: "12.0"
-          - name: macos-arm64
-            target: aarch64-apple-darwin
-            runner: macos-15
-            deployment_target: "12.0"
-          - name: windows-amd64
-            target: x86_64-pc-windows-msvc
-            runner: windows-2022
-            crt_static: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
-
-      - name: Add Rust target
-        run: rustup target add --toolchain 1.94.1 ${{ matrix.target }}
-
-      - name: Install musl toolchain
-        if: matrix.musl == true
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y musl-tools
-
-      - name: Package target
-        shell: bash
-        env:
-          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
-        run: |
-          set -euo pipefail
-          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
-          test -n "$version"
-          target='${{ matrix.target }}'
-          if [ '${{ matrix.musl }}' = 'true' ]; then
-            under=$(printf '%s' "$target" | tr '-' '_')
-            upper=$(printf '%s' "$target" | tr 'a-z-' 'A-Z_')
-            export "CC_${under}=musl-gcc"
-            export "CARGO_TARGET_${upper}_LINKER=musl-gcc"
-          fi
-          if [ '${{ matrix.crt_static }}' = 'true' ]; then
-            upper=$(printf '%s' "$target" | tr 'a-z-' 'A-Z_')
-            export "CARGO_TARGET_${upper}_RUSTFLAGS=-C target-feature=+crt-static"
-          fi
-          bash scripts/package-rust-release.sh --version "$version" --target "$target" --out dist
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-target-${{ matrix.target }}
-          path: dist/subagent-mcp_*
-          if-no-files-found: error
-          retention-days: 7
-
-  # Native Windows arm64 is a required release gate. A cargo-xwin cross-build
-  # is not acceptance for a published artifact.
-  windows_arm64:
-    name: package (windows-arm64, native)
-    needs: [verify-version]
-    runs-on: windows-11-arm
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install pinned Rust toolchain
-        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
-
-      - name: Add Rust target
-        run: rustup target add --toolchain 1.94.1 aarch64-pc-windows-msvc
-
-      - name: Package target
-        shell: bash
-        run: |
-          set -euo pipefail
-          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
-          test -n "$version"
-          export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static"
-          bash scripts/package-rust-release.sh --version "$version" --target aarch64-pc-windows-msvc --out dist
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-target-aarch64-pc-windows-msvc
-          path: dist/subagent-mcp_*
-          if-no-files-found: error
-          retention-days: 7
-
-  checksums:
-    name: checksums (six targets)
-    needs: [build, windows_arm64]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: release-target-*
-          path: dist
-          merge-multiple: true
-
-      - name: Verify the exact six release archives
-        run: |
-          set -euo pipefail
-          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
-          test -n "$version"
-          expected=$(
-            printf '%s\n' \
-              "subagent-mcp_${version}_linux_amd64.tar.gz" \
-              "subagent-mcp_${version}_linux_arm64.tar.gz" \
-              "subagent-mcp_${version}_darwin_amd64.tar.gz" \
-              "subagent-mcp_${version}_darwin_arm64.tar.gz" \
-              "subagent-mcp_${version}_windows_amd64.zip" \
-              "subagent-mcp_${version}_windows_arm64.zip" | LC_ALL=C sort
-          )
-          actual=$(find dist -maxdepth 1 -type f -name 'subagent-mcp_*' -printf '%f\n' | LC_ALL=C sort)
-          if [ "$actual" != "$expected" ]; then
-            echo "::error::release archive set mismatch"
-            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
-            exit 1
-          fi
-          while IFS= read -r name; do
-            test -s "dist/$name" || {
-              echo "::error::missing or empty archive: $name"
-              exit 1
-            }
-          done <<< "$expected"
-
-      - name: Generate checksums.txt from the final archives
-        run: |
-          set -euo pipefail
-          cd dist
-          sha256sum subagent-mcp_* > checksums.txt
-          cat checksums.txt
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-artifacts
-          path: dist/
-          if-no-files-found: error
-          retention-days: 7
+    uses: ./.github/workflows/release-package.yml
+    permissions:
+      contents: read
+    with:
+      mode: publish
+      arm64: required
 
   publish:
     name: publish GitHub release
-    needs: [runtime-gates, checksums]
+    needs: [runtime-gates, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:

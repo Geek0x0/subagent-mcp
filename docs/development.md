@@ -14,7 +14,7 @@ Run the Rust tests that do not require the pinned Go reference binary:
 cargo test --all-targets -- --skip differential_
 ```
 
-The differential tests need the pinned reference binary; see [the CI workflow](../.github/workflows/rust-ci.yml) for its setup and platform checks. Rust does not use the former Go `-race` test command.
+The differential tests need the pinned reference binary; see [the reusable CI gates](../.github/workflows/rust-gates.yml) for its setup and platform checks. Rust does not use the former Go `-race` test command.
 
 The release archives are built with `scripts/package-rust-release.sh` and contain the binary, `README.md`, and `config.example.toml`. The README links to online reference documents so those links remain usable outside a repository checkout.
 

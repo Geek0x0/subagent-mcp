@@ -1,0 +1,221 @@
+name: Rust Gates
+
+# Reusable pre-release gates: fmt/clippy/tests on three OSes, plugin manifest
+# versions, the differential harness, and the native platform runtime/TLS trust
+# gates. rust-ci.yml calls this on every PR/push and release.yml calls it before
+# publishing, so both paths run exactly one copy of these jobs. Host packaging
+# (Task 29A) is not a gate and stays in rust-ci.yml; the six-target release
+# packaging lives in release-package.yml.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  verify:
+    name: fmt / clippy / test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      # rust-toolchain.toml pins 1.94.1 with rustfmt + clippy. Install it up
+      # front so the pinned components are present on every runner.
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: rustfmt
+        run: cargo fmt --check
+
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The fake app-server fixtures record the pinned codex-cli version. A live
+      # CLI version drift is a pre-release smoke failure, not a silent acceptance.
+      - name: codex fake fixture version
+        run: cargo test --test codex_fake -- --exact fixture_version_is_pinned
+
+      # Differential tests are cfg-gated to Linux x86_64 and need the pinned Go
+      # reference artifact. The `differential` job below fetches that artifact
+      # and runs them; every runner here skips the `differential_` test names so
+      # a missing artifact cannot turn into a silent pass. Platform files are
+      # crate-level cfg-gated, so each runner compiles all of them and runs only
+      # the applicable one.
+      - name: tests
+        run: cargo test --all-targets -- --skip differential_
+
+  # ---------------------------------------------------------------------------
+  # Plugin manifests.
+  #
+  # The version in .claude-plugin/plugin.json and .codex-plugin/plugin.json is
+  # owned by the release process: a version bump commit moves them together with
+  # Cargo.toml, and the release workflow's sync-plugin-versions job re-asserts
+  # them from the tag after publishing. Any other edit that leaves them out of
+  # step with Cargo.toml fails here instead of shipping a stale plugin version.
+  # ---------------------------------------------------------------------------
+  manifests:
+    name: plugin manifest versions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert plugin versions match Cargo.toml
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          for path in .claude-plugin/plugin.json .codex-plugin/plugin.json; do
+            actual=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "$path")
+            if [ "$actual" != "$version" ]; then
+              echo "::error file=$path::$path has version $actual, Cargo.toml has $version"
+              exit 1
+            fi
+            echo "$path: $actual"
+          done
+
+  # ---------------------------------------------------------------------------
+  # Differential harness (Task 26).
+  #
+  # The reference is the pinned Go v0.13.1 linux_amd64 release. The fetch
+  # script verifies its SHA-256 before extracting it; this job then requires the
+  # artifact (`SUBAGENT_MCP_REQUIRE_BASELINE=1`) so a download regression fails
+  # instead of skipping the differential assertions.
+  # ---------------------------------------------------------------------------
+  differential:
+    name: differential (linux x86_64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Fetch pinned Go 0.13.1 baseline
+        run: bash scripts/fetch-baseline.sh
+
+      - name: differential tests
+        env:
+          SUBAGENT_MCP_REQUIRE_BASELINE: "1"
+        run: cargo test --test differential -v
+
+  # ---------------------------------------------------------------------------
+  # Platform runtime and TLS trust gates (Task 28).
+  #
+  # Each job runs the platform's own test binary plus the shared TLS trust
+  # matrix. These are native runs: no cross-build is accepted as evidence for a
+  # target that is not the runner's architecture. Results are recorded in
+  # docs/release/live-smoke-evidence.md.
+  # ---------------------------------------------------------------------------
+  platform-linux:
+    name: platform (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            runner: ubuntu-24.04
+          - name: linux-arm64
+            runner: ubuntu-24.04-arm
+    env:
+      # The Landlock case must fail, not skip, on a CI kernel without it.
+      SUBAGENT_MCP_REQUIRE_LANDLOCK: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      # Linux has no per-user trust store in the crate's path: the tests use
+      # SSL_CERT_FILE with a generated bundle, so no store mutation is needed.
+      - name: platform runtime + TLS trust tests
+        run: cargo test --test platform_linux --test tls_platform -v
+
+  platform-macos:
+    name: platform (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macos-x86_64
+            runner: macos-15-intel
+          - name: macos-arm64
+            runner: macos-15
+    env:
+      # tls_platform installs a temporary root in the login keychain to prove
+      # Security.framework trust and distrust, then removes it.
+      SUBAGENT_MCP_PLATFORM_TRUST_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: platform runtime + TLS trust tests
+        run: cargo test --test platform_macos --test tls_platform -v
+
+      # The store case is #[ignore]d so a missing env var can never count as a
+      # pass in the general matrix. This job must run it.
+      - name: platform trust-store tests
+        run: cargo test --test tls_platform -- --ignored
+
+      - name: Remove the temporary trust root
+        if: always()
+        run: bash scripts/tls-test-fixtures.sh cleanup "subagent-mcp platform trust test CA"
+
+  platform-windows:
+    name: platform (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            runner: windows-2022
+          # GitHub-hosted Windows arm64. If this runner label is unavailable,
+          # run the same commands on a Windows arm64 VM and record the test
+          # command, binary SHA-256, Windows build number, and pass/fail result
+          # in docs/release/live-smoke-evidence.md. A cargo-xwin cross-build is
+          # not acceptance.
+          - name: windows-arm64
+            runner: windows-11-arm
+    env:
+      # tls_platform installs a temporary root in the CurrentUser Root store to
+      # prove CryptoAPI trust and distrust, then removes it.
+      SUBAGENT_MCP_PLATFORM_TRUST_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: platform runtime + TLS trust tests
+        shell: pwsh
+        run: cargo test --test platform_windows --test tls_platform -v
+
+      # Windows installs a trusted root through CryptUI, which needs an
+      # interactive desktop; GitHub's hosted runner has none, so the store test
+      # hangs. The macOS store test still runs in its job. Windows trust-store
+      # evidence is a native-VM release gate recorded in
+      # docs/release/live-smoke-evidence.md.
+      - name: Remove the temporary trust root
+        if: always()
+        shell: pwsh
+        run: |
+          certutil -delstore -user Root "subagent-mcp platform trust test CA" 2>$null
+          certutil -delstore -user Disallowed "subagent-mcp platform trust test CA" 2>$null

@@ -1,0 +1,452 @@
+name: Release Package
+
+# Reusable six-target packaging. Both callers share this one matrix so the
+# release and the dry run cannot drift:
+#
+#   - release.yml           mode=publish, arm64=required
+#   - rust-release-dry-run  mode=dry-run, arm64=optional on pull_request (the
+#                           windows-11-arm label is a preview) and required on
+#                           workflow_dispatch, with an optional cargo-xwin
+#                           fallback that is never accepted as release evidence.
+#
+# mode=publish uploads only the six archives plus checksums.txt, which is
+# exactly what the GitHub release publishes. mode=dry-run additionally carries
+# the Windows arm64 provenance marker and arm64-build-status.json so a
+# cross-built archive cannot masquerade as a passed release gate.
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "publish (release artifacts) or dry-run (packaging rehearsal)"
+        type: string
+        required: true
+      arm64:
+        description: "required fails when the Windows arm64 archive is missing; optional warns"
+        type: string
+        default: required
+      arm64_fallback:
+        description: "Build Windows arm64 with cargo-xwin (dry-run only; not release evidence)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_GATE: ${{ inputs.arm64 == 'required' }}
+
+jobs:
+  validate:
+    name: validate inputs
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Validate mode and arm64 policy
+        run: |
+          set -euo pipefail
+          case '${{ inputs.mode }}' in
+          publish | dry-run) ;;
+          *)
+            echo "::error::mode must be publish or dry-run"
+            exit 1
+            ;;
+          esac
+          case '${{ inputs.arm64 }}' in
+          required | optional) ;;
+          *)
+            echo "::error::arm64 must be required or optional"
+            exit 1
+            ;;
+          esac
+          if [ '${{ inputs.mode }}' = 'publish' ] && [ '${{ inputs.arm64_fallback }}' = 'true' ]; then
+            echo "::error::the cargo-xwin fallback is dry-run only; it is not release evidence"
+            exit 1
+          fi
+
+  build:
+    name: package (${{ matrix.name }})
+    needs: [validate]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux is musl so the published binary does not depend on the
+          # runner's glibc. Both runners are native, so ring's C/asm sources
+          # compile for the runner architecture.
+          - name: linux-amd64-musl
+            target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+            musl: true
+          - name: linux-arm64-musl
+            target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04-arm
+            musl: true
+          # macOS builds natively on each architecture. The deployment target
+          # keeps the binary runnable on macOS 12+ as required by the design.
+          - name: macos-amd64
+            target: x86_64-apple-darwin
+            runner: macos-15-intel
+            deployment_target: "12.0"
+          - name: macos-arm64
+            target: aarch64-apple-darwin
+            runner: macos-15
+            deployment_target: "12.0"
+          # Windows x86_64 builds natively. +crt-static links the static CRT.
+          - name: windows-amd64
+            target: x86_64-pc-windows-msvc
+            runner: windows-2022
+            crt_static: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Add Rust target
+        run: rustup target add --toolchain 1.94.1 ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: matrix.musl == true
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Package target
+        shell: bash
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ matrix.deployment_target }}
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          target='${{ matrix.target }}'
+          if [ '${{ matrix.musl }}' = 'true' ]; then
+            under=$(printf '%s' "$target" | tr '-' '_')
+            upper=$(printf '%s' "$target" | tr 'a-z-' 'A-Z_')
+            export "CC_${under}=musl-gcc"
+            export "CARGO_TARGET_${upper}_LINKER=musl-gcc"
+          fi
+          if [ '${{ matrix.crt_static }}' = 'true' ]; then
+            upper=$(printf '%s' "$target" | tr 'a-z-' 'A-Z_')
+            export "CARGO_TARGET_${upper}_RUSTFLAGS=-C target-feature=+crt-static"
+          fi
+          bash scripts/package-rust-release.sh --version "$version" --target "$target" --out dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.mode == 'publish' && 'release-target' || 'rust-release-target' }}-${{ matrix.target }}
+          path: dist/subagent-mcp_*
+          if-no-files-found: error
+          retention-days: 7
+
+  # Native Windows arm64 packaging. This is the acceptance path: the archive is
+  # produced by the same target it runs on.
+  #
+  # windows-11-arm is a preview label, so when the caller marks arm64 optional
+  # (pull_request dry runs) this job is continue-on-error: an unavailable runner
+  # must not block packaging work. A required gate fails the run instead.
+  windows_arm64_native:
+    name: package (windows-arm64, native)
+    needs: [validate]
+    if: ${{ inputs.arm64_fallback != true }}
+    continue-on-error: ${{ inputs.arm64 == 'optional' }}
+    runs-on: windows-11-arm
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Add Rust target
+        run: rustup target add --toolchain 1.94.1 aarch64-pc-windows-msvc
+
+      - name: Package target
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static"
+          bash scripts/package-rust-release.sh --version "$version" --target aarch64-pc-windows-msvc --out dist
+
+      # Provenance travels inside the dry-run artifact, so a downloaded archive
+      # always says which build path produced it. Publish mode ships archives
+      # only.
+      - name: Record arm64 build path
+        if: inputs.mode != 'publish'
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'native\n' > dist/WINDOWS_ARM64_BUILD_PATH
+          cat dist/WINDOWS_ARM64_BUILD_PATH
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.mode == 'publish'
+        with:
+          name: ${{ inputs.mode == 'publish' && 'release-target' || 'rust-release-target' }}-aarch64-pc-windows-msvc
+          path: dist/subagent-mcp_*
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.mode != 'publish'
+        with:
+          name: ${{ inputs.mode == 'publish' && 'release-target' || 'rust-release-target' }}-aarch64-pc-windows-msvc
+          path: |
+            dist/subagent-mcp_*
+            dist/WINDOWS_ARM64_BUILD_PATH
+          if-no-files-found: error
+          retention-days: 7
+
+  # Fallback only: cross-build Windows arm64 on Linux with cargo-xwin. The
+  # archive from this job is NOT acceptance until it has been run on a Windows
+  # arm64 machine and recorded in docs/release/windows-arm64-evidence.md.
+  windows_arm64_xwin:
+    name: package (windows-arm64, cargo-xwin fallback)
+    needs: [validate]
+    if: ${{ inputs.mode == 'dry-run' && inputs.arm64_fallback == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install 1.94.1 --profile minimal --component rustfmt --component clippy
+
+      - name: Add Rust target
+        run: rustup target add --toolchain 1.94.1 aarch64-pc-windows-msvc
+
+      - name: Install cross linker
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm
+
+      - name: Install cargo-xwin
+        run: cargo install cargo-xwin --locked
+
+      - name: Package target
+        shell: bash
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          export CARGO_TARGET_AARCH64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static"
+          bash scripts/package-rust-release.sh --version "$version" --target aarch64-pc-windows-msvc --out dist --cargo "cargo xwin"
+
+      - name: Record arm64 build path
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'cargo-xwin\n' > dist/WINDOWS_ARM64_BUILD_PATH
+          cat dist/WINDOWS_ARM64_BUILD_PATH
+
+      - name: Record fallback evidence requirement
+        shell: bash
+        run: |
+          {
+            echo "### Windows arm64 used the cargo-xwin fallback"
+            echo
+            echo "This archive is a cross-build and is **not** acceptance evidence."
+            echo "The checksums job fails this run and records"
+            echo "\`dist/arm64-build-status.json\` with"
+            echo "\`\"acceptance\": \"requires-vm-evidence\"\`."
+            echo "Run the archive on a Windows arm64 machine and fill in"
+            echo "\`docs/release/windows-arm64-evidence.md\` with the archive SHA-256,"
+            echo "Windows build number, \`subagent-mcp.exe --version\` output, and the"
+            echo "MCP stdio handshake result."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.mode == 'publish' && 'release-target' || 'rust-release-target' }}-aarch64-pc-windows-msvc
+          path: |
+            dist/subagent-mcp_*
+            dist/WINDOWS_ARM64_BUILD_PATH
+          if-no-files-found: error
+          retention-days: 7
+
+  # One place generates checksums.txt from the final archives. It downloads the
+  # artifacts rather than rebuilding, so the uploaded checksums cover exactly
+  # the archives in the final artifact.
+  #
+  # In dry-run mode it also owns the Windows arm64 provenance gate:
+  #   - dist/WINDOWS_ARM64_BUILD_PATH is written by the arm64 job that produced
+  #     the archive (native or cargo-xwin) and travels inside that artifact.
+  #   - dist/arm64-build-status.json is the machine-readable verdict and is
+  #     uploaded with the archives.
+  #   - A cargo-xwin archive is packaged for VM evidence but fails this job:
+  #     cross-built is not release evidence.
+  #   - A missing arm64 archive fails when arm64 is required and is only a
+  #     warning when it is optional, where the preview windows-11-arm label must
+  #     not block packaging work.
+  checksums:
+    name: checksums (six targets)
+    needs: [validate, build, windows_arm64_native, windows_arm64_xwin]
+    if: ${{ always() && !cancelled() && needs.validate.result == 'success' && needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.mode == 'publish' && 'release-target' || 'rust-release-target' }}-*
+          path: dist
+          merge-multiple: true
+
+      - name: Verify archive set and arm64 build path
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+
+          base_archives=(
+            "subagent-mcp_${version}_linux_amd64.tar.gz"
+            "subagent-mcp_${version}_linux_arm64.tar.gz"
+            "subagent-mcp_${version}_darwin_amd64.tar.gz"
+            "subagent-mcp_${version}_darwin_arm64.tar.gz"
+            "subagent-mcp_${version}_windows_amd64.zip"
+          )
+          arm64_archive="subagent-mcp_${version}_windows_arm64.zip"
+
+          # The five unconditional targets must exist and be non-empty; the
+          # exact file set is checked below.
+          for name in "${base_archives[@]}"; do
+            test -s "dist/$name" || {
+              echo "::error::missing or empty archive: $name"
+              exit 1
+            }
+          done
+
+          arm64_present=false
+          if [ -f "dist/$arm64_archive" ]; then
+            arm64_present=true
+            test -s "dist/$arm64_archive" || {
+              echo "::error::zero-byte archive: $arm64_archive"
+              exit 1
+            }
+          fi
+
+          # Provenance is a dry-run concept: publish ships only the archives.
+          build_path=missing
+          if [ '${{ inputs.mode }}' != 'publish' ]; then
+            if [ -f dist/WINDOWS_ARM64_BUILD_PATH ]; then
+              build_path=$(tr -d '[:space:]' < dist/WINDOWS_ARM64_BUILD_PATH)
+            fi
+            case "$build_path" in
+            native | cargo-xwin | missing) ;;
+            *)
+              echo "::error::unknown Windows arm64 build path: $build_path"
+              exit 1
+              ;;
+            esac
+            if [ "$arm64_present" = true ] && [ "$build_path" = missing ]; then
+              echo "::error::$arm64_archive has no WINDOWS_ARM64_BUILD_PATH provenance marker"
+              exit 1
+            fi
+            if [ "$arm64_present" = false ] && [ "$build_path" != missing ]; then
+              echo "::error::stale WINDOWS_ARM64_BUILD_PATH=$build_path with no arm64 archive"
+              exit 1
+            fi
+          fi
+
+          if [ "$arm64_present" = false ] && [ "$RELEASE_GATE" = true ]; then
+            echo "::error::release gate requires the native aarch64-pc-windows-msvc archive"
+            exit 1
+          fi
+          if [ "$arm64_present" = false ]; then
+            echo "::warning::Windows arm64 archive missing (windows-11-arm unavailable?); not required here"
+          fi
+
+          # Exact file set: five archives, plus arm64 only when it was built.
+          expected_list=$(printf '%s\n' "${base_archives[@]}")
+          if [ "$arm64_present" = true ]; then
+            expected_list=$(printf '%s\n%s\n' "$expected_list" "$arm64_archive")
+          fi
+          expected=$(printf '%s\n' "$expected_list" | LC_ALL=C sort)
+          actual=$(find dist -maxdepth 1 -type f -name 'subagent-mcp_*' -printf '%f\n' | LC_ALL=C sort)
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::archive set mismatch"
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+
+          if [ '${{ inputs.mode }}' != 'publish' ]; then
+            case "$build_path" in
+            native) acceptance=native ;;
+            cargo-xwin) acceptance=requires-vm-evidence ;;
+            *) acceptance=missing ;;
+            esac
+            cat > dist/arm64-build-status.json <<JSON
+          {
+            "target": "aarch64-pc-windows-msvc",
+            "mode": "${{ inputs.mode }}",
+            "release_gate": $RELEASE_GATE,
+            "build_path": "$build_path",
+            "archive_present": $arm64_present,
+            "archive": "$arm64_archive",
+            "acceptance": "$acceptance",
+            "runtime_evidence": "docs/release/windows-arm64-evidence.md"
+          }
+          JSON
+            printf 'Windows arm64 build path: %s (acceptance: %s)\n' "$build_path" "$acceptance"
+          fi
+
+          find dist -maxdepth 1 -type f -printf '%f %s bytes\n' | LC_ALL=C sort
+
+      - name: Generate checksums.txt
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum subagent-mcp_* > checksums.txt
+          cat checksums.txt
+
+      - name: Summarize arm64 status
+        if: always() && inputs.mode != 'publish'
+        run: |
+          set -euo pipefail
+          {
+            echo "### Rust release dry run"
+            echo
+            if [ -f dist/arm64-build-status.json ]; then
+              cat dist/arm64-build-status.json
+            else
+              echo "arm64 build status unavailable (verification failed before it was written)"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: inputs.mode == 'publish'
+        with:
+          name: release-artifacts
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.mode != 'publish'
+        with:
+          name: rust-release-dry-run
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+      # Cross-built arm64 must never look like a passed release gate. The
+      # artifact is still uploaded above so the VM evidence run has a binary.
+      - name: Reject cross-built arm64 as release evidence
+        if: always() && inputs.mode != 'publish'
+        run: |
+          set -euo pipefail
+          if [ ! -f dist/WINDOWS_ARM64_BUILD_PATH ]; then
+            exit 0
+          fi
+          build_path=$(tr -d '[:space:]' < dist/WINDOWS_ARM64_BUILD_PATH)
+          if [ "$build_path" = cargo-xwin ]; then
+            echo "::error::Windows arm64 was cross-built with cargo-xwin; not release evidence until docs/release/windows-arm64-evidence.md is filled in from a Windows arm64 VM"
+            exit 1
+          fi

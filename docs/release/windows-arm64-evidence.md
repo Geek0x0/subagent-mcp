@@ -8,7 +8,8 @@ must be recorded before it can be treated as a release asset. The acceptance
 path is a native build and native run on Windows arm64. A `cargo-xwin`
 cross-build is a build-path fallback only; it is **not** runtime evidence.
 
-- Workflow: `.github/workflows/rust-release-dry-run.yml`
+- Workflow: `.github/workflows/rust-release-dry-run.yml`, which calls the shared
+  `.github/workflows/release-package.yml` matrix
 - Packaging script: `scripts/package-rust-release.sh`
 - Platform runtime gate (separate, Task 28):
   `docs/release/live-smoke-evidence.md`
@@ -40,7 +41,7 @@ set or a non-empty size does not match.
 The Windows arm64 artifact additionally carries a `WINDOWS_ARM64_BUILD_PATH`
 marker (`native` or `cargo-xwin`) written by the job that built it. The
 `checksums` job copies that marker into the dry-run artifact, writes
-`arm64-build-status.json` (`target`, `event`, `release_gate`, `build_path`,
+`arm64-build-status.json` (`target`, `mode`, `release_gate`, `build_path`,
 `archive_present`, `acceptance`), and fails the run when the marker says
 `cargo-xwin`. A six-archive set is required on `workflow_dispatch`; on
 `pull_request` a missing arm64 archive is a warning so the preview

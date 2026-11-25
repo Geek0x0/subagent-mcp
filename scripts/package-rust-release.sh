@@ -13,8 +13,9 @@
 #   subagent-mcp_<version>_<os>_<arch>.zip      (Windows, contains subagent-mcp.exe)
 #
 # This script does not tag, publish, or touch scripts/release.lock or the plugin
-# pin. It is used by .github/workflows/rust-release-dry-run.yml (six targets)
-# and .github/workflows/rust-ci.yml (host target only).
+# pin. It is used by .github/workflows/release-package.yml (six targets, for
+# both the release and the dry run) and .github/workflows/rust-ci.yml (host
+# target only).
 
 set -euo pipefail
 

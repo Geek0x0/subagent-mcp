@@ -14,8 +14,8 @@ substitute a cross-build for a native run.
   §5.6/§8.2 (process cleanup), §7 (security design), §8.5 (release matrix).
 - Tests: `tests/platform_linux.rs`, `tests/platform_macos.rs`,
   `tests/platform_windows.rs`, `tests/tls_platform.rs`.
-- CI jobs: `.github/workflows/rust-ci.yml` → `platform-linux`, `platform-macos`,
-  `platform-windows`.
+- CI jobs: `.github/workflows/rust-gates.yml` → `platform-linux`, `platform-macos`,
+  `platform-windows` (called by both `rust-ci.yml` and `release.yml`).
 - Fixtures / trust-root helper: `scripts/tls-test-fixtures.sh`.
 - TLS verifier spike (Task 8): `docs/release/tls-verifier-spike.md`.
 

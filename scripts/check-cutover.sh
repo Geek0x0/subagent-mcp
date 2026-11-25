@@ -28,11 +28,11 @@ check "go.mod is deleted" test ! -e go.mod
 check "go.sum is deleted" test ! -e go.sum
 
 check "release.yml does not build Go" bash -c '! grep -Eq "go build|CGO_ENABLED|cmd/subagent-mcp/main\\.go" .github/workflows/release.yml'
-check "release.yml calls the reusable runtime gates" grep -q 'uses: \./\.github/workflows/rust-ci\.yml' .github/workflows/release.yml
+check "release.yml calls the reusable runtime gates" grep -q 'uses: \./\.github/workflows/rust-gates\.yml' .github/workflows/release.yml
 check "publish job depends on runtime-gates" grep -Eq 'needs:.*runtime-gates' .github/workflows/release.yml
 check "publish uses gh release create" grep -q 'gh release create' .github/workflows/release.yml
 check "publish is not clobbering" bash -c '! grep -q -- "--clobber" .github/workflows/release.yml'
-check "rust-ci exposes workflow_call" grep -q 'workflow_call:' .github/workflows/rust-ci.yml
+check "runtime gates expose workflow_call" grep -q 'workflow_call:' .github/workflows/rust-gates.yml
 
 check "release.lock still pins 0.13.1" grep -q '^version 0\.13\.1$' scripts/release.lock
 check "plugin still pins 0.13.1" grep -q '"version": "0\.13\.1"' .claude-plugin/plugin.json
