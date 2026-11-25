@@ -529,7 +529,7 @@ fn serve_answers_initialize_and_lists_tools() {
     let mut server = Server::start(&config, home.path(), &[(API_KEY, API_SECRET)]);
     let init = server.initialize();
     assert_eq!(init["result"]["serverInfo"]["name"], "subagent-mcp");
-    assert_eq!(init["result"]["serverInfo"]["version"], "0.14.4");
+    assert_eq!(init["result"]["serverInfo"]["version"], "0.15.0");
     assert_eq!(init["result"]["capabilities"], json!({"tools": {}}));
 
     server.send(&json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}));

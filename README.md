@@ -8,6 +8,7 @@ An MCP server that runs coding-agent sessions with shell and file tools. Choose 
 | `responses` | OpenAI Responses API | OpenAI |
 | `messages` | Anthropic Messages API | Anthropic |
 | `codex-app-server` | Codex app-server over stdio | Local Codex CLI (experimental) |
+| `acp` | Agent Client Protocol over stdio | Devin CLI, Antigravity CLI, Claude Code ACP adapter (experimental) |
 
 Native providers use the built-in tools, approvals, Linux Landlock write sandbox, progress notifications, and session recording. Codex uses its own tools, sandbox, and login.
 
@@ -135,6 +136,34 @@ Auto mode sends the task prompt and validated working directory to the configure
 Enable the Codex block in `config.example.toml`, install Codex, and run `codex login` as the user launching the server. Model IDs must match that Codex installation; `--check-config` reports missing IDs. This provider is experimental and inherits the user's Codex config, plugins, hooks, skills, MCP servers, and AGENTS.md.
 
 Codex owns its tools, sandbox, and rollout. Shell, file-change, and network approvals are relayed; other interactive requests are unsupported. See [Codex setup and differences](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/configuration.md#codex-app-server-provider).
+
+### ACP agents
+
+`api = "acp"` runs any [Agent Client Protocol](https://agentclientprotocol.com) agent as a child process over stdio, one process per session, started in the session `cwd`. Like Codex, the agent uses its own tools, login, and loop; no `env_key` or `base_url` is needed. This provider is experimental.
+
+[Devin CLI](https://docs.devin.ai/cli/reference/commands) (sign in first with `devin auth login`, or set `WINDSURF_API_KEY`):
+
+```toml
+[providers.devin]
+api = "acp"
+command = "devin"
+args = ["acp"]                 # e.g. ["acp", "--model", "opus"]
+default_model = "default"
+models = [{ id = "default", description = "Devin's configured default model" }]
+```
+
+[Antigravity CLI](https://antigravity.google/docs/cli/acp) (sign in once with `agy` or `agy acp --login`):
+
+```toml
+[providers.agy]
+api = "acp"
+command = "agy"
+args = ["acp"]
+default_model = "default"
+models = [{ id = "default", description = "Antigravity's configured default model" }]
+```
+
+Use an absolute `command` path if the MCP client launches the server without your shell's `PATH`. Permission requests from the agent are relayed through the session's approval policy. `--check-config` starts the agent, reports its name, version, and auth methods, and warns about model IDs the agent does not advertise. See [ACP agents](https://github.com/Geek0x0/subagent-mcp/blob/main/docs/reference/configuration.md#acp-agents-experimental) for all fields and limitations.
 
 ## Worker policy
 
