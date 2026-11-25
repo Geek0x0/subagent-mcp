@@ -48,6 +48,36 @@ jobs:
         run: cargo test --all-targets -- --skip differential_
 
   # ---------------------------------------------------------------------------
+  # Plugin manifests.
+  #
+  # The version in .claude-plugin/plugin.json and .codex-plugin/plugin.json is
+  # owned by the release process: a version bump commit moves them together with
+  # Cargo.toml, and the release workflow's sync-plugin-versions job re-asserts
+  # them from the tag after publishing. Any other edit that leaves them out of
+  # step with Cargo.toml fails here instead of shipping a stale plugin version.
+  # ---------------------------------------------------------------------------
+  manifests:
+    name: plugin manifest versions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assert plugin versions match Cargo.toml
+        run: |
+          set -euo pipefail
+          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$version"
+          for path in .claude-plugin/plugin.json .codex-plugin/plugin.json; do
+            actual=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "$path")
+            if [ "$actual" != "$version" ]; then
+              echo "::error file=$path::$path has version $actual, Cargo.toml has $version"
+              exit 1
+            fi
+            echo "$path: $actual"
+          done
+
+  # ---------------------------------------------------------------------------
   # Differential harness (Task 26).
   #
   # The reference is the pinned Go v0.13.1 linux_amd64 release. The fetch
