@@ -10,6 +10,9 @@ name: Release
 #
 # The runtime-gates job calls rust-ci.yml, which runs the native Linux/macOS/
 # Windows runtime and TLS trust gates. Publishing is blocked on it.
+#
+# The last job, sync-plugin-versions, runs only after publish and pins the plugin
+# manifests and scripts/release.lock to the tag, then pushes that to main.
 
 on:
   push:
@@ -232,11 +235,13 @@ jobs:
             --verify-tag \
             --generate-notes
 
-  # Keep the Claude/Codex plugin manifests in step with the published tag.
-  # Runs only after everything above succeeded (publish needs the whole chain).
-  # Pushing to main cannot re-trigger this workflow: it listens to tag pushes.
+  # Keep the Claude/Codex plugin manifests and the launcher's release lock in
+  # step with the published tag. Runs only after everything above succeeded
+  # (publish needs the whole chain, and the lock needs the published
+  # checksums.txt). Pushing to main cannot re-trigger this workflow: it listens
+  # to tag pushes.
   sync-plugin-versions:
-    name: sync plugin manifests
+    name: sync plugin manifests and release lock
     needs: [publish]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -275,6 +280,19 @@ jobs:
           print("changed: " + (", ".join(changed) if changed else "(none)"))
           PY
 
+      # The launcher pins the binary it downloads in scripts/release.lock, not
+      # in the manifests, so a tag without this step keeps serving the old
+      # binary. The script reads the release's checksums.txt, so it can only run
+      # after publish.
+      - name: Pin release lock to the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version=${TAG#v}
+          test -n "$version"
+          sh scripts/update-release-lock.sh "$version"
+
       - name: Commit and push
         env:
           TAG: ${{ github.ref_name }}
@@ -282,13 +300,13 @@ jobs:
           set -euo pipefail
           version=${TAG#v}
           if git diff --quiet; then
-            echo "plugin manifests already at $version; nothing to push"
+            echo "manifests and release lock already at $version; nothing to push"
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add .claude-plugin/plugin.json .codex-plugin/plugin.json
-          git commit -m "chore: sync plugin manifests to v$version"
+          git add .claude-plugin/plugin.json .codex-plugin/plugin.json scripts/release.lock
+          git commit -m "chore: sync plugin manifests and release lock to v$version"
           if ! git push origin HEAD:main; then
             echo "push rejected; rebasing on main and retrying once"
             git pull --rebase origin main
