@@ -321,11 +321,7 @@ async fn run_async<W: Write, F: AdapterFactory + ?Sized>(
         warn_if_cleartext(out, name, &provider.base_url);
 
         if matches!(provider.api, Api::CodexAppServer | Api::Acp) {
-            let (auth_ok, check_failed) = if provider.api == Api::Acp {
-                check_acp(out, name, provider, live, factory).await
-            } else {
-                check_codex(out, name, provider, live, factory).await
-            };
+            let (auth_ok, check_failed) = check_agent(out, name, provider, live, factory).await;
             if auth_ok {
                 checked += 1;
             }
@@ -470,33 +466,12 @@ async fn run_async<W: Write, F: AdapterFactory + ?Sized>(
     if status == "FAIL" { 1 } else { 0 }
 }
 
-/// Check a Codex provider: `auth`, `model/list`, and an optional live turn.
-/// Returns `(auth_ok, failed)`.
-async fn check_codex<W: Write, F: AdapterFactory + ?Sized>(
-    out: &mut W,
-    name: &str,
-    provider: &ProviderConfig,
-    live: bool,
-    factory: &F,
-) -> (bool, bool) {
-    check_agent(out, name, provider, live, factory).await
-}
-
-/// Check an ACP provider: spawn the agent and `initialize` it through
-/// [`AuthChecker::check_auth`], report its `agentInfo` and `authMethods`,
-/// validate the configured models, and optionally run a live turn. Counted
-/// like Codex: checked once auth passes, failed on any error. Login happens in
-/// the agent itself, so there is no key line.
-async fn check_acp<W: Write, F: AdapterFactory + ?Sized>(
-    out: &mut W,
-    name: &str,
-    provider: &ProviderConfig,
-    live: bool,
-    factory: &F,
-) -> (bool, bool) {
-    check_agent(out, name, provider, live, factory).await
-}
-
+/// Check an agent provider (Codex or ACP): `auth`, model validation, and an
+/// optional live turn. Returns `(auth_ok, failed)`. Codex lists models with
+/// `model/list` and prints a key line; ACP spawns the agent and `initialize`s it
+/// through [`AuthChecker::check_auth`], reporting its `agentInfo` and
+/// `authMethods` (login happens in the agent, so there is no key line). Both
+/// count checked once auth passes and failed on any error.
 async fn check_agent<W: Write, F: AdapterFactory + ?Sized>(
     out: &mut W,
     name: &str,

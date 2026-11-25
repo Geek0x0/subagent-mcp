@@ -21,6 +21,7 @@ use super::events::{self, Stop, ToolCallCache};
 use super::rpc::{Inbound, Peer, RpcError};
 use crate::provider::types::{AuthStatus, ProviderError, Thread, ThreadCallbacks, ThreadOptions};
 use crate::util::approval::Approver;
+use crate::util::json::go_quote;
 use crate::util::run::RunContext;
 
 /// ACP protocol version sent and accepted.
@@ -527,8 +528,9 @@ pub async fn start(
             Ok(_) => {}
             Err(e) if e.code == METHOD_NOT_FOUND || e.code == INVALID_PARAMS => {
                 warnings.push(format!(
-                    "acp: model {:?} could not be set and was ignored: {}",
-                    opts.model, e.message
+                    "acp: model {} could not be set and was ignored: {}",
+                    go_quote(&opts.model),
+                    e.message
                 ));
             }
             Err(e) => return Err(proc.call_error("session/set_model", &e).await),
