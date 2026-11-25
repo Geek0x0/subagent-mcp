@@ -148,6 +148,16 @@ pub fn permission_request(thread_id: &str, params: &Value) -> ApprovalRequest {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
+    let command = match params
+        .pointer("/toolCall/rawInput")
+        .filter(|v| !v.is_null())
+    {
+        Some(raw) => match raw.get("command").and_then(Value::as_str) {
+            Some(c) => c.to_string(),
+            None => raw.to_string(),
+        },
+        None => title.clone(),
+    };
     let paths = params
         .pointer("/toolCall/locations")
         .and_then(Value::as_array)
@@ -164,7 +174,7 @@ pub fn permission_request(thread_id: &str, params: &Value) -> ApprovalRequest {
             .filter(|k| !k.is_empty())
             .unwrap_or("acp")
             .to_string(),
-        command: Some(title.clone()),
+        command: Some(command),
         paths,
         reason: title,
     }
@@ -254,5 +264,28 @@ mod tests {
         );
         assert_eq!(stop_reason(&json!({"stopReason": "weird"})), Stop::Ok);
         assert_eq!(stop_reason(&json!({"stopReason": "end_turn"})), Stop::Ok);
+    }
+
+    #[test]
+    fn permission_command_from_raw_input() {
+        let p = json!({"toolCall": {"title": "Run ls", "kind": "execute",
+            "rawInput": {"command": "ls -la", "description": "list"}}});
+        let r = permission_request("t", &p);
+        assert_eq!(r.command.as_deref(), Some("ls -la"));
+        assert_eq!(r.reason, "Run ls");
+
+        let p = json!({"toolCall": {"title": "Edit a.rs", "kind": "edit",
+            "rawInput": {"file_path": "a.rs", "old": 1}}});
+        let r = permission_request("t", &p);
+        assert_eq!(
+            r.command.as_deref(),
+            Some(r#"{"file_path":"a.rs","old":1}"#)
+        );
+        assert_eq!(r.reason, "Edit a.rs");
+
+        let p = json!({"toolCall": {"title": "Run ls", "kind": "execute"}});
+        let r = permission_request("t", &p);
+        assert_eq!(r.command.as_deref(), Some("Run ls"));
+        assert_eq!(r.reason, "Run ls");
     }
 }
