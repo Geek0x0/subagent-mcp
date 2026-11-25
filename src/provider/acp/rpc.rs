@@ -1,7 +1,9 @@
 //! Generic line-delimited JSON-RPC 2.0 peer over an `AsyncRead`/`AsyncWrite`
 //! pair. It has no ACP knowledge: outbound calls are matched to responses by
-//! id, and inbound notifications and requests are forwarded, in order, on an
-//! unbounded channel. Lines that are not JSON objects (agent banners, logs,
+//! id, and inbound notifications and requests are forwarded, in order, on a
+//! bounded channel. When the channel is full notifications are dropped
+//! (counted, logged once); requests are never dropped. A line longer than
+//! [`MAX_FRAME`] closes the connection. Lines that are not JSON objects (agent banners, logs,
 //! non-UTF-8 bytes) are skipped.
 //!
 //! Frames are written by a dedicated writer task, so a caller that is
@@ -29,6 +31,11 @@ pub const CODE_CLOSED: i64 = -32099;
 pub const CODE_CANCELLED: i64 = -32098;
 /// Code for calls abandoned because the run deadline passed.
 pub const CODE_DEADLINE: i64 = -32097;
+
+/// Largest inbound line accepted, matching the HTTP/SSE line limit.
+pub const MAX_FRAME: usize = crate::provider::sse::SSE_MAX_LINE;
+/// Capacity of the inbound channel.
+pub const INBOUND_CAPACITY: usize = 1024;
 
 /// A message the far end initiated.
 #[derive(Debug, Clone, PartialEq)]
@@ -133,7 +140,21 @@ pub struct Peer {
 impl Peer {
     /// Start the reader and writer tasks and return the peer plus the inbound
     /// stream. The stream ends when the reader hits EOF or a read error.
-    pub fn spawn<R, W>(r: R, mut w: W) -> (Peer, mpsc::UnboundedReceiver<Inbound>)
+    pub fn spawn<R, W>(r: R, w: W) -> (Peer, mpsc::Receiver<Inbound>)
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self::spawn_with_limits(r, w, MAX_FRAME, INBOUND_CAPACITY)
+    }
+
+    /// [`Peer::spawn`] with an explicit line limit and channel capacity.
+    pub fn spawn_with_limits<R, W>(
+        r: R,
+        mut w: W,
+        max_frame: usize,
+        capacity: usize,
+    ) -> (Peer, mpsc::Receiver<Inbound>)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
@@ -156,16 +177,29 @@ impl Peer {
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
         });
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(capacity.max(1));
         let reader = Arc::clone(&inner);
         tokio::spawn(async move {
             let mut r = BufReader::new(r);
             let mut buf = Vec::new();
-            loop {
-                buf.clear();
-                match r.read_until(b'\n', &mut buf).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => dispatch(&reader, &tx, &buf),
+            let mut dropped = 0u64;
+            while let Ok(true) = read_line_bounded(&mut r, &mut buf, max_frame).await {
+                if let Some(msg) = dispatch(&reader, &buf) {
+                    match msg {
+                        Inbound::Request { .. } => {
+                            if tx.send(msg).await.is_err() {
+                                continue;
+                            }
+                        }
+                        Inbound::Notification { .. } => {
+                            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(msg) {
+                                dropped += 1;
+                                if dropped == 1 {
+                                    eprintln!("acp: inbound channel full; dropping notifications");
+                                }
+                            }
+                        }
+                    }
                 }
             }
             reader.close();
@@ -256,9 +290,38 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-fn dispatch(inner: &Inner, tx: &mpsc::UnboundedSender<Inbound>, line: &[u8]) {
+/// Read one `\n`-terminated line into `buf` (cleared first) without ever
+/// holding more than `max` bytes. `Ok(false)` on EOF, a read error, or a line
+/// over `max`; a final unterminated line at EOF is still returned.
+async fn read_line_bounded<R: AsyncRead + Unpin>(
+    r: &mut BufReader<R>,
+    buf: &mut Vec<u8>,
+    max: usize,
+) -> std::io::Result<bool> {
+    buf.clear();
+    loop {
+        let chunk = r.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(!buf.is_empty());
+        }
+        let (take, done) = match chunk.iter().position(|&b| b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        if buf.len() + take > max.saturating_add(1) || (!done && buf.len() + take > max) {
+            return Ok(false);
+        }
+        buf.extend_from_slice(&chunk[..take]);
+        r.consume(take);
+        if done {
+            return Ok(true);
+        }
+    }
+}
+
+fn dispatch(inner: &Inner, line: &[u8]) -> Option<Inbound> {
     let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(line) else {
-        return;
+        return None;
     };
     let method = obj
         .get("method")
@@ -267,16 +330,12 @@ fn dispatch(inner: &Inner, tx: &mpsc::UnboundedSender<Inbound>, line: &[u8]) {
     let params = obj.remove("params").unwrap_or(Value::Null);
     match (method, obj.remove("id")) {
         (Some(method), Some(id)) if !id.is_null() => {
-            let _ = tx.send(Inbound::Request { id, method, params });
+            return Some(Inbound::Request { id, method, params });
         }
-        (Some(method), _) => {
-            let _ = tx.send(Inbound::Notification { method, params });
-        }
+        (Some(method), _) => return Some(Inbound::Notification { method, params }),
         (None, Some(id)) => {
-            let Some(id) = id.as_u64() else { return };
-            let Some(waiter) = inner.pending.lock().unwrap().remove(&id) else {
-                return;
-            };
+            let id = id.as_u64()?;
+            let waiter = inner.pending.lock().unwrap().remove(&id)?;
             let reply = match obj.get("error") {
                 Some(e) if !e.is_null() => Err(RpcError::from_value(e)),
                 _ => Ok(obj.remove("result").unwrap_or(Value::Null)),
@@ -284,5 +343,76 @@ fn dispatch(inner: &Inner, tx: &mpsc::UnboundedSender<Inbound>, line: &[u8]) {
             let _ = waiter.send(reply);
         }
         (None, None) => {}
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::sse::SSE_MAX_LINE;
+    use tokio::io::AsyncWriteExt;
+
+    fn ctx() -> RunContext {
+        RunContext {
+            cancel: tokio_util::sync::CancellationToken::new(),
+            deadline: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn oversized_line_closes_peer() {
+        let (mut agent, ours) = tokio::io::duplex(1 << 16);
+        let (r, w) = tokio::io::split(ours);
+        let (peer, mut rx) = Peer::spawn_with_limits(r, w, 1024, 16);
+        agent.write_all(&vec![b'x'; 4096]).await.unwrap();
+        let end = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv()).await;
+        assert!(matches!(end, Ok(None)), "inbound must end");
+        assert!(peer.closed());
+    }
+
+    #[tokio::test]
+    async fn notification_flood_does_not_block_requests() {
+        let (agent, ours) = tokio::io::duplex(1 << 20);
+        let (r, w) = tokio::io::split(ours);
+        let (ar, mut aw) = tokio::io::split(agent);
+        let (peer, mut rx) = Peer::spawn_with_limits(r, w, SSE_MAX_LINE, 4);
+        let call = tokio::spawn({
+            let peer = peer.clone();
+            async move { peer.call(&ctx(), "ping", json!({})).await }
+        });
+        let mut ar = BufReader::new(ar);
+        let mut line = String::new();
+        ar.read_line(&mut line).await.unwrap();
+        let id = serde_json::from_str::<Value>(&line).unwrap()["id"].clone();
+        let mut out = String::new();
+        for _ in 0..100 {
+            out.push_str("{\"jsonrpc\":\"2.0\",\"method\":\"n\",\"params\":{}}\n");
+        }
+        out.push_str("{\"jsonrpc\":\"2.0\",\"id\":\"r1\",\"method\":\"req\",\"params\":{}}\n");
+        out.push_str(&format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"result\":7}}\n"
+        ));
+        aw.write_all(out.as_bytes()).await.unwrap();
+        let mut saw_request = false;
+        let mut notes = 0;
+        while let Ok(Some(msg)) =
+            tokio::time::timeout(std::time::Duration::from_millis(500), rx.recv()).await
+        {
+            match msg {
+                Inbound::Request { ref method, .. } if method == "req" => {
+                    saw_request = true;
+                    break;
+                }
+                _ => notes += 1,
+            }
+        }
+        assert!(notes <= 100);
+        let res = tokio::time::timeout(std::time::Duration::from_secs(2), call)
+            .await
+            .expect("call blocked by notification flood")
+            .unwrap();
+        assert_eq!(res.unwrap(), json!(7));
+        assert!(saw_request, "request must never be dropped");
     }
 }

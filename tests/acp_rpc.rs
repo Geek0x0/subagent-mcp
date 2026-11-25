@@ -31,7 +31,7 @@ impl Agent {
     }
 }
 
-fn pair() -> (Peer, tokio::sync::mpsc::UnboundedReceiver<Inbound>, Agent) {
+fn pair() -> (Peer, tokio::sync::mpsc::Receiver<Inbound>, Agent) {
     let (client_read, agent_write) = tokio::io::duplex(64 * 1024);
     let (client_write, agent_read) = tokio::io::duplex(64 * 1024);
     let (peer, rx) = Peer::spawn(client_read, client_write);

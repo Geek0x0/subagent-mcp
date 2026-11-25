@@ -13,7 +13,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::io::{AsyncReadExt, AsyncWrite};
 use tokio::process::{Child, ChildStderr, ChildStdin, Command};
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::Receiver;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -270,7 +270,7 @@ impl AsyncWrite for SharedStdin {
 struct Process {
     name: String,
     peer: Peer,
-    inbound: UnboundedReceiver<Inbound>,
+    inbound: Receiver<Inbound>,
     slot: Arc<ChildSlot>,
     stdin: Arc<Mutex<Option<ChildStdin>>>,
     tail: Arc<Mutex<StderrTail>>,
