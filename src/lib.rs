@@ -20,4 +20,4 @@ pub mod sandbox;
 pub mod tools;
 pub mod util;
 
-pub const VERSION: &str = "0.15.0";
+pub const VERSION: &str = "0.15.1";
