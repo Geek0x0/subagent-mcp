@@ -1,15 +1,22 @@
 //! Generic line-delimited JSON-RPC 2.0 peer over an `AsyncRead`/`AsyncWrite`
 //! pair. It has no ACP knowledge: outbound calls are matched to responses by
 //! id, and inbound notifications and requests are forwarded, in order, on an
-//! unbounded channel. Lines that are not JSON objects (agent banners, logs)
-//! are skipped.
+//! unbounded channel. Lines that are not JSON objects (agent banners, logs,
+//! non-UTF-8 bytes) are skipped.
+//!
+//! Frames are written by a dedicated writer task, so a caller that is
+//! cancelled mid-write never leaves a partial line on the wire.
+//!
+//! Dropping every [`Peer`] handle does not close the transport: the reader
+//! and writer tasks live until the reader hits EOF (for a child process, until
+//! it exits or is killed).
 
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
@@ -17,8 +24,8 @@ use crate::util::run::RunContext;
 
 /// Code for calls failed because the connection closed.
 pub const CODE_CLOSED: i64 = -32099;
-/// Code for calls abandoned because the caller's context was cancelled or its
-/// deadline passed.
+/// Code for calls abandoned because the caller's context was explicitly
+/// cancelled.
 pub const CODE_CANCELLED: i64 = -32098;
 /// Code for calls abandoned because the run deadline passed.
 pub const CODE_DEADLINE: i64 = -32097;
@@ -80,10 +87,10 @@ impl fmt::Display for RpcError {
 impl std::error::Error for RpcError {}
 
 type Reply = Result<Value, RpcError>;
-type Writer = Box<dyn AsyncWrite + Unpin + Send>;
+type Frame = (Vec<u8>, oneshot::Sender<bool>);
 
 struct Inner {
-    writer: tokio::sync::Mutex<Writer>,
+    frames: mpsc::UnboundedSender<Frame>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     next_id: AtomicU64,
     closed: AtomicBool,
@@ -98,19 +105,22 @@ impl Inner {
         }
     }
 
+    /// Queue one frame and wait for the writer task to finish it. Dropping
+    /// this future does not abort the frame: the writer task owns the bytes.
     async fn write(&self, msg: &Value) -> Result<(), RpcError> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(RpcError::closed());
         }
-        let mut line = msg.to_string();
-        line.push('\n');
-        let mut w = self.writer.lock().await;
-        let res = async {
-            w.write_all(line.as_bytes()).await?;
-            w.flush().await
+        let mut line = msg.to_string().into_bytes();
+        line.push(b'\n');
+        let (ack, done) = oneshot::channel();
+        self.frames
+            .send((line, ack))
+            .map_err(|_| RpcError::closed())?;
+        match done.await {
+            Ok(true) => Ok(()),
+            _ => Err(RpcError::closed()),
         }
-        .await;
-        res.map_err(|_| RpcError::closed())
     }
 }
 
@@ -121,15 +131,27 @@ pub struct Peer {
 }
 
 impl Peer {
-    /// Start the reader task and return the peer plus the inbound stream. The
-    /// stream ends when the reader hits EOF or a read error.
-    pub fn spawn<R, W>(r: R, w: W) -> (Peer, mpsc::UnboundedReceiver<Inbound>)
+    /// Start the reader and writer tasks and return the peer plus the inbound
+    /// stream. The stream ends when the reader hits EOF or a read error.
+    pub fn spawn<R, W>(r: R, mut w: W) -> (Peer, mpsc::UnboundedReceiver<Inbound>)
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        let (frames, mut frame_rx) = mpsc::unbounded_channel::<Frame>();
+        tokio::spawn(async move {
+            while let Some((bytes, ack)) = frame_rx.recv().await {
+                let ok = async {
+                    w.write_all(&bytes).await?;
+                    w.flush().await
+                }
+                .await
+                .is_ok();
+                let _ = ack.send(ok);
+            }
+        });
         let inner = Arc::new(Inner {
-            writer: tokio::sync::Mutex::new(Box::new(w)),
+            frames,
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
@@ -137,9 +159,14 @@ impl Peer {
         let (tx, rx) = mpsc::unbounded_channel();
         let reader = Arc::clone(&inner);
         tokio::spawn(async move {
-            let mut lines = BufReader::new(r).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                dispatch(&reader, &tx, &line);
+            let mut r = BufReader::new(r);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match r.read_until(b'\n', &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => dispatch(&reader, &tx, &buf),
+                }
             }
             reader.close();
         });
@@ -157,7 +184,7 @@ impl Peer {
         self.inner.pending.lock().unwrap().insert(id, tx);
         // The reader may have drained `pending` before our insert.
         if self.inner.closed.load(Ordering::SeqCst) {
-            self.inner.pending.lock().unwrap().remove(&id);
+            self.remove_pending(id);
             return Err(RpcError::closed());
         }
         let msg = json!({"jsonrpc":"2.0","id":id,"method":method,"params":params});
@@ -166,14 +193,17 @@ impl Peer {
             _ = ctx.cancel.cancelled() => None,
             _ = sleep_until(ctx.deadline) => None,
             res = async {
-                self.inner.write(&msg).await?;
+                if let Err(e) = self.inner.write(&msg).await {
+                    self.remove_pending(id);
+                    return Err(e);
+                }
                 (&mut rx).await.unwrap_or_else(|_| Err(RpcError::closed()))
             } => Some(res),
         };
         match outcome {
             Some(res) => res,
             None => {
-                self.inner.pending.lock().unwrap().remove(&id);
+                self.remove_pending(id);
                 Err(ctx_error(ctx).unwrap_or_else(|| RpcError::new(CODE_CANCELLED, "cancelled")))
             }
         }
@@ -205,6 +235,10 @@ impl Peer {
     pub fn closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)
     }
+
+    fn remove_pending(&self, id: u64) {
+        self.inner.pending.lock().unwrap().remove(&id);
+    }
 }
 
 fn ctx_error(ctx: &RunContext) -> Option<RpcError> {
@@ -222,15 +256,15 @@ async fn sleep_until(deadline: Option<tokio::time::Instant>) {
     }
 }
 
-fn dispatch(inner: &Inner, tx: &mpsc::UnboundedSender<Inbound>, line: &str) {
-    let Ok(Value::Object(mut obj)) = serde_json::from_str::<Value>(line) else {
+fn dispatch(inner: &Inner, tx: &mpsc::UnboundedSender<Inbound>, line: &[u8]) {
+    let Ok(Value::Object(mut obj)) = serde_json::from_slice::<Value>(line) else {
         return;
     };
     let method = obj
         .get("method")
         .and_then(Value::as_str)
         .map(str::to_string);
-    let params = take_params(&mut obj);
+    let params = obj.remove("params").unwrap_or(Value::Null);
     match (method, obj.remove("id")) {
         (Some(method), Some(id)) if !id.is_null() => {
             let _ = tx.send(Inbound::Request { id, method, params });
@@ -251,8 +285,4 @@ fn dispatch(inner: &Inner, tx: &mpsc::UnboundedSender<Inbound>, line: &str) {
         }
         (None, None) => {}
     }
-}
-
-fn take_params(obj: &mut Map<String, Value>) -> Value {
-    obj.remove("params").unwrap_or(Value::Null)
 }

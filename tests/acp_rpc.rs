@@ -222,7 +222,8 @@ async fn passed_deadline_returns_deadline_reason() {
     let p = peer.clone();
     let c2 = c.clone();
     let call = tokio::spawn(async move { p.call(&c2, "m", json!({})).await });
-    let _ = agent.recv().await;
+    // The deadline may pass before the frame is written; never hang here.
+    let _ = tokio::time::timeout(Duration::from_secs(1), agent.recv()).await;
     let err = tokio::time::timeout(Duration::from_secs(1), call)
         .await
         .expect("deadline returns within 1 s")
@@ -230,4 +231,66 @@ async fn passed_deadline_returns_deadline_reason() {
         .unwrap_err();
     assert_ne!(err.code, -32098);
     assert_eq!(Some(err.message), c.deadline_reason());
+}
+
+#[tokio::test]
+async fn cancel_mid_write_keeps_frames_whole() {
+    // A tiny pipe forces the large request frame to block mid-write.
+    let (client_read, _agent_write) = tokio::io::duplex(64 * 1024);
+    let (client_write, agent_read) = tokio::io::duplex(64);
+    let (peer, _rx) = Peer::spawn(client_read, client_write);
+    let c = ctx();
+    let c2 = c.clone();
+    let p = peer.clone();
+    let big = "x".repeat(16 * 1024);
+    let call = tokio::spawn(async move { p.call(&c2, "big", json!({"blob": big})).await });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    c.cancel.cancel();
+    let err = tokio::time::timeout(Duration::from_secs(1), call)
+        .await
+        .expect("cancel returns within 1 s")
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.code, -32098);
+    let p = peer.clone();
+    let notify =
+        tokio::spawn(async move { p.notify("session/cancel", json!({"sessionId":"s"})).await });
+    let mut lines = BufReader::new(agent_read).lines();
+    let first: Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(1), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .expect("request frame is whole");
+    assert_eq!(first["method"], "big");
+    let second: Value = serde_json::from_str(
+        &tokio::time::timeout(Duration::from_secs(1), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap(),
+    )
+    .expect("notify frame is whole");
+    assert_eq!(second["method"], "session/cancel");
+    notify.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn non_utf8_lines_skipped() {
+    let (peer, _rx, mut agent) = pair();
+    let p = peer.clone();
+    let call = tokio::spawn(async move { p.call(&ctx(), "m", json!({})).await });
+    let req = agent.recv().await;
+    agent.out.write_all(b"\xff\xfe\n").await.unwrap();
+    agent
+        .send(json!({"jsonrpc":"2.0","id":req["id"],"result":2}))
+        .await;
+    let res = tokio::time::timeout(Duration::from_secs(1), call)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(res.unwrap(), json!(2));
+    assert!(!peer.closed());
 }
