@@ -26,7 +26,7 @@ use crate::util::run::RunContext;
 
 /// ACP protocol version sent and accepted.
 pub const PROTOCOL_VERSION: i64 = 1;
-/// Bound on `initialize`, `session/new` and `session/set_model`.
+/// Bound on `initialize`, `session/new` and model selection.
 pub const CAPABILITY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default wait for a prompt result after `session/cancel`.
 pub const CANCEL_GRACE: Duration = Duration::from_secs(5);
@@ -470,6 +470,72 @@ pub async fn probe(ctx: &RunContext, spawn: Spawn) -> Result<AuthStatus, Provide
     Ok(AuthStatus { summary, version })
 }
 
+/// The model config option advertised in a `session/new` result: its id and
+/// the listed values (empty when the agent does not list them).
+fn model_config_option(session: &Value) -> Option<(String, Vec<String>)> {
+    let opt = session
+        .get("configOptions")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|o| {
+            o.get("category").and_then(Value::as_str) == Some("model")
+                || o.get("id").and_then(Value::as_str) == Some("model")
+        })?;
+    let id = opt.get("id").and_then(Value::as_str)?.to_string();
+    let mut values = Vec::new();
+    fn collect(list: Option<&Value>, out: &mut Vec<String>) {
+        for o in list.and_then(Value::as_array).into_iter().flatten() {
+            if let Some(v) = o.get("value").and_then(Value::as_str) {
+                out.push(v.to_string());
+            }
+            // Grouped options nest their own list.
+            collect(o.get("options"), out);
+        }
+    }
+    collect(opt.get("options"), &mut values);
+    Some((id, values))
+}
+
+/// Apply an explicitly requested model, failing when it cannot be applied.
+async fn set_model(
+    proc: &Process,
+    ctx: &RunContext,
+    session: &Value,
+    session_id: &str,
+    model: &str,
+) -> Result<(), ProviderError> {
+    let quoted = go_quote(model);
+    let (method, params) = match model_config_option(session) {
+        Some((config_id, values)) => {
+            if !values.is_empty() && !values.iter().any(|v| v == model) {
+                return Err(perr(
+                    &proc.name,
+                    format!(
+                        "model {quoted} is not offered by the agent (available: {})",
+                        values.join(", ")
+                    ),
+                ));
+            }
+            (
+                "session/set_config_option",
+                json!({"sessionId": session_id, "configId": config_id, "value": model}),
+            )
+        }
+        None => (
+            "session/set_model",
+            json!({"sessionId": session_id, "modelId": model}),
+        ),
+    };
+    match proc.peer.call(&capability_ctx(ctx), method, params).await {
+        Ok(_) => Ok(()),
+        Err(e) if e.code == METHOD_NOT_FOUND || e.code == INVALID_PARAMS => Err(perr(
+            &proc.name,
+            format!("model {quoted} could not be set: {method}: {}", e.message),
+        )),
+        Err(e) => Err(proc.call_error(method, &e).await),
+    }
+}
+
 /// Spawn the agent, initialize it and open a session.
 pub async fn start(
     ctx: &RunContext,
@@ -514,27 +580,9 @@ pub async fn start(
             "session/new failed: no sessionId in result",
         ));
     };
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     if opts.model != "default" && !opts.model.is_empty() {
-        let res = proc
-            .peer
-            .call(
-                &capability_ctx(ctx),
-                "session/set_model",
-                json!({"sessionId": session_id, "modelId": opts.model}),
-            )
-            .await;
-        match res {
-            Ok(_) => {}
-            Err(e) if e.code == METHOD_NOT_FOUND || e.code == INVALID_PARAMS => {
-                warnings.push(format!(
-                    "acp: model {} could not be set and was ignored: {}",
-                    go_quote(&opts.model),
-                    e.message
-                ));
-            }
-            Err(e) => return Err(proc.call_error("session/set_model", &e).await),
-        }
+        set_model(&proc, ctx, &session, &session_id, &opts.model).await?;
     }
     let instructions = [&opts.base_instructions, &opts.developer_instructions]
         .into_iter()

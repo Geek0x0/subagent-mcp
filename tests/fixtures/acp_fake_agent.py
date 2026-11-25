@@ -17,6 +17,8 @@ Behaviour is chosen by ACP_FAKE_MODE:
   set_model_unsupported session/set_model returns -32601
   set_model_bad_params  session/set_model returns -32602
   deaf                  stops reading stdin after session/new
+  config_options        session/new advertises a model configOption with values
+                        fancy/other; session/set_config_option succeeds
   stop:<reason>         one chunk, then stopReason <reason>
 
 Every received message is appended to ACP_FAKE_LOG (one JSON per line). The
@@ -73,7 +75,7 @@ def finish(reason):
 
 def on_prompt(id_):
     state["prompt_id"] = id_
-    if MODE in ("echo", "banner", "set_model_unsupported", "set_model_bad_params"):
+    if MODE in ("echo", "banner", "set_model_unsupported", "set_model_bad_params", "config_options"):
         chunk("hello ")
         chunk("world")
         finish("end_turn")
@@ -139,7 +141,15 @@ def handle(msg):
         if MODE == "auth":
             error(id_, -32000, "Authentication required")
         else:
-            result(id_, {"sessionId": SESSION})
+            new = {"sessionId": SESSION}
+            if MODE == "config_options":
+                new["configOptions"] = [{
+                    "id": "model", "name": "Model", "category": "model",
+                    "type": "select", "currentValue": "other",
+                    "options": [{"value": "fancy", "name": "Fancy"},
+                                {"value": "other", "name": "Other"}],
+                }]
+            result(id_, new)
             if MODE == "deaf":
                 time.sleep(300)
     elif method == "session/set_model":
@@ -149,6 +159,8 @@ def handle(msg):
             error(id_, -32602, "Invalid params")
         else:
             result(id_, {})
+    elif method == "session/set_config_option" and MODE == "config_options":
+        result(id_, {"configOptions": []})
     elif method == "session/prompt":
         on_prompt(id_)
     elif method == "session/cancel":

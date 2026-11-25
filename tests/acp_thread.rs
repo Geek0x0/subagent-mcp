@@ -288,31 +288,103 @@ async fn effort_warns_once() {
 }
 
 #[tokio::test]
-async fn set_model_unsupported_warns() {
+async fn explicit_model_unsupported_fails_start() {
     need_python!();
     for mode in ["set_model_unsupported", "set_model_bad_params"] {
         let fake = Fake::new();
         let mut o = opts(fake.cwd());
         o.model = "fancy".into();
-        let t = thread::start(&ctx(), fake.spawn(mode, &[]), o)
-            .await
-            .unwrap();
-        let (cb, events) = callbacks(TestApprover::new(Answer::Yes));
-        assert_eq!(
-            t.run(ctx(), "x".into(), None, cb).await.unwrap(),
-            "hello world"
-        );
-        let warnings = of_type(&events, "warning");
-        assert_eq!(warnings.len(), 1, "{mode}");
-        assert!(warnings[0]["message"].as_str().unwrap().contains("fancy"));
+        let err = match thread::start(&ctx(), fake.spawn(mode, &[]), o).await {
+            Ok(_) => panic!("{mode}: start succeeded"),
+            Err(e) => e.message,
+        };
+        assert!(err.contains("\"fancy\""), "{mode}: {err}");
         let set = fake
             .messages()
             .into_iter()
             .find(|m| m["method"] == "session/set_model")
             .unwrap();
         assert_eq!(set["params"]["modelId"], "fancy");
-        t.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn legacy_set_model_applies() {
+    need_python!();
+    let fake = Fake::new();
+    let mut o = opts(fake.cwd());
+    o.model = "fancy".into();
+    let t = thread::start(&ctx(), fake.spawn("echo", &[]), o)
+        .await
+        .unwrap();
+    let (cb, events) = callbacks(TestApprover::new(Answer::Yes));
+    assert_eq!(
+        t.run(ctx(), "x".into(), None, cb).await.unwrap(),
+        "hello world"
+    );
+    assert!(of_type(&events, "warning").is_empty());
+    let msgs = fake.messages();
+    let set = msgs
+        .iter()
+        .find(|m| m["method"] == "session/set_model")
+        .unwrap();
+    assert_eq!(set["params"]["modelId"], "fancy");
+    assert_eq!(set["params"]["sessionId"], "sess-1");
+    t.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn config_option_model_applies() {
+    need_python!();
+    let fake = Fake::new();
+    let mut o = opts(fake.cwd());
+    o.model = "fancy".into();
+    let t = thread::start(&ctx(), fake.spawn("config_options", &[]), o)
+        .await
+        .unwrap();
+    let msgs = fake.messages();
+    assert!(!msgs.iter().any(|m| m["method"] == "session/set_model"));
+    let set = msgs
+        .iter()
+        .find(|m| m["method"] == "session/set_config_option")
+        .unwrap();
+    assert_eq!(
+        set["params"],
+        serde_json::json!({"sessionId": "sess-1", "configId": "model", "value": "fancy"})
+    );
+    t.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn config_option_unlisted_model_fails_start() {
+    need_python!();
+    let fake = Fake::new();
+    let mut o = opts(fake.cwd());
+    o.model = "nope".into();
+    let err = match thread::start(&ctx(), fake.spawn("config_options", &[]), o).await {
+        Ok(_) => panic!("start succeeded"),
+        Err(e) => e.message,
+    };
+    assert!(err.contains("\"nope\""), "{err}");
+    assert!(err.contains("fancy"), "{err}");
+    assert!(
+        !fake
+            .messages()
+            .iter()
+            .any(|m| m["method"] == "session/set_config_option")
+    );
+}
+
+#[tokio::test]
+async fn default_model_sets_nothing() {
+    need_python!();
+    let fake = Fake::new();
+    let t = start(&fake, fake.spawn("config_options", &[])).await;
+    let msgs = fake.messages();
+    assert!(!msgs.iter().any(|m| {
+        m["method"] == "session/set_model" || m["method"] == "session/set_config_option"
+    }));
+    t.close().await.unwrap();
 }
 
 #[tokio::test]
