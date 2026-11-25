@@ -93,10 +93,11 @@ jobs:
             --generate-notes
 
   # Keep the Claude/Codex plugin manifests and the launcher's release lock in
-  # step with the published tag. Runs only after everything above succeeded
-  # (publish needs the whole chain, and the lock needs the published
-  # checksums.txt). Pushing to main cannot re-trigger this workflow: it listens
-  # to tag pushes.
+  # step with the published tag. This job is the only writer of the manifests;
+  # rust-gates rejects every human commit that touches them. Runs only after
+  # everything above succeeded (publish needs the whole chain, and the lock
+  # needs the published checksums.txt). Pushing to main cannot re-trigger this
+  # workflow: it listens to tag pushes.
   sync-plugin-versions:
     name: sync plugin manifests and release lock
     needs: [publish]

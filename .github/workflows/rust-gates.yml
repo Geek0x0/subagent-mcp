@@ -1,7 +1,7 @@
 name: Rust Gates
 
 # Reusable pre-release gates: fmt/clippy/tests on three OSes, plugin manifest
-# versions, the differential harness, and the native platform runtime/TLS trust
+# consistency and ownership, the differential harness, and the native platform runtime/TLS trust
 # gates. rust-ci.yml calls this on every PR/push and release.yml calls it before
 # publishing, so both paths run exactly one copy of these jobs. Host packaging
 # (Task 29A) is not a gate and stays in rust-ci.yml; the six-target release
@@ -56,11 +56,11 @@ jobs:
   # ---------------------------------------------------------------------------
   # Plugin manifests.
   #
-  # The version in .claude-plugin/plugin.json and .codex-plugin/plugin.json is
-  # owned by the release process: a version bump commit moves them together with
-  # Cargo.toml, and the release workflow's sync-plugin-versions job re-asserts
-  # them from the tag after publishing. Any other edit that leaves them out of
-  # step with Cargo.toml fails here instead of shipping a stale plugin version.
+  # .claude-plugin/plugin.json and .codex-plugin/plugin.json are version-owned
+  # by CI: the release workflow's sync-plugin-versions job writes them from the
+  # published tag, and nothing else may change them. The two files must always
+  # agree with each other and hold a semver, so a half-written sync is caught;
+  # they intentionally lag Cargo.toml between a bump and the next release.
   # ---------------------------------------------------------------------------
   manifests:
     name: plugin manifest versions
@@ -69,19 +69,82 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Assert plugin versions match Cargo.toml
+      - name: Assert plugin manifests agree
         run: |
           set -euo pipefail
-          version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
-          test -n "$version"
-          for path in .claude-plugin/plugin.json .codex-plugin/plugin.json; do
-            actual=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["version"])' "$path")
-            if [ "$actual" != "$version" ]; then
-              echo "::error file=$path::$path has version $actual, Cargo.toml has $version"
-              exit 1
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import re
+          import sys
+
+          paths = [".claude-plugin/plugin.json", ".codex-plugin/plugin.json"]
+          versions = {}
+          for name in paths:
+              data = json.loads(pathlib.Path(name).read_text(encoding="utf-8"))
+              version = data.get("version")
+              if not isinstance(version, str) or not re.fullmatch(
+                  r"\d+\.\d+\.\d+([-+][0-9A-Za-z.-]+)?", version
+              ):
+                  print(f"::error file={name}::{name} has no valid semver version: {version!r}")
+                  sys.exit(1)
+              versions[name] = version
+
+          if len(set(versions.values())) != 1:
+              for name, version in versions.items():
+                  print(f"::error file={name}::{name} has version {version}; manifests disagree")
+              sys.exit(1)
+
+          print(f"{versions[paths[0]]} (CI-owned)")
+          PY
+
+  # Humans must not bump the plugin manifests by hand, not even with a release
+  # commit: the release sync job is the only writer. A push or PR that changes
+  # either file is rejected unless the pusher is the Actions bot. Tag pushes are
+  # exempt because release.yml runs the sync job itself.
+  manifest-ownership:
+    name: plugin manifests are CI-owned
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    if: github.ref_type == 'branch'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Reject human edits to plugin manifests
+        env:
+          EVENT: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
+          BEFORE: ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          set -euo pipefail
+          if [ "$ACTOR" = "github-actions[bot]" ]; then
+            echo "actor is the Actions bot; plugin manifest writes allowed"
+            exit 0
+          fi
+
+          if [ "$EVENT" = "pull_request" ]; then
+            git fetch --no-tags origin "$BASE_REF"
+            range="origin/$BASE_REF...HEAD"
+          else
+            base="$BEFORE"
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ] \
+              || ! git cat-file -e "$base^{commit}" 2>/dev/null; then
+              base="HEAD^"
             fi
-            echo "$path: $actual"
-          done
+            range="$base..HEAD"
+          fi
+
+          changed=$(git diff --name-only "$range" -- .claude-plugin/plugin.json .codex-plugin/plugin.json)
+          if [ -n "$changed" ]; then
+            while IFS= read -r path; do
+              echo "::error file=$path::$path is written only by the release sync job; bump Cargo.toml and let CI update the manifests"
+            done <<< "$changed"
+            exit 1
+          fi
+          echo "no plugin manifest edits in $range"
 
   # ---------------------------------------------------------------------------
   # Differential harness (Task 26).
