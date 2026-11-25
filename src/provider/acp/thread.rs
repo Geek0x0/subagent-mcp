@@ -791,11 +791,15 @@ impl Thread for AcpThread {
         let result = match outcome {
             Outcome::Done(res) => res,
             Outcome::Cancelled => {
-                let _ = proc
-                    .peer
-                    .notify("session/cancel", json!({"sessionId": self.session_id}))
-                    .await;
+                // Sending the cancel shares the grace budget: the writer is
+                // FIFO, so the frame can sit behind a prompt the agent never
+                // reads.
+                let peer = proc.peer.clone();
+                let session_id = self.session_id.clone();
                 let grace = async {
+                    let _ = peer
+                        .notify("session/cancel", json!({"sessionId": session_id}))
+                        .await;
                     loop {
                         tokio::select! {
                             biased;

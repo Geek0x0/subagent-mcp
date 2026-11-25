@@ -641,3 +641,31 @@ async fn kill_all_reaps_children() {
     assert_eq!(unsafe { libc::kill(pid, 0) }, -1, "child must be reaped");
     drop(t);
 }
+
+#[tokio::test]
+async fn cancel_with_blocked_writer_returns() {
+    need_python!();
+    let fake = Fake::new();
+    let t = start(&fake, fake.spawn("deaf", &[])).await;
+    let (cb, _) = callbacks(TestApprover::new(Answer::Yes));
+    let run_ctx = ctx();
+    let cancel = run_ctx.cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.cancel();
+    });
+    let big = "x".repeat(1 << 20);
+    let started = Instant::now();
+    let res = tokio::time::timeout(Duration::from_secs(5), t.run(run_ctx, big, None, cb)).await;
+    let res = res.expect("run hung after cancel");
+    assert!(res.is_err());
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    tokio::time::timeout(Duration::from_secs(5), t.close())
+        .await
+        .expect("close hung")
+        .unwrap();
+}

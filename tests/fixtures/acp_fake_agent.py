@@ -16,6 +16,7 @@ Behaviour is chosen by ACP_FAKE_MODE:
   bad_version           initialize returns protocolVersion 99
   set_model_unsupported session/set_model returns -32601
   set_model_bad_params  session/set_model returns -32602
+  deaf                  stops reading stdin after session/new
   stop:<reason>         one chunk, then stopReason <reason>
 
 Every received message is appended to ACP_FAKE_LOG (one JSON per line). The
@@ -28,6 +29,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 MODE = os.environ.get("ACP_FAKE_MODE", "echo")
 LOG = os.environ.get("ACP_FAKE_LOG")
@@ -138,6 +140,8 @@ def handle(msg):
             error(id_, -32000, "Authentication required")
         else:
             result(id_, {"sessionId": SESSION})
+            if MODE == "deaf":
+                time.sleep(300)
     elif method == "session/set_model":
         if MODE == "set_model_unsupported":
             error(id_, -32601, "Method not found")
