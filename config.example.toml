@@ -57,7 +57,7 @@ models = [{ id = "claude-sonnet-5" }, { id = "claude-opus-5" }]
 # [providers.claude]
 # api = "acp"
 # command = "npx"
-# args = ["-y", "@zed-industries/claude-code-acp"]
+# args = ["-y", "@agentclientprotocol/claude-agent-acp"]
 # env = { SOME_FLAG = "1" }
 # default_model = "default"
 # models = [{ id = "default", description = "whatever the agent picks" }]

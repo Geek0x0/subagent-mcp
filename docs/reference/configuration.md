@@ -160,7 +160,7 @@ The session inherits the user's whole Codex environment — auth, config, plugin
 [providers.claude]
 api = "acp"
 command = "npx"
-args = ["-y", "@zed-industries/claude-code-acp"]
+args = ["-y", "@agentclientprotocol/claude-agent-acp"]
 env = { SOME_FLAG = "1" }
 default_model = "default"
 models = [{ id = "default", description = "whatever the agent picks" }]
