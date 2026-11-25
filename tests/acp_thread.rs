@@ -585,6 +585,37 @@ async fn close_kills_child() {
 }
 
 #[tokio::test]
+async fn close_kills_process_group_after_normal_exit() {
+    need_python!();
+    let fake = Fake::new();
+    let gc_file = fake.dir.path().join("grandchild");
+    let gc_path = gc_file.display().to_string();
+    let t = start(
+        &fake,
+        fake.spawn("echo", &[("ACP_FAKE_GRANDCHILD", gc_path.as_str())]),
+    )
+    .await;
+    let gc: i32 = std::fs::read_to_string(&gc_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(alive(gc));
+    // The agent exits on stdin EOF within the grace period; its grandchild
+    // must still be torn down with the group.
+    t.close().await.unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while alive(gc) && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let gone = !alive(gc);
+    if !gone {
+        unsafe { libc::kill(gc, libc::SIGKILL) };
+    }
+    assert!(gone, "grandchild {gc} survived close");
+}
+
+#[tokio::test]
 async fn close_dead_thread_is_ok() {
     need_python!();
     let fake = Fake::new();

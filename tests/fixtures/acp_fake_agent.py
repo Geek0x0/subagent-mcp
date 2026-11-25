@@ -18,11 +18,14 @@ Behaviour is chosen by ACP_FAKE_MODE:
   stop:<reason>         one chunk, then stopReason <reason>
 
 Every received message is appended to ACP_FAKE_LOG (one JSON per line). The
-process id is written to ACP_FAKE_PID when set.
+process id is written to ACP_FAKE_PID when set. When ACP_FAKE_GRANDCHILD is
+set, a long-lived `sleep 30` is started in the agent's process group and its
+pid is written to that path.
 """
 
 import json
 import os
+import subprocess
 import sys
 
 MODE = os.environ.get("ACP_FAKE_MODE", "echo")
@@ -153,6 +156,16 @@ def main():
     if PID:
         with open(PID, "w") as f:
             f.write(str(os.getpid()))
+    grandchild = os.environ.get("ACP_FAKE_GRANDCHILD")
+    if grandchild:
+        p = subprocess.Popen(
+            ["sleep", "30"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        with open(grandchild, "w") as f:
+            f.write(str(p.pid))
     if MODE == "banner":
         print("Welcome to the fake agent!", flush=True)
         print("[log] starting up", flush=True)

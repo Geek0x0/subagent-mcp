@@ -77,6 +77,28 @@ fn may_signal_group(pid: Option<u32>, reaped: bool) -> bool {
     pid.is_some() && !reaped
 }
 
+/// Whether `pid` (our child) has exited, without reaping it (`WNOWAIT`).
+#[cfg(unix)]
+fn leader_exited_unreaped(pid: u32) -> bool {
+    // SAFETY: `info` is a zeroed, properly sized siginfo_t that waitid fills.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    if rc != 0 {
+        // ECHILD: no such child any more; treat as gone.
+        return true;
+    }
+    // With WNOHANG and no state change, si_pid stays 0.
+    // SAFETY: reading si_pid from a siginfo_t filled (or zeroed) above.
+    unsafe { info.si_pid() != 0 }
+}
+
 impl ChildSlot {
     /// Kill the child (and on Unix its process group) and reap it, waiting at
     /// most `wait`. Synchronous so the shutdown hook can use it.
@@ -86,11 +108,12 @@ impl ChildSlot {
         let Some(mut child) = self.child.lock().unwrap().take() else {
             return;
         };
-        // Signal the group before any reaping `try_wait` in this path.
+        let reaped = self.reaped.load(Ordering::SeqCst);
+        // Signal the group before any reaping `try_wait` in this path. On Unix
+        // `exited()` never reaps, so the leader (alive or a zombie) still pins
+        // the pgid here.
         #[cfg(unix)]
-        if may_signal_group(self.pid, self.reaped.load(Ordering::SeqCst))
-            && let Some(pid) = self.pid
-        {
+        if let Some(pid) = self.pid.filter(|_| may_signal_group(self.pid, reaped)) {
             // SAFETY: killpg has no memory-safety preconditions; the group id
             // is the child's pid because it was spawned with process_group(0),
             // and the leader is unreaped so the id cannot have been reused.
@@ -98,7 +121,7 @@ impl ChildSlot {
                 libc::killpg(pid as libc::pid_t, libc::SIGKILL);
             }
         }
-        if self.reaped.load(Ordering::SeqCst) {
+        if reaped {
             return;
         }
         let _ = child.start_kill();
@@ -112,11 +135,22 @@ impl ChildSlot {
         }
     }
 
-    /// Whether the leader has exited. Reaps it if so, and records that.
+    /// Whether the leader has exited. On Unix this never reaps: the zombie
+    /// must keep pinning the pgid until `kill_and_reap` has signalled the
+    /// group. Elsewhere it reaps and records that.
     fn exited(&self) -> bool {
         if self.reaped.load(Ordering::SeqCst) {
             return true;
         }
+        #[cfg(unix)]
+        {
+            let guard = self.child.lock().unwrap();
+            let (Some(_), Some(pid)) = (guard.as_ref(), self.pid) else {
+                return true;
+            };
+            leader_exited_unreaped(pid)
+        }
+        #[cfg(not(unix))]
         match self.child.lock().unwrap().as_mut() {
             Some(child) => {
                 let gone = !matches!(child.try_wait(), Ok(None));
